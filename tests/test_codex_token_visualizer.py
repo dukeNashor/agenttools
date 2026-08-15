@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -167,6 +168,21 @@ class VisualizerTests(unittest.TestCase):
         html_text = viz.render_html(report)
         self.assertIn("Create a synthetic report.", html_text)
         self.assertIn('"messagesIncluded":true', html_text)
+
+    def test_console_encoding_is_reconfigured_for_chinese_output(self) -> None:
+        stdout_bytes = io.BytesIO()
+        stderr_bytes = io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+        stderr = io.TextIOWrapper(stderr_bytes, encoding="cp1252")
+        with patch.object(viz.sys, "stdout", stdout), patch.object(viz.sys, "stderr", stderr):
+            viz.configure_console_encoding()
+            self.assertEqual(viz.sys.stdout.encoding.lower(), "utf-8")
+            self.assertEqual(viz.sys.stderr.encoding.lower(), "utf-8")
+            viz.sys.stdout.write("线程")
+            viz.sys.stdout.flush()
+        self.assertEqual(stdout_bytes.getvalue().decode("utf-8"), "线程")
+        stdout.detach()
+        stderr.detach()
 
     def test_report_json_cannot_break_out_of_script_tag(self) -> None:
         lines = [

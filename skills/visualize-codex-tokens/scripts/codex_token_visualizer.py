@@ -1212,7 +1212,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_console_encoding() -> None:
+    """Make Chinese CLI output reliable when Windows redirects to cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError, ValueError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    configure_console_encoding()
     args = build_parser().parse_args(argv)
     roots = [path.expanduser().resolve() for path in args.sessions_root] if args.sessions_root else None
     requested_id = _extract_thread_id(args.thread)
