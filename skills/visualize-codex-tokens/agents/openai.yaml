@@ -1,0 +1,7 @@
+interface:
+  display_name: "Visualize Codex Tokens"
+  short_description: "Create interactive per-turn Codex token reports"
+  default_prompt: "Use $visualize-codex-tokens to generate an interactive token report for a Codex thread."
+
+policy:
+  allow_implicit_invocation: false

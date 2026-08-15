@@ -1,0 +1,34 @@
+{
+  "name": "agenttools",
+  "version": "0.1.0",
+  "description": "Reusable agent tools for Codex, starting with interactive thread token reports.",
+  "author": {
+    "name": "dukeNashor",
+    "url": "https://github.com/dukeNashor"
+  },
+  "homepage": "https://github.com/dukeNashor/agenttools",
+  "repository": "https://github.com/dukeNashor/agenttools",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "skills",
+    "tokens",
+    "visualization"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Tools",
+    "shortDescription": "Inspect Codex thread token usage.",
+    "longDescription": "Agent Tools packages focused Codex workflows. Its first skill generates self-contained interactive reports of per-turn and total token usage from local Codex rollouts.",
+    "developerName": "dukeNashor",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/dukeNashor/agenttools",
+    "defaultPrompt": [
+      "Use $visualize-codex-tokens to inspect a Codex thread's token usage."
+    ]
+  }
+}

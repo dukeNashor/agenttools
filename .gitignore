@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+*.html
+*.jsonl
+!tests/fixtures/*.jsonl
+
+outputs/
+work/
+.codex/
+sessions/
+archived_sessions/
