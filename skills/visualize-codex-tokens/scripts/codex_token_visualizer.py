@@ -17,12 +17,12 @@ import sys
 import tempfile
 import webbrowser
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "1.2.0"
+VERSION = "2.5.0"
 THREAD_ID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -67,6 +67,21 @@ class Usage:
             total=total_tokens,
         )
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "Usage":
+        payload = payload or {}
+        return cls(
+            **{
+                key: _as_nonnegative_int(
+                    payload.get(
+                        key,
+                        payload.get("cacheWrite" if key == "cache_write" else key),
+                    )
+                )
+                for key in USAGE_KEYS
+            }
+        )
+
     def to_dict(self) -> dict[str, int]:
         return {key: int(getattr(self, key)) for key in USAGE_KEYS}
 
@@ -78,6 +93,133 @@ class Usage:
 
     def clamp_nonnegative(self) -> "Usage":
         return Usage(**{key: max(0, getattr(self, key)) for key in USAGE_KEYS})
+
+
+@dataclass(frozen=True)
+class ContextSnapshot:
+    """One Codex-recorded context occupancy snapshot."""
+
+    tokens: int
+    window_tokens: int | None
+    timestamp: str
+
+    def to_dict(self) -> dict[str, Any]:
+        rate = (
+            round(100 * self.tokens / self.window_tokens, 4)
+            if self.window_tokens
+            else None
+        )
+        return {
+            "tokens": self.tokens,
+            "windowTokens": self.window_tokens,
+            "occupancyRate": rate,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass(frozen=True)
+class ContextTimelinePoint:
+    """One context snapshot placed on a turn-local cumulative Token axis."""
+
+    snapshot: ContextSnapshot
+    turn_token_offset: int
+    range_turn_token_offset: int | None = None
+
+    def to_dict(self, window: DateWindow | None = None) -> dict[str, Any]:
+        return {
+            **self.snapshot.to_dict(),
+            "turnTokenOffset": (
+                self.range_turn_token_offset
+                if window is not None
+                else self.turn_token_offset
+            ),
+        }
+
+
+@dataclass
+class ContextCompaction:
+    timestamp: str
+    before: ContextSnapshot | None = None
+    after: ContextSnapshot | None = None
+    turn_token_offset: int | None = None
+    range_turn_token_offset: int | None = None
+
+    def to_dict(self, window: DateWindow | None = None) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "before": self.before.to_dict() if self.before is not None else None,
+            "after": self.after.to_dict() if self.after is not None else None,
+            "turnTokenOffset": (
+                self.range_turn_token_offset
+                if window is not None
+                else self.turn_token_offset
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class DateWindow:
+    """An inclusive local-date range represented as a half-open UTC interval."""
+
+    start_date: date
+    end_date: date
+    start_utc: datetime
+    end_utc: datetime
+    timezone_label: str
+    local_tz: tzinfo | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def for_dates(
+        cls,
+        start_date: date,
+        end_date: date,
+        local_tz: tzinfo | None = None,
+    ) -> "DateWindow":
+        if end_date < start_date:
+            raise ValueError("结束日期不能早于开始日期。")
+        start_naive = datetime.combine(start_date, time.min)
+        end_naive = datetime.combine(end_date + timedelta(days=1), time.min)
+        if local_tz is None:
+            start_local = start_naive.astimezone()
+            end_local = end_naive.astimezone()
+        else:
+            start_local = start_naive.replace(tzinfo=local_tz)
+            end_local = end_naive.replace(tzinfo=local_tz)
+        timezone_label = start_local.tzname() or str(start_local.tzinfo) or "本机时区"
+        return cls(
+            start_date=start_date,
+            end_date=end_date,
+            start_utc=start_local.astimezone(timezone.utc),
+            end_utc=end_local.astimezone(timezone.utc),
+            timezone_label=timezone_label,
+            local_tz=local_tz,
+        )
+
+    def _local(self, value: datetime) -> datetime:
+        if self.local_tz is None:
+            return value.astimezone()
+        return value.astimezone(self.local_tz)
+
+    def contains_datetime(self, value: datetime) -> bool:
+        return self.start_utc <= value.astimezone(timezone.utc) < self.end_utc
+
+    def contains(self, timestamp: str) -> bool:
+        parsed = _parse_timestamp(timestamp)
+        return parsed is not None and self.contains_datetime(parsed)
+
+    def local_date_text(self, timestamp: str) -> str | None:
+        parsed = _parse_timestamp(timestamp)
+        return self._local(parsed).date().isoformat() if parsed is not None else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "startDate": self.start_date.isoformat(),
+            "endDate": self.end_date.isoformat(),
+            "startUtc": self.start_utc.isoformat(),
+            "endUtcExclusive": self.end_utc.isoformat(),
+            "timezone": self.timezone_label,
+            "attribution": "token_count_snapshot_time",
+        }
 
 
 @dataclass
@@ -119,6 +261,15 @@ class Turn:
     model_responses: int = 0
     compactions: int = 0
     warning_codes: list[str] = field(default_factory=list)
+    range_usage: Usage = field(default_factory=Usage)
+    range_relevant: bool = False
+    range_first_activity_at: str | None = None
+    range_last_activity_at: str | None = None
+    message_events: int = 0
+    latest_context_snapshot: ContextSnapshot | None = None
+    range_latest_context_snapshot: ContextSnapshot | None = None
+    context_timeline: list[ContextTimelinePoint] = field(default_factory=list)
+    context_compactions: list[ContextCompaction] = field(default_factory=list)
 
     def add_unique(self, attr: str, value: Any) -> None:
         if value is None or value == "":
@@ -130,9 +281,83 @@ class Turn:
     def usage_delta(self) -> Usage:
         return (self.end_usage - self.start_usage).clamp_nonnegative()
 
-    def to_dict(self, cache_write_available: bool) -> dict[str, Any]:
-        usage = self.usage_delta()
+    def note_range_activity(self, timestamp: str) -> None:
+        self.range_relevant = True
+        if timestamp:
+            if self.range_first_activity_at is None:
+                self.range_first_activity_at = timestamp
+            self.range_last_activity_at = timestamp
+
+    def to_dict(
+        self,
+        cache_write_available: bool,
+        window: DateWindow | None = None,
+    ) -> dict[str, Any]:
+        usage = self.range_usage if window is not None else self.usage_delta()
         breakdown, mismatch = _usage_breakdown(usage, cache_write_available)
+        range_clipped = False
+        if window is not None:
+            started = _parse_timestamp(self.started_at)
+            ended = _parse_timestamp(self.ended_at or "")
+            range_clipped = bool(
+                (started is not None and started < window.start_utc)
+                or ended is None
+                or (ended is not None and ended >= window.end_utc)
+            )
+        context_snapshot = (
+            self.range_latest_context_snapshot
+            if window is not None
+            else self.latest_context_snapshot
+        )
+        if context_snapshot is None:
+            context_payload = {
+                "snapshotType": "unknown",
+                "tokens": None,
+                "windowTokens": None,
+                "occupancyRate": None,
+                "timestamp": None,
+            }
+        else:
+            if window is None:
+                snapshot_type = (
+                    "turn_end"
+                    if self.status in {"complete", "aborted"}
+                    else "current_latest"
+                )
+            else:
+                ended = _parse_timestamp(self.ended_at or "")
+                ended_in_window = ended is not None and window.contains_datetime(ended)
+                if self.status in {"complete", "aborted"} and ended_in_window:
+                    snapshot_type = "turn_end"
+                elif (
+                    self.status == "incomplete"
+                    and self.latest_context_snapshot == self.range_latest_context_snapshot
+                ):
+                    snapshot_type = "current_latest"
+                else:
+                    snapshot_type = "range_latest"
+            context_payload = {
+                "snapshotType": snapshot_type,
+                **context_snapshot.to_dict(),
+            }
+        context_compactions: list[dict[str, Any]] = []
+        for compaction in self.context_compactions:
+            payload = compaction.to_dict(window=window)
+            if window is not None:
+                for side in ("before", "after"):
+                    snapshot = payload.get(side)
+                    if snapshot is not None and not window.contains(
+                        _coerce_text(snapshot.get("timestamp"))
+                    ):
+                        payload[side] = None
+            context_compactions.append(payload)
+        context_timeline = []
+        for point in self.context_timeline:
+            if window is not None and not window.contains(point.snapshot.timestamp):
+                continue
+            payload = point.to_dict(window=window)
+            if payload["turnTokenOffset"] is not None:
+                context_timeline.append(payload)
         return {
             "index": self.index,
             "turnId": self.turn_id,
@@ -153,6 +378,12 @@ class Turn:
             "usage": usage.to_dict(),
             "breakdown": breakdown,
             "breakdownMismatch": mismatch,
+            "rangeClipped": range_clipped,
+            "rangeFirstActivityAt": self.range_first_activity_at,
+            "rangeLastActivityAt": self.range_last_activity_at,
+            "contextSnapshot": context_payload,
+            "contextTimeline": context_timeline,
+            "contextCompactions": context_compactions,
         }
 
 
@@ -211,6 +442,24 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _add_usage_bucket(buckets: dict[str, Usage], key: str | None, value: Usage) -> None:
+    if key is None:
+        return
+    buckets[key] = buckets.get(key, Usage()) + value
 
 
 def _extract_thread_id(text: str) -> str | None:
@@ -280,7 +529,13 @@ def resolve_rollout(value: str, roots: Iterable[Path] | None = None) -> Path:
     return max(choices, key=lambda path: path.stat().st_mtime).resolve()
 
 
-def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[str, Any]:
+def parse_rollout(
+    path: Path,
+    requested_thread_id: str | None = None,
+    window: DateWindow | None = None,
+    tolerate_live: bool = False,
+) -> dict[str, Any]:
+    filename_thread_id = _extract_thread_id(path.name)
     warnings: list[WarningRecord] = []
     normalizer = UsageNormalizer(warnings)
     latest_usage = Usage()
@@ -298,6 +553,33 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
     cache_write_field_present = False
     reasoning_field_present = False
     total_field_present = True
+    range_usage = Usage()
+    range_unattributed = Usage()
+    daily_usage: dict[str, Usage] = {}
+    range_activity = False
+    range_first_activity_at: str | None = None
+    range_last_activity_at: str | None = None
+    subagent_preamble = False
+    subagent_baseline_applied = False
+    latest_context_snapshot: ContextSnapshot | None = None
+    previous_context_snapshot: ContextSnapshot | None = None
+    pending_compaction: ContextCompaction | None = None
+
+    def compaction_offsets() -> tuple[int | None, int | None]:
+        if current is None:
+            return None, None
+        turn_offset = (latest_usage - current.start_usage).clamp_nonnegative().total
+        return turn_offset, current.range_usage.total
+
+    def note_range_activity(timestamp: str) -> None:
+        nonlocal range_activity, range_first_activity_at, range_last_activity_at
+        if window is None or not window.contains(timestamp):
+            return
+        range_activity = True
+        if timestamp:
+            if range_first_activity_at is None:
+                range_first_activity_at = timestamp
+            range_last_activity_at = timestamp
 
     with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         for line_number, raw_line in enumerate(handle, 1):
@@ -315,7 +597,7 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                 trailing = not raw_line.endswith(("\n", "\r"))
                 warnings.append(
                     WarningRecord(
-                        "error",
+                        "warning" if tolerate_live and trailing else "error",
                         "trailing_partial_line" if trailing else "malformed_json",
                         (
                             "已忽略末尾疑似未写完的 JSON 行。"
@@ -331,9 +613,23 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
             payload = record.get("payload")
             if not isinstance(payload, dict):
                 payload = {}
+            timestamp = _coerce_text(record.get("timestamp"))
+            in_window = window is None or window.contains(timestamp)
 
             if record_type == "session_meta":
                 session_meta.append(payload)
+                candidate_id = _coerce_text(payload.get("id")).lower()
+                source_text = " ".join(
+                    _coerce_text(payload.get(key))
+                    for key in ("thread_source", "source")
+                ).lower()
+                if (
+                    filename_thread_id
+                    and candidate_id == filename_thread_id
+                    and "subagent" in source_text
+                ):
+                    subagent_preamble = True
+                note_range_activity(timestamp)
                 continue
 
             if record_type == "turn_context":
@@ -360,16 +656,53 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
 
             if record_type == "compacted":
                 # event_msg/context_compacted is the canonical count; this top-level
-                # companion event intentionally does not increment it again.
+                # companion event marks the exact pre-compaction context snapshot.
+                if current is not None:
+                    turn_offset, range_turn_offset = compaction_offsets()
+                    pending_compaction = ContextCompaction(
+                        timestamp=timestamp,
+                        before=latest_context_snapshot,
+                        turn_token_offset=turn_offset,
+                        range_turn_token_offset=range_turn_offset,
+                    )
                 continue
 
             if record_type != "event_msg":
                 continue
 
             event_type = payload.get("type")
-            timestamp = _coerce_text(record.get("timestamp"))
+            if (
+                event_type == "thread_settings_applied"
+                and subagent_preamble
+                and not subagent_baseline_applied
+                and current is not None
+            ):
+                # Subagent rollouts begin with a copied snapshot of the active
+                # parent turn. Keep its cumulative counter as the baseline for
+                # subsequent deltas, but never expose or count the copied turn.
+                current = None
+                turns.clear()
+                turns_by_id.clear()
+                orphan_messages.clear()
+                warnings.clear()
+                unattributed = Usage()
+                range_unattributed = Usage()
+                range_usage = Usage()
+                daily_usage.clear()
+                malformed_lines = 0
+                blank_lines = 0
+                token_events = 0
+                duplicate_snapshots = 0
+                rollback_count = 0
+                normalizer.reset_count = 0
+                subagent_baseline_applied = True
+                latest_context_snapshot = None
+                previous_context_snapshot = None
+                pending_compaction = None
+                continue
 
             if event_type == "task_started":
+                pending_compaction = None
                 if current is not None:
                     current.status = "incomplete"
                     current.ended_at = timestamp
@@ -399,6 +732,9 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                         "context_windows", _as_nonnegative_int(context_window)
                     )
                 turns_by_id[turn_id] = current
+                if window is not None and in_window:
+                    current.note_range_activity(timestamp)
+                    note_range_activity(timestamp)
                 continue
 
             if event_type == "user_message":
@@ -411,8 +747,14 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                     "audioCount": len(payload.get("audio") or [])
                     + len(payload.get("local_audio") or []),
                 }
+                if current is not None:
+                    current.message_events += 1
+                if window is not None and not in_window:
+                    continue
                 if current is None:
                     orphan_messages.append(message)
+                    if window is not None:
+                        note_range_activity(timestamp)
                     warnings.append(
                         WarningRecord(
                             "warning",
@@ -422,8 +764,11 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                         )
                     )
                 else:
-                    message["steering"] = bool(current.messages)
+                    message["steering"] = current.message_events > 1
                     current.messages.append(message)
+                    if window is not None:
+                        current.note_range_activity(timestamp)
+                        note_range_activity(timestamp)
                 continue
 
             if event_type == "token_count":
@@ -460,22 +805,73 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                 total_field_present = total_field_present and ("total_tokens" in total_payload)
                 raw_usage = Usage.from_payload(total_payload)
                 logical_usage, event_delta = normalizer.normalize(raw_usage, line_number)
-                if event_delta.total == 0:
+                last_payload = info.get("last_token_usage")
+                context_snapshot: ContextSnapshot | None = None
+                if isinstance(last_payload, dict) and "total_tokens" in last_payload:
+                    raw_window = info.get("model_context_window")
+                    context_window = (
+                        _as_nonnegative_int(raw_window)
+                        if raw_window is not None
+                        else (
+                            current.context_windows[-1]
+                            if current is not None and current.context_windows
+                            else None
+                        )
+                    )
+                    if context_window == 0:
+                        context_window = None
+                    context_snapshot = ContextSnapshot(
+                        tokens=_as_nonnegative_int(last_payload.get("total_tokens")),
+                        window_tokens=context_window,
+                        timestamp=timestamp,
+                    )
+                    previous_context_snapshot = latest_context_snapshot
+                    latest_context_snapshot = context_snapshot
+                    if pending_compaction is not None and pending_compaction.after is None:
+                        pending_compaction.after = context_snapshot
+                if event_delta.total == 0 and in_window:
                     duplicate_snapshots += 1
-                token_events += 1
+                if in_window:
+                    token_events += 1
                 latest_usage = logical_usage
                 if current is not None:
                     current.end_usage = logical_usage
-                    current.token_snapshots += 1
-                    if event_delta.total > 0:
-                        current.model_responses += 1
+                    if context_snapshot is not None:
+                        current.latest_context_snapshot = context_snapshot
+                        turn_offset = (
+                            logical_usage - current.start_usage
+                        ).clamp_nonnegative().total
+                        range_turn_offset = (
+                            current.range_usage.total + event_delta.total
+                            if window is not None and in_window
+                            else None
+                        )
+                        current.context_timeline.append(
+                            ContextTimelinePoint(
+                                snapshot=context_snapshot,
+                                turn_token_offset=turn_offset,
+                                range_turn_token_offset=range_turn_offset,
+                            )
+                        )
+                        if in_window:
+                            current.range_latest_context_snapshot = context_snapshot
+                    if in_window:
+                        current.token_snapshots += 1
+                        if event_delta.total > 0:
+                            current.model_responses += 1
+                        if window is not None:
+                            current.range_usage = current.range_usage + event_delta
+                            current.note_range_activity(timestamp)
                     context_window = info.get("model_context_window")
                     if context_window is not None:
                         current.add_unique(
                             "context_windows", _as_nonnegative_int(context_window)
                         )
-                elif event_delta.total > 0:
-                    unattributed = unattributed + event_delta
+                elif event_delta.total > 0 and in_window:
+                    if window is None:
+                        unattributed = unattributed + event_delta
+                    else:
+                        range_unattributed = range_unattributed + event_delta
                     warnings.append(
                         WarningRecord(
                             "warning",
@@ -484,6 +880,14 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                             line=line_number,
                         )
                     )
+                if window is not None and in_window:
+                    range_usage = range_usage + event_delta
+                    _add_usage_bucket(
+                        daily_usage,
+                        window.local_date_text(timestamp),
+                        event_delta,
+                    )
+                    note_range_activity(timestamp)
                 continue
 
             if event_type in {"task_complete", "turn_aborted"}:
@@ -527,14 +931,35 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                     if event_type == "turn_aborted"
                     else None
                 )
+                if window is not None and in_window:
+                    current.note_range_activity(timestamp)
+                    note_range_activity(timestamp)
                 turns.append(current)
                 current = None
+                pending_compaction = None
                 continue
 
             if event_type == "context_compacted":
-                if current is not None:
+                if current is not None and in_window:
                     current.compactions += 1
-                else:
+                    compaction = pending_compaction
+                    if compaction is None:
+                        turn_offset, range_turn_offset = compaction_offsets()
+                        compaction = ContextCompaction(
+                            timestamp=timestamp,
+                            before=previous_context_snapshot,
+                            after=latest_context_snapshot,
+                            turn_token_offset=turn_offset,
+                            range_turn_token_offset=range_turn_offset,
+                        )
+                    else:
+                        compaction.timestamp = timestamp
+                    current.context_compactions.append(compaction)
+                    pending_compaction = None
+                    if window is not None:
+                        current.note_range_activity(timestamp)
+                        note_range_activity(timestamp)
+                elif current is None and in_window:
                     warnings.append(
                         WarningRecord(
                             "warning",
@@ -546,8 +971,10 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
                 continue
 
             if event_type == "thread_rolled_back":
-                rollback_count += 1
-                if current is not None:
+                if in_window:
+                    rollback_count += 1
+                    note_range_activity(timestamp)
+                if current is not None and in_window:
                     warnings.append(
                         WarningRecord(
                             "warning",
@@ -562,21 +989,26 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
         current.status = "incomplete"
         current.ended_at = None
         current.warning_codes.append("unclosed_turn")
-        warnings.append(
-            WarningRecord(
-                "error",
-                "unclosed_turn",
-                "rollout 结束时仍有一个活动轮次未闭合。",
-                turn_id=current.turn_id,
+        if window is None or current.range_relevant:
+            warnings.append(
+                WarningRecord(
+                    "warning" if tolerate_live else "error",
+                    "unclosed_turn",
+                    "rollout 结束时仍有一个活动轮次未闭合。",
+                    turn_id=current.turn_id,
+                )
             )
-        )
         turns.append(current)
 
-    # Context events can precede finalization; make sure indices are stable.
-    for index, turn in enumerate(turns, 1):
+    relevant_turns = (
+        [turn for turn in turns if turn.range_relevant]
+        if window is not None
+        else turns
+    )
+    # Context events can precede finalization; make sure displayed indices are stable.
+    for index, turn in enumerate(relevant_turns, 1):
         turn.index = index
 
-    filename_thread_id = _extract_thread_id(path.name)
     desired_id = (requested_thread_id or filename_thread_id or "").lower() or None
     selected_meta: dict[str, Any] = {}
     if desired_id:
@@ -593,16 +1025,23 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
     meta_id = _coerce_text(selected_meta.get("id") or selected_meta.get("session_id"))
     thread_id = desired_id or meta_id or path.stem
 
-    turn_dicts = [turn.to_dict(cache_write_field_present) for turn in turns]
+    turn_dicts = [
+        turn.to_dict(cache_write_field_present, window=window)
+        for turn in relevant_turns
+    ]
     turn_usage_sum = Usage()
     breakdown_mismatch_turns = 0
-    for turn, turn_dict in zip(turns, turn_dicts):
-        turn_usage_sum = turn_usage_sum + turn.usage_delta()
+    for turn, turn_dict in zip(relevant_turns, turn_dicts):
+        turn_usage_sum = turn_usage_sum + (
+            turn.range_usage if window is not None else turn.usage_delta()
+        )
         if turn_dict["breakdownMismatch"] != 0:
             breakdown_mismatch_turns += 1
 
-    accounted = turn_usage_sum + unattributed
-    reconciliation = latest_usage - accounted
+    effective_unattributed = range_unattributed if window is not None else unattributed
+    effective_final_usage = range_usage if window is not None else latest_usage
+    accounted = turn_usage_sum + effective_unattributed
+    reconciliation = effective_final_usage - accounted
     if any(getattr(reconciliation, key) != 0 for key in USAGE_KEYS):
         warnings.append(
             WarningRecord(
@@ -637,16 +1076,16 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
         )
 
     final_breakdown, final_breakdown_mismatch = _usage_breakdown(
-        latest_usage, cache_write_field_present
+        effective_final_usage, cache_write_field_present
     )
     status_counts: dict[str, int] = {"complete": 0, "aborted": 0, "incomplete": 0}
-    for turn in turns:
+    for turn in relevant_turns:
         status_counts[turn.status] = status_counts.get(turn.status, 0) + 1
 
     source_stat = path.stat()
     integrity_errors = sum(1 for warning in warnings if warning.severity == "error")
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2 if window is not None else 1,
         "generator": {"name": "codex_token_visualizer", "version": VERSION},
         "metadata": {
             "threadId": thread_id,
@@ -658,41 +1097,416 @@ def parse_rollout(path: Path, requested_thread_id: str | None = None) -> dict[st
             ).isoformat(),
             "generatedAt": datetime.now(timezone.utc).isoformat(),
             "sessionMeta": {
+                "id": selected_meta.get("id"),
+                "sessionId": selected_meta.get("session_id"),
                 "cwd": selected_meta.get("cwd"),
                 "originator": selected_meta.get("originator"),
                 "cliVersion": selected_meta.get("cli_version"),
                 "forkedFromId": selected_meta.get("forked_from_id"),
                 "parentThreadId": selected_meta.get("parent_thread_id"),
+                "source": selected_meta.get("source"),
+                "threadSource": selected_meta.get("thread_source"),
             },
+            "dateWindow": window.to_dict() if window is not None else None,
+            "hasRangeActivity": range_activity if window is not None else True,
+            "rangeFirstActivityAt": range_first_activity_at,
+            "rangeLastActivityAt": range_last_activity_at,
+            "subagentBaselineApplied": subagent_baseline_applied,
             "containsFullUserMessages": True,
             "cacheWriteFieldAvailable": cache_write_field_present,
             "reasoningFieldAvailable": reasoning_field_present,
         },
         "summary": {
-            "turnCount": len(turns),
+            "turnCount": len(relevant_turns),
             "statusCounts": status_counts,
-            "zeroUsageTurns": sum(1 for turn in turns if turn.usage_delta().total == 0),
+            "zeroUsageTurns": sum(
+                1
+                for turn in relevant_turns
+                if (
+                    turn.range_usage.total
+                    if window is not None
+                    else turn.usage_delta().total
+                )
+                == 0
+            ),
             "tokenEvents": token_events,
             "duplicateSnapshots": duplicate_snapshots,
             "rollbacks": rollback_count,
-            "contextCompactions": sum(turn.compactions for turn in turns),
+            "contextCompactions": sum(turn.compactions for turn in relevant_turns),
             "malformedLines": malformed_lines,
             "blankLines": blank_lines,
             "orphanMessageCount": len(orphan_messages),
             "counterResets": normalizer.reset_count,
-            "finalUsage": latest_usage.to_dict(),
+            "finalUsage": effective_final_usage.to_dict(),
             "finalBreakdown": final_breakdown,
             "finalBreakdownMismatch": final_breakdown_mismatch,
             "turnUsageSum": turn_usage_sum.to_dict(),
-            "unattributedUsage": unattributed.to_dict(),
+            "unattributedUsage": effective_unattributed.to_dict(),
             "accountedUsage": accounted.to_dict(),
             "reconciliationDifference": reconciliation.to_dict(),
             "integrityErrorCount": integrity_errors,
             "warningCount": len(warnings),
+            "dailyUsage": [
+                {"date": day, "usage": daily_usage[day].to_dict()}
+                for day in sorted(daily_usage)
+            ],
         },
         "warnings": [warning.to_dict() for warning in warnings],
         "orphanMessages": orphan_messages,
         "turns": turn_dicts,
+    }
+
+
+def discover_rollouts(
+    roots: Iterable[Path] | None = None,
+    window: DateWindow | None = None,
+) -> list[Path]:
+    """Find rollout JSONL files once, preferring the newest copy of each ID."""
+    search_roots = list(roots) if roots is not None else default_session_roots()
+    chosen: dict[str, Path] = {}
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for candidate in root.rglob("*.jsonl"):
+            try:
+                resolved = candidate.resolve()
+                modified = resolved.stat().st_mtime
+            except OSError:
+                continue
+            if window is not None:
+                if datetime.fromtimestamp(modified, tz=timezone.utc) < window.start_utc:
+                    continue
+                created_match = re.search(r"rollout-(\d{4}-\d{2}-\d{2})T", resolved.name)
+                if created_match:
+                    try:
+                        created_date = date.fromisoformat(created_match.group(1))
+                    except ValueError:
+                        created_date = None
+                    if created_date is not None and created_date > window.end_date:
+                        continue
+            rollout_id = _extract_thread_id(resolved.name)
+            key = rollout_id or os.path.normcase(str(resolved))
+            previous = chosen.get(key)
+            if previous is None:
+                chosen[key] = resolved
+                continue
+            try:
+                if modified > previous.stat().st_mtime:
+                    chosen[key] = resolved
+            except OSError:
+                chosen[key] = resolved
+    return sorted(chosen.values(), key=lambda path: os.path.normcase(str(path)))
+
+
+def _source_kind(report: dict[str, Any]) -> str:
+    meta = report.get("metadata", {}).get("sessionMeta", {})
+    rendered = " ".join(
+        _coerce_text(meta.get(key)) for key in ("threadSource", "source", "originator")
+    ).lower()
+    if "subagent" in rendered or meta.get("parentThreadId"):
+        return "subagent"
+    if "automation" in rendered or "scheduled" in rendered:
+        return "automation"
+    return "main"
+
+
+def _root_thread_id(
+    report: dict[str, Any], reports_by_id: dict[str, dict[str, Any]]
+) -> str:
+    thread_id = _coerce_text(report.get("metadata", {}).get("threadId"))
+    seen: set[str] = set()
+    current = report
+    while thread_id and thread_id not in seen:
+        seen.add(thread_id)
+        meta = current.get("metadata", {}).get("sessionMeta", {})
+        parent = _coerce_text(meta.get("parentThreadId"))
+        session_id = _coerce_text(meta.get("sessionId"))
+        candidate = parent or (session_id if session_id != thread_id else "")
+        if not candidate:
+            return thread_id
+        thread_id = candidate.lower()
+        current = reports_by_id.get(thread_id, current)
+        if current is report and thread_id not in reports_by_id:
+            return thread_id
+    return thread_id or _coerce_text(report.get("metadata", {}).get("threadId"))
+
+
+def _sum_usage(items: Iterable[dict[str, Any]], key: str = "finalUsage") -> Usage:
+    result = Usage()
+    for item in items:
+        result = result + Usage.from_dict(item.get("summary", {}).get(key))
+    return result
+
+
+def _short_thread_id(thread_id: str) -> str:
+    return thread_id[:8] if thread_id else "unknown"
+
+
+def _fallback_session_title(cwd: Any, thread_id: str) -> str:
+    rendered_cwd = _coerce_text(cwd).rstrip("\\/")
+    leaf = re.split(r"[\\/]", rendered_cwd)[-1] if rendered_cwd else ""
+    return f"{leaf} · {_short_thread_id(thread_id)}" if leaf else _short_thread_id(thread_id)
+
+
+def _prompt_title(report: dict[str, Any]) -> str | None:
+    messages: list[dict[str, Any]] = []
+    for turn in report.get("turns", []):
+        messages.extend(turn.get("messages", []))
+    messages.extend(report.get("orphanMessages", []))
+    messages.sort(key=lambda message: _coerce_text(message.get("timestamp")))
+    for message in messages:
+        text_value = re.sub(r"\s+", " ", _coerce_text(message.get("text"))).strip()
+        if text_value:
+            return text_value[:77] + "..." if len(text_value) > 80 else text_value
+    return None
+
+
+def _merge_daily_usage(items: Iterable[dict[str, Any]]) -> dict[str, Usage]:
+    merged: dict[str, Usage] = {}
+    for item in items:
+        for bucket in item.get("summary", {}).get("dailyUsage", []):
+            day = _coerce_text(bucket.get("date"))
+            if day:
+                _add_usage_bucket(merged, day, Usage.from_dict(bucket.get("usage")))
+    return merged
+
+
+def _date_buckets(window: DateWindow, usage: dict[str, Usage]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    current = window.start_date
+    while current <= window.end_date:
+        day = current.isoformat()
+        result.append({"date": day, "usage": usage.get(day, Usage()).to_dict()})
+        current += timedelta(days=1)
+    return result
+
+
+def build_range_report(
+    window: DateWindow,
+    roots: Iterable[Path] | None = None,
+) -> dict[str, Any]:
+    """Build a date-scoped report grouped by user-visible top-level task."""
+    parsed_reports: list[dict[str, Any]] = []
+    for path in discover_rollouts(roots, window=window):
+        parsed_reports.append(parse_rollout(path, window=window, tolerate_live=True))
+
+    reports_by_id = {
+        _coerce_text(report.get("metadata", {}).get("threadId")).lower(): report
+        for report in parsed_reports
+        if _coerce_text(report.get("metadata", {}).get("threadId"))
+    }
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for report in parsed_reports:
+        if not report.get("metadata", {}).get("hasRangeActivity"):
+            continue
+        root_id = _root_thread_id(report, reports_by_id)
+        groups.setdefault(root_id, []).append(report)
+
+    sessions: list[dict[str, Any]] = []
+    all_warnings: list[dict[str, Any]] = []
+    for root_id, active_members in groups.items():
+        root_report = reports_by_id.get(root_id)
+        members = list(active_members)
+        if root_report is not None and root_report not in members:
+            members.append(root_report)
+        root_meta = (
+            root_report.get("metadata", {})
+            if root_report is not None
+            else active_members[0].get("metadata", {})
+        )
+        root_session_meta = root_meta.get("sessionMeta", {})
+        fallback_title = _fallback_session_title(root_session_meta.get("cwd"), root_id)
+        message_title = _prompt_title(root_report) if root_report is not None else None
+
+        turns: list[dict[str, Any]] = []
+        member_warnings: list[dict[str, Any]] = []
+        for member in members:
+            member_meta = member.get("metadata", {})
+            member_id = _coerce_text(member_meta.get("threadId"))
+            kind = _source_kind(member)
+            for source_turn in member.get("turns", []):
+                turn = dict(source_turn)
+                turn["sourceTurnIndex"] = source_turn.get("index")
+                turn["sourceRolloutId"] = member_id
+                turn["sourceKind"] = kind
+                turn["sourceLabel"] = (
+                    f"子代理 {_short_thread_id(member_id)}"
+                    if kind == "subagent"
+                    else ("自动化" if kind == "automation" else "主会话")
+                )
+                turns.append(turn)
+            if member_meta.get("hasRangeActivity"):
+                for source_warning in member.get("warnings", []):
+                    warning = dict(source_warning)
+                    warning["rolloutId"] = member_id
+                    warning["sourceName"] = member_meta.get("sourceName")
+                    member_warnings.append(warning)
+                    all_warnings.append(dict(warning, sessionId=root_id))
+
+        turns.sort(
+            key=lambda turn: (
+                _coerce_text(
+                    turn.get("contextSnapshot", {}).get("timestamp")
+                    or turn.get("endedAt")
+                    or turn.get("rangeLastActivityAt")
+                    or turn.get("startedAt")
+                ),
+                _coerce_text(turn.get("sourceRolloutId")),
+                _as_nonnegative_int(turn.get("sourceTurnIndex")),
+            )
+        )
+        for index, turn in enumerate(turns, 1):
+            turn["index"] = index
+
+        active_usage = _sum_usage(active_members)
+        cache_write_available = any(
+            member.get("metadata", {}).get("cacheWriteFieldAvailable")
+            for member in active_members
+        )
+        breakdown, mismatch = _usage_breakdown(active_usage, cache_write_available)
+        status_counts: dict[str, int] = {"complete": 0, "aborted": 0, "incomplete": 0}
+        for turn in turns:
+            status = _coerce_text(turn.get("status")) or "incomplete"
+            status_counts[status] = status_counts.get(status, 0) + 1
+        daily = _merge_daily_usage(active_members)
+        first_activity = min(
+            (
+                _coerce_text(member.get("metadata", {}).get("rangeFirstActivityAt"))
+                for member in active_members
+                if member.get("metadata", {}).get("rangeFirstActivityAt")
+            ),
+            default="",
+        )
+        last_activity = max(
+            (
+                _coerce_text(member.get("metadata", {}).get("rangeLastActivityAt"))
+                for member in active_members
+                if member.get("metadata", {}).get("rangeLastActivityAt")
+            ),
+            default="",
+        )
+        source_kinds = sorted({_source_kind(member) for member in active_members})
+        session = {
+            "metadata": {
+                "threadId": root_id,
+                "title": message_title or fallback_title,
+                "messageTitle": message_title,
+                "fallbackTitle": fallback_title,
+                "cwd": root_session_meta.get("cwd"),
+                "originator": root_session_meta.get("originator"),
+                "source": root_session_meta.get("source"),
+                "sourceKinds": source_kinds,
+                "rangeFirstActivityAt": first_activity or None,
+                "rangeLastActivityAt": last_activity or None,
+                "rolloutCount": len(active_members),
+                "sourcePaths": [
+                    member.get("metadata", {}).get("sourcePath")
+                    for member in active_members
+                ],
+                "cacheWriteFieldAvailable": cache_write_available,
+                "reasoningFieldAvailable": any(
+                    member.get("metadata", {}).get("reasoningFieldAvailable")
+                    for member in active_members
+                ),
+                "messagesIncluded": True,
+                "containsFullUserMessages": True,
+            },
+            "summary": {
+                "turnCount": len(turns),
+                "statusCounts": status_counts,
+                "zeroUsageTurns": sum(
+                    1 for turn in turns if _as_nonnegative_int(turn.get("usage", {}).get("total")) == 0
+                ),
+                "finalUsage": active_usage.to_dict(),
+                "finalBreakdown": breakdown,
+                "finalBreakdownMismatch": mismatch,
+                "turnUsageSum": _sum_usage(
+                    [{"summary": {"finalUsage": turn.get("usage", {})}} for turn in turns]
+                ).to_dict(),
+                "unattributedUsage": _sum_usage(
+                    [
+                        {"summary": {"finalUsage": member.get("summary", {}).get("unattributedUsage", {})}}
+                        for member in active_members
+                    ]
+                ).to_dict(),
+                "accountedUsage": active_usage.to_dict(),
+                "reconciliationDifference": Usage().to_dict(),
+                "integrityErrorCount": sum(
+                    1 for warning in member_warnings if warning.get("severity") == "error"
+                ),
+                "warningCount": len(member_warnings),
+                "dailyUsage": _date_buckets(window, daily),
+            },
+            "warnings": member_warnings,
+            "orphanMessages": [
+                message
+                for member in active_members
+                for message in member.get("orphanMessages", [])
+            ],
+            "turns": turns,
+        }
+        sessions.append(session)
+
+    sessions.sort(
+        key=lambda session: (
+            _coerce_text(session.get("metadata", {}).get("rangeLastActivityAt")),
+            _coerce_text(session.get("metadata", {}).get("threadId")),
+        ),
+        reverse=True,
+    )
+    total_usage = _sum_usage(sessions)
+    cache_write_available = any(
+        session.get("metadata", {}).get("cacheWriteFieldAvailable")
+        for session in sessions
+    )
+    final_breakdown, final_breakdown_mismatch = _usage_breakdown(
+        total_usage, cache_write_available
+    )
+    daily_usage = _merge_daily_usage(sessions)
+    status_counts: dict[str, int] = {"complete": 0, "aborted": 0, "incomplete": 0}
+    for session in sessions:
+        for status, count in session.get("summary", {}).get("statusCounts", {}).items():
+            status_counts[status] = status_counts.get(status, 0) + _as_nonnegative_int(count)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "schemaVersion": 2,
+        "mode": "range",
+        "generator": {"name": "codex_token_visualizer", "version": VERSION},
+        "metadata": {
+            "generatedAt": generated_at,
+            "dateWindow": window.to_dict(),
+            "containsFullUserMessages": True,
+            "messagesIncluded": True,
+            "cacheWriteFieldAvailable": cache_write_available,
+            "reasoningFieldAvailable": any(
+                session.get("metadata", {}).get("reasoningFieldAvailable")
+                for session in sessions
+            ),
+            "sourceRoots": [
+                str(path)
+                for path in (list(roots) if roots is not None else default_session_roots())
+            ],
+            "snapshotAt": generated_at,
+        },
+        "summary": {
+            "sessionCount": len(sessions),
+            "turnCount": sum(session["summary"]["turnCount"] for session in sessions),
+            "statusCounts": status_counts,
+            "zeroUsageSessions": sum(
+                1 for session in sessions if session["summary"]["finalUsage"]["total"] == 0
+            ),
+            "zeroUsageTurns": sum(session["summary"]["zeroUsageTurns"] for session in sessions),
+            "finalUsage": total_usage.to_dict(),
+            "finalBreakdown": final_breakdown,
+            "finalBreakdownMismatch": final_breakdown_mismatch,
+            "dailyUsage": _date_buckets(window, daily_usage),
+            "integrityErrorCount": sum(
+                1 for warning in all_warnings if warning.get("severity") == "error"
+            ),
+            "warningCount": len(all_warnings),
+        },
+        "warnings": all_warnings,
+        "sessions": sessions,
     }
 
 
@@ -788,11 +1602,48 @@ svg { display:block; width:100%; height:auto; overflow:visible; }
 .bar { cursor:pointer; transition:opacity .14s ease, filter .14s ease; }
 .bar:hover, .bar.selected { filter:brightness(1.22); }
 .bar.dim { opacity:.28; }
-.tooltip { position:fixed; z-index:50; pointer-events:none; display:none; max-width:360px; padding:11px 12px; border-radius:10px; background:#fffefa; border:1px solid var(--border); box-shadow:var(--shadow); color:var(--text); font-size:12px; }
+.tooltip { position:fixed; z-index:80; pointer-events:none; display:none; visibility:hidden; width:min(440px,calc(100vw - 16px)); max-height:calc(100vh - 16px); overflow:hidden; padding:12px 13px; border-radius:11px; background:#fffefa; border:1px solid var(--border); box-shadow:var(--shadow); color:var(--text); font-size:12px; transition:none; }
 .tooltip strong { display:block; margin-bottom:5px; }
 .tooltip .row { display:flex; justify-content:space-between; gap:20px; color:var(--muted); }
 .tooltip .row b { color:var(--text); font-variant-numeric:tabular-nums; }
+.tooltip-title { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:8px; }
+.tooltip-title strong { margin:0; font-size:13px; }
+.tooltip-badge { flex:none; border-radius:999px; padding:2px 7px; background:var(--panel-2); color:var(--accent); font-size:10px; font-weight:750; }
+.tooltip-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:8px 0; }
+.tooltip-metric { min-width:0; padding:9px 10px; border:1px solid color-mix(in srgb,var(--metric-color) 28%,var(--border)); border-radius:9px; background:color-mix(in srgb,var(--metric-color) 8%,#fffefa); }
+.tooltip-metric.context { --metric-color:var(--accent); }
+.tooltip-metric.token { --metric-color:var(--uncached); }
+.tooltip-metric span { display:block; color:var(--muted); font-size:10px; font-weight:750; }
+.tooltip-metric strong { display:block; margin:3px 0 1px; color:var(--metric-color); font-size:20px; line-height:1.1; font-variant-numeric:tabular-nums; }
+.tooltip-metric small { display:block; min-height:30px; color:var(--text); font-size:10px; line-height:1.4; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.tooltip-grid { display:grid; grid-template-columns:auto minmax(0,1fr); gap:3px 12px; padding-top:7px; border-top:1px solid rgba(126,111,91,.18); }
+.tooltip-grid span { color:var(--muted); }
+.tooltip-grid b { min-width:0; overflow-wrap:anywhere; text-align:right; font-weight:650; font-variant-numeric:tabular-nums; }
+.tooltip-section { margin-top:8px; padding-top:7px; border-top:1px solid rgba(126,111,91,.18); }
+.tooltip-section-label { color:var(--muted); font-size:10px; font-weight:750; letter-spacing:.06em; text-transform:uppercase; }
+.tooltip-message { max-height:min(230px,30vh); margin-top:4px; overflow:hidden; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--text); font:11.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.tooltip-truncated { margin-top:4px; color:var(--warning); font-size:10px; }
 .cumulative-wrap { padding:4px 18px 14px; }
+.context-radial-wrap { padding:4px 18px 18px; border-top:1px solid rgba(126,111,91,.2); }
+.context-radial-wrap svg { width:min(100%,900px); margin:auto; max-height:680px; }
+.context-source-legend { display:flex; justify-content:center; gap:13px; flex-wrap:wrap; padding:0 18px 12px; color:var(--muted); font-size:11px; }
+.context-source-legend span::before { content:""; display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; background:var(--source-color); }
+.context-turn { cursor:pointer; transition:opacity .14s ease, filter .14s ease; }
+.context-turn.dim { opacity:.14; }
+.context-turn:hover, .context-turn:focus, .context-turn.selected { filter:brightness(1.12) saturate(1.15); outline:none; }
+.context-turn .mapping-line { stroke:var(--text); stroke-width:1; opacity:.2; }
+.context-turn:hover .mapping-line, .context-turn:focus .mapping-line, .context-turn.selected .mapping-line { stroke-width:2.4; opacity:.78; }
+.context-turn .token-sector { stroke:#fffefa; stroke-width:1.2; }
+.context-turn.source-switch .token-sector { stroke-width:4; }
+.context-reference { fill:none; stroke:rgba(117,110,100,.18); stroke-width:1; stroke-dasharray:3 4; }
+.context-reference.context-capacity { stroke:rgba(45,41,36,.75); stroke-width:2.5; stroke-dasharray:none; }
+.context-compaction { cursor:pointer; }
+.context-compaction line { stroke:var(--warning); stroke-width:3; }
+.context-compaction .compaction-position-line { stroke-dasharray:4 4; opacity:.78; }
+.context-compaction .compaction-jump-line { stroke-width:3.5; }
+.context-compaction circle { fill:#fffefa; stroke:var(--warning); stroke-width:2; }
+.context-compaction .compaction-after { fill:var(--warning); }
+.context-zero-tick { stroke-width:2; opacity:.78; }
 .warning-box { margin:16px 0; border-radius:14px; border:1px solid var(--border); overflow:hidden; }
 .warning-box summary { cursor:pointer; padding:13px 16px; background:rgba(247,198,107,.08); color:var(--warning); font-weight:700; }
 .warning-list { margin:0; padding:8px 16px 14px 36px; max-height:300px; overflow:auto; }
@@ -800,7 +1651,7 @@ svg { display:block; width:100%; height:auto; overflow:visible; }
 .warning-list li.error { color:#a74450; }
 .warning-list li.info { color:#5b6f59; }
 .table-wrap { overflow:auto; max-height:720px; border-top:1px solid var(--border); }
-table { border-collapse:separate; border-spacing:0; width:100%; min-width:1320px; }
+table { border-collapse:separate; border-spacing:0; width:100%; min-width:1510px; }
 th { position:sticky; top:0; z-index:2; background:#eee7dc; color:#5f584f; text-align:right; padding:10px 11px; border-bottom:1px solid var(--border); font-size:11px; letter-spacing:.04em; text-transform:uppercase; cursor:pointer; }
 th:first-child, th:nth-child(2), th:nth-child(3), th:last-child { text-align:left; }
 td { padding:9px 11px; border-bottom:1px solid rgba(126,111,91,.18); text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -890,6 +1741,14 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   </section>
 
   <section class="panel">
+    <div class="panel-head">
+      <div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开：外环弧长表示 Token 消耗，内环按轮内快照位置阶梯展示 Context 占用率。</p></div>
+    </div>
+    <div class="context-source-legend" id="context-source-legend"></div>
+    <div class="context-radial-wrap"><svg id="context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div>
+  </section>
+
+  <section class="panel">
     <div class="panel-head"><div><h2>轮次明细</h2><p>数值列使用按列计算的条件格式；点击行或柱形可查看完整用户消息。</p></div></div>
     <div class="table-wrap">
       <table>
@@ -898,7 +1757,8 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
           <th data-sort="modelResponses">模型响应</th><th data-sort="cachedInput">缓存读取</th>
           <th data-sort="cacheWriteInput">缓存写入</th><th data-sort="otherNonCachedInput">其他输入</th>
           <th data-sort="ordinaryOutput">普通输出</th><th data-sort="reasoningOutput">推理输出</th>
-          <th data-sort="total">总量</th><th data-sort="cacheRate">缓存率</th><th data-sort="prompt">用户消息</th>
+          <th data-sort="total">总量</th><th data-sort="cacheRate">缓存率</th>
+          <th data-sort="contextTokens">上下文占用</th><th data-sort="contextRate">上下文率</th><th data-sort="prompt">用户消息</th>
         </tr></thead>
         <tbody id="turn-table-body"></tbody>
       </table>
@@ -912,7 +1772,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   <div class="drawer-head"><div><div class="eyebrow">轮次详情</div><h2 id="drawer-title"></h2></div><button id="drawer-close" type="button">关闭</button></div>
   <div class="drawer-body" id="drawer-body"></div>
 </aside>
-<div class="tooltip" id="tooltip"></div>
+<div class="tooltip" id="turn-tooltip" role="tooltip"></div>
 <script id="report-data" type="application/json">__REPORT_JSON__</script>
 <script>
 (() => {
@@ -934,7 +1794,8 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
   const state = { scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
-  const tooltip = byId("tooltip");
+  const tooltip = byId("turn-tooltip");
+  const TOOLTIP_MESSAGE_LIMIT = 800;
 
   function byId(id) { return document.getElementById(id); }
   function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
@@ -1013,6 +1874,13 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     }));
     byId("drawer-close").addEventListener("click", closeDrawer);
     document.addEventListener("keydown", event => { if (event.key === "Escape") closeDrawer(); });
+    document.addEventListener("click", event => {
+      const drawer = byId("drawer");
+      if (event.button !== 0 || !drawer.classList.contains("open")) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || drawer.contains(target) || target.closest("[data-turn-target=true]")) return;
+      closeDrawer();
+    });
     renderLegend(); syncScaleButtons();
   }
   function setScale(scale) { state.scale = scale; syncScaleButtons(); renderTurnChart(filteredTurns()); }
@@ -1025,18 +1893,17 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     fill.style.left = `${left}%`; fill.style.width = `${Math.max(0,right-left)}%`;
   }
 
-  function filteredTurns() {
-    return turns.filter(turn => {
+  function turnMatchesFilter(turn) {
       if (turn.index < state.start || turn.index > state.end || !state.statuses.has(turn.status)) return false;
       if (!state.search) return true;
       const haystack = [turn.turnId, turn.status, turn.models.join(" "), turn.efforts.join(" "), firstPrompt(turn)].join(" ").toLocaleLowerCase();
       return haystack.includes(state.search);
-    });
   }
+  function filteredTurns() { return turns.filter(turnMatchesFilter); }
   function renderAll() {
     byId("range-start-value").textContent = state.start; byId("range-end-value").textContent = state.end; updateRangeFill();
     const visible = filteredTurns(); byId("visible-count").textContent = `当前显示 ${visible.length} 轮`;
-    renderTurnChart(visible); renderTable(visible); renderCumulative();
+    renderTurnChart(visible); renderTable(visible); renderCumulative(); renderContextRadial();
   }
 
   function svgEl(name, attrs = {}) { const el = document.createElementNS("http://www.w3.org/2000/svg", name); Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k, v)); return el; }
@@ -1047,14 +1914,108 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     const nice = (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * power; const result = [];
     for (let n = 0; n <= max + nice * .25; n += nice) result.push(n); return result;
   }
+  function positionTooltip(event, target) {
+    const targetRect = target?.getBoundingClientRect?.();
+    const pointerX = Number.isFinite(event?.clientX) ? event.clientX : targetRect ? targetRect.left + targetRect.width / 2 : innerWidth / 2;
+    const pointerY = Number.isFinite(event?.clientY) ? event.clientY : targetRect ? targetRect.top + targetRect.height / 2 : innerHeight / 2;
+    tooltip.style.display = "block"; tooltip.style.visibility = "hidden";
+    const gap = 14, edge = 8, width = tooltip.offsetWidth, height = tooltip.offsetHeight;
+    let x = pointerX + gap, y = pointerY + gap;
+    if (x + width > innerWidth - edge) x = pointerX - width - gap;
+    if (y + height > innerHeight - edge) y = pointerY - height - gap;
+    tooltip.style.left = `${Math.max(edge,Math.min(x,innerWidth-width-edge))}px`;
+    tooltip.style.top = `${Math.max(edge,Math.min(y,innerHeight-height-edge))}px`;
+    tooltip.style.visibility = "visible";
+  }
   function showTooltip(event, turn) {
     const b = turn.breakdown;
     tooltip.innerHTML = `<strong>第 ${turn.index} 轮 · ${esc(statusText(turn.status))}</strong>` + segmentKeys.filter(key => b[key]).map(key => `<div class="row"><span>${esc(segmentLabels[key])}</span><b>${formatTokens(b[key])}</b></div>`).join("") + `<div class="row"><span>总量</span><b>${formatTokens(turn.usage.total)}</b></div><div style="margin-top:6px;color:var(--muted);max-height:48px;overflow:hidden">${esc(firstPrompt(turn) || "未记录用户消息")}</div>`;
-    tooltip.style.display = "block"; const pad = 14; let x = event.clientX + pad, y = event.clientY + pad;
-    if (x + 370 > innerWidth) x = event.clientX - 370; if (y + tooltip.offsetHeight > innerHeight) y = event.clientY - tooltip.offsetHeight - pad;
-    tooltip.style.left = `${Math.max(8,x)}px`; tooltip.style.top = `${Math.max(8,y)}px`;
+    positionTooltip(event,event.currentTarget);
   }
-  function hideTooltip() { tooltip.style.display = "none"; }
+  function initialMessagePreview(turn) {
+    const message = (turn.messages || [])[0];
+    if (!message) return {text:messagesIncluded ? "该轮未记录用户消息。" : "生成报告时已排除用户消息。",truncated:false};
+    const full = String(message.text || "");
+    if (!full) { const attachments=[message.imageCount?`${message.imageCount} 张图片`:"",message.audioCount?`${message.audioCount} 条音频`:""].filter(Boolean).join(" · "); return {text:attachments?`初始消息包含 ${attachments}，无文本。`:"初始用户消息没有文本。",truncated:false}; }
+    return {text:full.slice(0,TOOLTIP_MESSAGE_LIMIT),truncated:full.length>TOOLTIP_MESSAGE_LIMIT};
+  }
+  function showTurnTooltip(event, turn, target, conversationTotal) {
+    if (event?.pointerType === "touch") { hideTooltip(); return; }
+    const b = turn.breakdown || {}, snapshot = contextSnapshot(turn), message = initialMessagePreview(turn);
+    const tokenRows = segmentKeys.map(key => `<span>${esc(segmentLabels[key])}</span><b>${formatTokens(b[key]||0)}</b>`).join("");
+    const contextPortion = snapshot.occupancyRate == null ? "未知" : `${Number(snapshot.occupancyRate).toFixed(2)}%`;
+    const contextAbsolute = snapshot.occupancyRate == null ? "未记录 Context 快照" : `${formatTokens(snapshot.tokens)} / ${snapshot.windowTokens == null ? "—" : formatTokens(snapshot.windowTokens)} Token`;
+    const tokenPortion = conversationTotal>0 ? `${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%` : "—";
+    const tokenAbsolute = `${formatTokens(turn.usage.total)} / ${formatTokens(conversationTotal)} Token`;
+    tooltip.innerHTML = `<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div>`
+      + `<div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div>`
+      + `<div class="tooltip-grid"><span>来源</span><b>${esc(sourceLabel(turn))}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${formatTokens(turn.compactions)}</b></div>`
+      + `<div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${formatTokens(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div>`
+      + `<div class="tooltip-section"><div class="tooltip-section-label">初始用户消息</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;
+    positionTooltip(event,target);
+  }
+  function moveTurnTooltip(event, target) { if (event.pointerType !== "touch" && tooltip.style.display === "block") positionTooltip(event,target); }
+  function focusTurnTooltip(event, turn, target, conversationTotal) { if (target.matches(":focus-visible")) showTurnTooltip(event,turn,target,conversationTotal); }
+  function turnTargetKeydown(event, turn) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); hideTooltip(); openDrawer(turn); } }
+  function hideTooltip() { tooltip.style.display = "none"; tooltip.style.visibility = "hidden"; }
+
+  function contextTypeText(type) {
+    return ({turn_end:"结束时",range_latest:"范围内最新",current_latest:"当前最新",unknown:"未知"})[type] || "未知";
+  }
+  function contextSnapshot(turn) { return turn.contextSnapshot || {snapshotType:"unknown",tokens:null,windowTokens:null,occupancyRate:null,timestamp:null}; }
+  function contextTimeline(turn, tokens) {
+    const points=(turn.contextTimeline||[]).filter(point=>point.occupancyRate!=null).map(point=>({...point,turnTokenOffset:Math.max(0,Math.min(tokens,Number(point.turnTokenOffset)||0))})).sort((a,b)=>a.turnTokenOffset-b.turnTokenOffset||String(a.timestamp||"").localeCompare(String(b.timestamp||"")));
+    if(points.length) return points;
+    const fallback=contextSnapshot(turn);
+    return fallback.occupancyRate==null?[]:[{...fallback,turnTokenOffset:tokens}];
+  }
+  function contextBands(turn, tokens) {
+    if(tokens<=0) return [];
+    const points=contextTimeline(turn,tokens);
+    if(!points.length) return [{start:0,end:tokens,snapshot:null}];
+    const bands=[];let cursor=0,active=null;
+    points.forEach(point=>{if(point.turnTokenOffset>cursor){bands.push({start:cursor,end:point.turnTokenOffset,snapshot:active||point});cursor=point.turnTokenOffset}active=point});
+    if(cursor<tokens) bands.push({start:cursor,end:tokens,snapshot:active||points.at(-1)});
+    return bands;
+  }
+  function contextRateText(snapshot) { return snapshot.occupancyRate == null ? "—" : `${Number(snapshot.occupancyRate).toFixed(2)}%`; }
+  const sourcePalette=["#3b8b78","#bd7556","#8c78bd","#d9874c","#4f78a8","#b35f79","#6d8c45","#a56c3f"];
+  function sourceId(turn){return turn.sourceRolloutId||report.metadata.threadId||"main"}
+  function sourceLabel(turn){return turn.sourceLabel||"主会话"}
+  function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
+  function contextOrderTime(turn){const snapshot=contextSnapshot(turn);return snapshot.timestamp||turn.endedAt||turn.rangeLastActivityAt||turn.startedAt||""}
+  const contextGap=Math.PI/180,contextStart=-Math.PI/2+contextGap/2,contextSpan=2*Math.PI-contextGap;
+  function radialPoint(cx,cy,r,fraction){const angle=contextStart+Math.max(0,Math.min(1,fraction))*contextSpan;return{x:cx+r*Math.cos(angle),y:cy+r*Math.sin(angle)}}
+  function arcLinePath(cx,cy,r,start,end){const a=radialPoint(cx,cy,r,start),b=radialPoint(cx,cy,r,end),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${r},${r} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)}`}
+  function arcBandPath(cx,cy,inner,outer,start,end){if(end-start<=1e-9)return"";const a=radialPoint(cx,cy,outer,start),b=radialPoint(cx,cy,outer,end),c=radialPoint(cx,cy,inner,end),d=radialPoint(cx,cy,inner,start),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${outer},${outer} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)} L${c.x.toFixed(2)},${c.y.toFixed(2)} A${inner},${inner} 0 ${large} 0 ${d.x.toFixed(2)},${d.y.toFixed(2)} Z`}
+  function renderContextRadial(){
+    const svg=byId("context-radial-chart");clearSvg(svg);svg.setAttribute("viewBox","0 0 760 620");
+    const ordered=[...turns].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),cx=380,cy=300,innerBase=105,innerMax=178,outerInner=202,outerOuter=234;
+    const sources=[...new Map(ordered.map(turn=>[sourceId(turn),{id:sourceId(turn),label:sourceLabel(turn)}])).values()];
+    byId("context-source-legend").innerHTML=sources.map(source=>`<span style="--source-color:${sourceColor(source.id)}">${esc(source.label)}</span>`).join("");
+    if(!ordered.length){addText(svg,cx,cy,"没有可显示的 turn","middle");return}
+    const defs=svgEl("defs"),pattern=svgEl("pattern",{id:"context-unknown-pattern",width:8,height:8,patternUnits:"userSpaceOnUse",patternTransform:"rotate(35)"}),arrow=svgEl("marker",{id:"context-compaction-arrow",markerWidth:8,markerHeight:8,refX:7,refY:4,orient:"auto",markerUnits:"userSpaceOnUse"});pattern.appendChild(svgEl("line",{x1:0,y1:0,x2:0,y2:8,stroke:css("--muted"),"stroke-width":2,opacity:.42}));arrow.appendChild(svgEl("path",{d:"M0,0 L8,4 L0,8 Z",fill:css("--warning")}));defs.append(pattern,arrow);svg.appendChild(defs);
+    svg.appendChild(svgEl("path",{d:arcBandPath(cx,cy,outerInner,outerOuter,0,1),fill:"#e9e2d7"}));
+    [25,50,75,100].forEach(rate=>{const capacity=rate===100,radius=innerBase+(innerMax-innerBase)*rate/100;svg.appendChild(svgEl("path",{d:arcLinePath(cx,cy,radius,0,1),class:capacity?"context-reference context-capacity":"context-reference"}));const point=radialPoint(cx,cy,radius,0);const label=svgEl("text",{x:point.x+5,y:point.y+3,fill:capacity?css("--text"):css("--muted"),"font-size":capacity?"10":"9","font-weight":capacity?"750":"400"});label.textContent=capacity?"Context 100%":`${rate}%`;svg.appendChild(label)});
+    const total=ordered.reduce((sum,turn)=>sum+Math.max(0,Number(turn.usage.total)||0),0),denominator=Math.max(total,1);let consumed=0;
+    const entries=ordered.map(turn=>{const tokens=Math.max(0,Number(turn.usage.total)||0),entry={turn,tokens,tokenStart:consumed,start:consumed/denominator,end:(consumed+tokens)/denominator};consumed+=tokens;return entry});
+    const observed=ordered.flatMap(turn=>contextTimeline(turn,Math.max(0,Number(turn.usage.total)||0)).map(snapshot=>({turn,snapshot}))),peak=observed.reduce((best,item)=>Number(item.snapshot.occupancyRate)>Number(best?.snapshot?.occupancyRate??-1)?item:best,null),compactionCount=ordered.reduce((sum,turn)=>sum+(turn.contextCompactions||[]).length,0);
+    const centerTitle=svgEl("text",{x:cx,y:cy-38,"text-anchor":"middle",fill:css("--muted"),"font-size":"13"}),centerValue=svgEl("text",{x:cx,y:cy-4,"text-anchor":"middle",fill:css("--text"),"font-size":"27","font-weight":"760"}),centerDetail=svgEl("text",{x:cx,y:cy+24,"text-anchor":"middle",fill:css("--text"),"font-size":"12"}),centerMeta=svgEl("text",{x:cx,y:cy+48,"text-anchor":"middle",fill:css("--muted"),"font-size":"11"});svg.append(centerTitle,centerValue,centerDetail,centerMeta);
+    function resetCenter(){centerTitle.textContent="完整会话";centerValue.textContent=`${compact(total)} Token`;centerDetail.textContent=peak?`Context 峰值 ${contextRateText(peak.snapshot)}`:"Context 峰值未知";centerMeta.textContent=`${compactionCount} 次 Compaction`}
+    function showCenter(turn){const snapshot=contextSnapshot(turn);centerTitle.textContent=`${sourceLabel(turn)} · ${statusText(turn.status)}`;centerValue.textContent=`${compact(turn.usage.total)} Token`;centerDetail.textContent=snapshot.tokens==null?"Context 未知":`${formatTokens(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":formatTokens(snapshot.windowTokens)} Token`;centerMeta.textContent=snapshot.tokens==null?contextTypeText(snapshot.snapshotType):`${contextRateText(snapshot)} · ${contextTypeText(snapshot.snapshotType)}`}
+    resetCenter();
+    let previousSource=null;
+    entries.forEach(entry=>{const {turn,tokens,tokenStart,start,end}=entry,snapshot=contextSnapshot(turn),source=sourceId(turn),color=sourceColor(source),knownContext=snapshot.tokens!=null&&snapshot.occupancyRate!=null,rate=Math.max(0,Math.min(100,Number(snapshot.occupancyRate)||0)),contextOuter=innerBase+(innerMax-innerBase)*rate/100,dim=!turnMatchesFilter(turn),sourceSwitch=previousSource!==null&&previousSource!==source;previousSource=source;
+      const group=svgEl("g",{class:`context-turn context-sector${dim?" dim":""}${state.selected===turn.turnId?" selected":""}${sourceSwitch?" source-switch":""}`,tabindex:"0",role:"button","data-turn-target":"true","aria-label":`${sourceLabel(turn)}，${formatTokens(tokens)} Token，Context ${knownContext?contextRateText(snapshot):"未知"}`});
+      if(tokens>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,outerInner,outerOuter,start,end),fill:color,class:"token-sector"}));contextBands(turn,tokens).forEach(band=>{const bandStart=(tokenStart+band.start)/denominator,bandEnd=(tokenStart+band.end)/denominator,bandRate=band.snapshot?.occupancyRate,knownBand=bandRate!=null,bandOuter=innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(bandRate)||0))/100;group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,innerBase,knownBand?Math.max(innerBase+1.5,bandOuter):innerMax,bandStart,bandEnd),fill:knownBand?color:"url(#context-unknown-pattern)",opacity:knownBand?.44:.7,class:"context-band"}))});}
+      else{const a=radialPoint(cx,cy,innerBase-4,start),b=radialPoint(cx,cy,outerOuter+9,start);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,stroke:color,class:"context-zero-tick"}));if(knownContext){const p=radialPoint(cx,cy,Math.max(innerBase+1.5,contextOuter),start);group.appendChild(svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:color,stroke:"#fffefa","stroke-width":1.5}))}}
+      [start,end].forEach(fraction=>{const a=radialPoint(cx,cy,innerBase,fraction),b=radialPoint(cx,cy,outerOuter,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"mapping-line"}))});
+      const hitEnd=tokens>0?end:Math.min(1,start+.004);group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,innerBase-7,outerOuter+8,start,hitEnd),fill:"rgba(0,0,0,.001)"}));group.addEventListener("pointerenter",event=>{showCenter(turn);showTurnTooltip(event,turn,group,total)});group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",()=>{resetCenter();hideTooltip()});group.addEventListener("focus",event=>{showCenter(turn);focusTurnTooltip(event,turn,group,total)});group.addEventListener("blur",()=>{resetCenter();hideTooltip()});group.addEventListener("keydown",event=>turnTargetKeydown(event,turn));group.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(group);
+      (turn.contextCompactions||[]).forEach(event=>{const offset=Math.max(0,Math.min(tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,marker=svgEl("g",{class:"context-compaction",tabindex:"0",role:"button","data-turn-target":"true","aria-label":`Compaction，累计 Token 位置 ${((fraction)*100).toFixed(2)}%`}),positionOuter=radialPoint(cx,cy,outerOuter+12,fraction),beforeRate=event.before?.occupancyRate,afterRate=event.after?.occupancyRate;if(beforeRate!=null&&afterRate!=null){const before=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(beforeRate)))/100,fraction),after=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(afterRate)))/100,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:before.x,y2:before.y,class:"compaction-position-line"}));marker.appendChild(svgEl("line",{x1:before.x,y1:before.y,x2:after.x,y2:after.y,class:"compaction-jump-line","marker-end":"url(#context-compaction-arrow)"}));marker.appendChild(svgEl("circle",{cx:before.x,cy:before.y,r:4,class:"compaction-before"}));marker.appendChild(svgEl("circle",{cx:after.x,cy:after.y,r:4,class:"compaction-after"}))}else{const positionInner=radialPoint(cx,cy,innerMax+5,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:positionInner.x,y2:positionInner.y,class:"compaction-position-line"}))}const title=svgEl("title");title.textContent=`Compaction · ${dateText(event.timestamp)} · ${event.before?.tokens==null?"未知":formatTokens(event.before.tokens)} → ${event.after?.tokens==null?"未知":formatTokens(event.after.tokens)} Context Token`;marker.appendChild(title);marker.addEventListener("focus",()=>showCenter(turn));marker.addEventListener("blur",resetCenter);marker.addEventListener("keydown",keyEvent=>turnTargetKeydown(keyEvent,turn));marker.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(marker)})
+    });
+    const startPoint=radialPoint(cx,cy,outerOuter+18,0),endPoint=radialPoint(cx,cy,outerOuter+18,1);[[startPoint,"Token 0%","start"],[endPoint,"Token 100%","end"]].forEach(([point,label,anchor])=>{const node=svgEl("text",{x:point.x,y:point.y+4,"text-anchor":anchor,fill:css("--muted"),"font-size":"11","font-weight":"700"});node.textContent=label;svg.appendChild(node)});
+    const outerLabel=svgEl("text",{x:24,y:33,fill:css("--muted"),"font-size":"12","font-weight":"700"});outerLabel.textContent="外环 · Token 消耗（累计 Token 进度）";svg.appendChild(outerLabel);const innerLabel=svgEl("text",{x:24,y:53,fill:css("--muted"),"font-size":"12"});innerLabel.textContent="内环 · Context 快照（按 Token 位置阶梯变化）";svg.appendChild(innerLabel)
+  }
 
   function renderTurnChart(visible) {
     const svg = byId("turn-chart"); clearSvg(svg);
@@ -1069,7 +2030,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     visible.forEach((turn, position) => {
       const x = margin.left + position*step + (step-barW)/2, total = Math.max(0,turn.usage.total), totalHeight = innerH*scaled(total);
       let y = margin.top + innerH;
-      const group = svgEl("g", {class:`bar${state.selected===turn.turnId?" selected":""}`, tabindex:"0", role:"button", "aria-label":`第 ${turn.index} 轮，${formatTokens(total)} Token`});
+      const group = svgEl("g", {class:`bar${state.selected===turn.turnId?" selected":""}`, tabindex:"0", role:"button", "data-turn-target":"true", "aria-label":`第 ${turn.index} 轮，${formatTokens(total)} Token`});
       segmentKeys.forEach(key => { const value = Math.max(0,turn.breakdown[key]||0); if (!value || !total) return; const h = totalHeight * value / Math.max(total,1); y -= h; group.appendChild(svgEl("rect", {x,y,width:barW,height:Math.max(.5,h),fill:colors[key],rx:"1"})); });
       group.addEventListener("mousemove", event => showTooltip(event,turn)); group.addEventListener("mouseleave",hideTooltip); group.addEventListener("focus", event => showTooltip(event,turn)); group.addEventListener("blur",hideTooltip); group.addEventListener("click",() => openDrawer(turn));
       svg.appendChild(group);
@@ -1091,7 +2052,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
 
   function sortValue(turn,key) {
     if (key in turn.breakdown) return turn.breakdown[key]; if (key in turn.usage) return turn.usage[key];
-    if (key === "cacheRate") return cacheRate(turn); if (key === "prompt") return firstPrompt(turn).toLocaleLowerCase(); return turn[key] ?? "";
+    if (key === "cacheRate") return cacheRate(turn); if (key === "contextTokens") return Number(contextSnapshot(turn).tokens) || 0; if (key === "contextRate") return Number(contextSnapshot(turn).occupancyRate) || 0; if (key === "prompt") return firstPrompt(turn).toLocaleLowerCase(); return turn[key] ?? "";
   }
   function numericMax(items, getter) { return items.reduce((max, item) => Math.max(max, Number(getter(item)) || 0), 1); }
   function heatStyle(value, max, highIsGood = false) {
@@ -1106,25 +2067,26 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       modelResponses:numericMax(visible,t=>t.modelResponses), cachedInput:numericMax(visible,t=>t.breakdown.cachedInput),
       cacheWriteInput:numericMax(visible,t=>t.breakdown.cacheWriteInput), otherNonCachedInput:numericMax(visible,t=>t.breakdown.otherNonCachedInput),
       ordinaryOutput:numericMax(visible,t=>t.breakdown.ordinaryOutput), reasoningOutput:numericMax(visible,t=>t.breakdown.reasoningOutput),
-      total:numericMax(visible,t=>t.usage.total)
+      total:numericMax(visible,t=>t.usage.total), contextTokens:numericMax(visible,t=>contextSnapshot(t).tokens)
     };
     byId("table-empty").hidden=sorted.length>0;
-    byId("turn-table-body").innerHTML=sorted.map(turn=>{const b=turn.breakdown,prompt=firstPrompt(turn).replace(/\s+/g," ").trim(),rate=cacheRate(turn);return `<tr data-turn-id="${esc(turn.turnId)}" class="${state.selected===turn.turnId?"selected":""}"><td>${turn.index}</td><td><span class="status ${esc(turn.status)}">${esc(statusText(turn.status))}</span></td><td>${esc(dateText(turn.startedAt))}</td><td class="heat-cell" style="${heatStyle(turn.modelResponses,maxima.modelResponses)}">${formatTokens(turn.modelResponses)}</td><td class="heat-cell" style="${heatStyle(b.cachedInput,maxima.cachedInput)}">${formatTokens(b.cachedInput)}</td><td${cacheWriteAvailable?` class="heat-cell" style="${heatStyle(b.cacheWriteInput,maxima.cacheWriteInput)}"`:""}>${cacheWriteAvailable?formatTokens(b.cacheWriteInput):"不适用"}</td><td class="heat-cell" style="${heatStyle(b.otherNonCachedInput,maxima.otherNonCachedInput)}">${formatTokens(b.otherNonCachedInput)}</td><td class="heat-cell" style="${heatStyle(b.ordinaryOutput,maxima.ordinaryOutput)}">${formatTokens(b.ordinaryOutput)}</td><td class="heat-cell" style="${heatStyle(b.reasoningOutput,maxima.reasoningOutput)}">${formatTokens(b.reasoningOutput)}</td><td class="heat-cell" style="${heatStyle(turn.usage.total,maxima.total)}"><b>${formatTokens(turn.usage.total)}</b></td><td class="heat-cell" style="${heatStyle(rate,100,true)}">${rate.toFixed(2)}%</td><td class="prompt-cell" title="${esc(prompt)}">${esc(prompt||"—")}</td></tr>`;}).join("");
+    byId("turn-table-body").innerHTML=sorted.map(turn=>{const b=turn.breakdown,prompt=firstPrompt(turn).replace(/\s+/g," ").trim(),rate=cacheRate(turn),snapshot=contextSnapshot(turn),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return `<tr data-turn-id="${esc(turn.turnId)}" data-turn-target="true" class="${state.selected===turn.turnId?"selected":""}"><td>${turn.index}</td><td><span class="status ${esc(turn.status)}">${esc(statusText(turn.status))}</span></td><td>${esc(dateText(turn.startedAt))}</td><td class="heat-cell" style="${heatStyle(turn.modelResponses,maxima.modelResponses)}">${formatTokens(turn.modelResponses)}</td><td class="heat-cell" style="${heatStyle(b.cachedInput,maxima.cachedInput)}">${formatTokens(b.cachedInput)}</td><td${cacheWriteAvailable?` class="heat-cell" style="${heatStyle(b.cacheWriteInput,maxima.cacheWriteInput)}"`:""}>${cacheWriteAvailable?formatTokens(b.cacheWriteInput):"不适用"}</td><td class="heat-cell" style="${heatStyle(b.otherNonCachedInput,maxima.otherNonCachedInput)}">${formatTokens(b.otherNonCachedInput)}</td><td class="heat-cell" style="${heatStyle(b.ordinaryOutput,maxima.ordinaryOutput)}">${formatTokens(b.ordinaryOutput)}</td><td class="heat-cell" style="${heatStyle(b.reasoningOutput,maxima.reasoningOutput)}">${formatTokens(b.reasoningOutput)}</td><td class="heat-cell" style="${heatStyle(turn.usage.total,maxima.total)}"><b>${formatTokens(turn.usage.total)}</b></td><td class="heat-cell" style="${heatStyle(rate,100,true)}">${rate.toFixed(2)}%</td><td class="heat-cell" title="${esc(contextTitle)}" style="${snapshot.tokens==null?"":heatStyle(snapshot.tokens,maxima.contextTokens)}">${snapshot.tokens==null?"—":formatTokens(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="prompt-cell" title="${esc(prompt)}">${esc(prompt||"—")}</td></tr>`;}).join("");
     byId("turn-table-body").querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer(turns.find(t=>t.turnId===row.dataset.turnId))));
   }
 
   function openDrawer(turn) {
-    if (!turn) return; state.selected=turn.turnId; byId("drawer-title").textContent=`第 ${turn.index} 轮`; const b=turn.breakdown;
-    const details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["开始时间",dateText(turn.startedAt)],["持续时间",durationText(turn.durationMs)],["模型",turn.models.join(", ")||"—"],["推理强度",turn.efforts.join(", ")||"—"],["模型响应",formatTokens(turn.modelResponses)],["Token 快照",formatTokens(turn.tokenSnapshots)],["上下文压缩",formatTokens(turn.compactions)],["总 Token",formatTokens(turn.usage.total)],["输入",formatTokens(turn.usage.input)],["输出",formatTokens(turn.usage.output)]];
+    if (!turn) return; state.selected=turn.turnId; byId("drawer-title").textContent=`第 ${turn.index} 轮`; const b=turn.breakdown,snapshot=contextSnapshot(turn);
+    const details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["开始时间",dateText(turn.startedAt)],["持续时间",durationText(turn.durationMs)],["模型",turn.models.join(", ")||"—"],["推理强度",turn.efforts.join(", ")||"—"],["模型响应",formatTokens(turn.modelResponses)],["Token 快照",formatTokens(turn.tokenSnapshots)],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":formatTokens(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":formatTokens(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",formatTokens(turn.compactions)],["总 Token",formatTokens(turn.usage.total)],["输入",formatTokens(turn.usage.input)],["输出",formatTokens(turn.usage.output)]];
     let body=`<div class="detail-grid">${details.map(([k,v])=>`<div class="detail-item"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
     body+=`<div class="message"><div class="message-head">Token 构成</div><pre>${segmentKeys.map(key=>`${segmentLabels[key]}：${formatTokens(b[key]||0)}`).join("\n")}</pre></div>`;
+    if((turn.contextCompactions||[]).length){const compactionLines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${formatTokens(value.tokens)} / ${value.windowTokens==null?"—":formatTokens(value.windowTokens)} · ${contextRateText(value)}`:"未知";return `#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":formatTokens(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});body+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(compactionLines.join("\n\n"))}</pre></div>`;}
     if (turn.messages.length) body+=turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i===0?"初始用户消息":"追加用户消息"} · ${esc(dateText(m.timestamp))}${m.imageCount?` · ${m.imageCount} 张图片`:""}${m.audioCount?` · ${m.audioCount} 条音频`:""}</div><pre></pre></section>`).join("");
     else body+=`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;
     byId("drawer-body").innerHTML=body;
     byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>{pre.textContent=turn.messages[i].text;});
-    byId("drawer").classList.add("open"); byId("drawer").setAttribute("aria-hidden","false"); renderTurnChart(filteredTurns()); renderTable(filteredTurns());
+    byId("drawer").classList.add("open"); byId("drawer").setAttribute("aria-hidden","false"); renderTurnChart(filteredTurns()); renderTable(filteredTurns()); renderContextRadial();
   }
-  function closeDrawer() { state.selected=null; byId("drawer").classList.remove("open"); byId("drawer").setAttribute("aria-hidden","true"); renderTurnChart(filteredTurns()); renderTable(filteredTurns()); }
+  function closeDrawer() { state.selected=null; byId("drawer").classList.remove("open"); byId("drawer").setAttribute("aria-hidden","true"); renderTurnChart(filteredTurns()); renderTable(filteredTurns()); renderContextRadial(); }
 
   try { renderHeader(); renderWarnings(); configureControls(); renderAll(); document.body.dataset.reportReady="true"; }
   catch (error) { document.body.dataset.reportReady="error"; const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error); }
@@ -1135,9 +2097,175 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
 """
 
 
+RANGE_HTML_TEMPLATE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>__PAGE_TITLE__</title>
+<style>
+:root{--bg:#f5f2ec;--panel:#fffefa;--panel2:#f0e9dd;--text:#2d2924;--muted:#756e64;--border:#ddd5c9;--accent:#3b8b78;--danger:#c95561;--warning:#b77a26;--cached:#4f9d87;--cache-write:#8c78bd;--uncached:#d9874c;--output:#dca83e;--reasoning:#cf6f78;--unclassified:#928a80;--shadow:0 16px 42px rgba(92,75,54,.12)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -15%,rgba(87,166,141,.16),transparent 38rem),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input{font:inherit}button{cursor:pointer;color:inherit}.shell{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh;transition:grid-template-columns .2s ease}.shell.session-nav-closed{grid-template-columns:0 minmax(0,1fr)}.sidebar{position:sticky;z-index:60;top:0;width:300px;height:100vh;overflow:auto;padding:22px 16px;background:rgba(238,231,220,.96);border-right:1px solid var(--border);backdrop-filter:blur(18px);transition:transform .2s ease,opacity .2s ease,visibility .2s}.shell.session-nav-closed .sidebar{transform:translateX(-104%);opacity:0;visibility:hidden;pointer-events:none}.sidebar-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.sidebar-head button,.session-drawer-toggle{border:1px solid var(--border);border-radius:9px;background:var(--panel);padding:7px 9px}.brand{padding:0 8px 16px;min-width:0;flex:1}.eyebrow{color:var(--accent);text-transform:uppercase;letter-spacing:.14em;font-size:11px;font-weight:800}.brand h2{margin:5px 0 4px;font-size:20px}.muted{color:var(--muted)}.nav-search,.content-search{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:9px;background:var(--panel);color:var(--text)}.session-list{display:grid;gap:7px;margin-top:12px}.session-button{width:100%;text-align:left;padding:11px;border:1px solid transparent;border-radius:11px;background:transparent}.session-button:hover,.session-button.active{background:var(--panel);border-color:var(--accent);box-shadow:0 6px 18px rgba(92,75,54,.08)}.session-button strong,.session-button span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-button span{color:var(--muted);font-size:11px;margin-top:3px}.session-drawer-backdrop{display:none;position:fixed;z-index:55;inset:0;border:0;border-radius:0;padding:0;background:rgba(45,41,36,.28)}.content{min-width:0;padding:28px clamp(16px,3vw,44px) 64px}.content-topbar{display:flex;align-items:center;min-height:36px;margin-bottom:10px}.session-drawer-toggle{display:inline-flex;align-items:center;gap:7px}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.hero h1{font-size:clamp(28px,4vw,46px);line-height:1.08;margin:7px 0 9px;letter-spacing:-.035em}.subline{color:var(--muted);overflow-wrap:anywhere}.sensitive{color:#984b55;background:#fae9e8;border:1px solid #e8c4c2;border-radius:999px;padding:7px 11px;font-size:12px;white-space:nowrap}.sensitive.safe{color:#3f765f;background:#e8f3eb;border-color:#c3ddcb}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:11px;margin:20px 0}.card,.panel{background:linear-gradient(180deg,rgba(255,254,250,.98),rgba(252,249,243,.98));border:1px solid var(--border);box-shadow:var(--shadow)}.card{padding:15px;border-radius:14px;min-height:100px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.07em}.value{font-size:clamp(21px,2.2vw,30px);font-weight:760;margin-top:7px;font-variant-numeric:tabular-nums}.note{color:var(--muted);font-size:11px}.panel{border-radius:16px;margin-top:15px;overflow:hidden}.panel-head{padding:17px 19px 12px;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.panel-head h2{font-size:18px;margin:0}.panel-head p{color:var(--muted);margin:3px 0 0}.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.controls button{border:1px solid var(--border);border-radius:8px;padding:7px 9px;background:var(--panel)}.controls button.active{border-color:var(--accent);color:var(--accent)}.filters{padding:0 19px 14px;display:flex;gap:11px;align-items:center;flex-wrap:wrap;color:var(--muted)}.filters .content-search{min-width:260px;flex:1}.check{display:inline-flex;align-items:center;gap:4px}.legend{padding:0 19px 13px;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:11px}.legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;background:var(--swatch)}.chart-scroll,.table-wrap{overflow:auto;border-top:1px solid var(--border)}.chart-wrap{min-width:900px;padding:8px 10px 2px}.trend-wrap{padding:4px 16px 12px;overflow:auto}.trend-wrap svg{min-width:760px}svg{display:block;width:100%;height:auto}.grid{stroke:rgba(117,110,100,.2)}.bar{cursor:pointer}.bar:hover{filter:brightness(1.16)}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1430px}th{position:sticky;top:0;z-index:2;background:#eee7dc;color:#5f584f;text-align:right;padding:10px;border-bottom:1px solid var(--border);font-size:10px;letter-spacing:.04em;text-transform:uppercase}th:first-child,th:nth-child(2),th:nth-child(3),th:last-child,td:first-child,td:nth-child(2),td:nth-child(3),td:last-child{text-align:left}td{padding:9px 10px;border-bottom:1px solid rgba(126,111,91,.18);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}tbody tr{cursor:pointer}tbody tr:hover{outline:1px solid rgba(59,139,120,.3);outline-offset:-1px}.title-cell{max-width:390px;overflow:hidden;text-overflow:ellipsis}.warning-box{margin:15px 0;border:1px solid var(--border);border-radius:12px;overflow:hidden}.warning-box summary{cursor:pointer;padding:12px 15px;color:var(--warning);font-weight:700}.warning-list{max-height:260px;overflow:auto;margin:0;padding:4px 18px 14px 34px}.warning-list li{margin:5px 0;color:var(--muted)}.warning-list li.error{color:#a74450}.empty{padding:36px;text-align:center;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:11px;margin-top:25px}.drawer{position:fixed;z-index:50;top:0;right:0;width:min(620px,94vw);height:100vh;transform:translateX(104%);transition:transform .2s;background:#fbf8f2;border-left:1px solid var(--border);box-shadow:-24px 0 60px rgba(92,75,54,.22);display:flex;flex-direction:column}.drawer.open{transform:translateX(0)}.drawer-head{padding:18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}.drawer-head h2{margin:2px 0}.drawer-head button{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:7px 10px}.drawer-body{overflow:auto;padding:16px 18px 50px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.detail{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.detail b{display:block;margin-top:3px;overflow-wrap:anywhere}.message{margin-top:12px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.message-head{padding:7px 10px;background:var(--panel2);color:var(--muted);font-size:11px}.message pre{margin:0;padding:11px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.provisional{color:var(--warning)}
+.context-radial-wrap{padding:4px 18px 18px;border-top:1px solid var(--border)}.context-radial-wrap svg{width:min(100%,900px);margin:auto;max-height:680px}.source-legend{display:flex;justify-content:center;gap:11px;flex-wrap:wrap;padding:0 18px 12px;color:var(--muted);font-size:11px}.source-legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;background:var(--source-color)}.context-turn{cursor:pointer;transition:opacity .14s ease,filter .14s ease}.context-turn.dim{opacity:.14}.context-turn:hover,.context-turn:focus,.context-turn.selected{filter:brightness(1.12) saturate(1.15);outline:none}.context-turn .mapping-line{stroke:var(--text);stroke-width:1;opacity:.2}.context-turn:hover .mapping-line,.context-turn:focus .mapping-line,.context-turn.selected .mapping-line{stroke-width:2.4;opacity:.78}.context-turn .token-sector{stroke:#fffefa;stroke-width:1.2}.context-turn.source-switch .token-sector{stroke-width:4}.context-reference{fill:none;stroke:rgba(117,110,100,.18);stroke-width:1;stroke-dasharray:3 4}.context-reference.context-capacity{stroke:rgba(45,41,36,.75);stroke-width:2.5;stroke-dasharray:none}.context-compaction{cursor:pointer}.context-compaction line{stroke:var(--warning);stroke-width:3}.context-compaction circle{fill:#fffefa;stroke:var(--warning);stroke-width:2}.context-zero-tick{stroke-width:2;opacity:.78}
+.context-compaction .compaction-position-line{stroke-dasharray:4 4;opacity:.78}.context-compaction .compaction-jump-line{stroke-width:3.5}.context-compaction .compaction-after{fill:var(--warning)}
+.tooltip{position:fixed;z-index:80;pointer-events:none;display:none;visibility:hidden;width:min(440px,calc(100vw - 16px));max-height:calc(100vh - 16px);overflow:hidden;padding:12px 13px;border:1px solid var(--border);border-radius:11px;background:#fffefa;box-shadow:var(--shadow);font-size:12px;transition:none}.tooltip-title{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px}.tooltip-title strong{font-size:13px}.tooltip-badge{flex:none;border-radius:999px;padding:2px 7px;background:var(--panel2);color:var(--accent);font-size:10px;font-weight:750}.tooltip-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}.tooltip-metric{min-width:0;padding:9px 10px;border:1px solid color-mix(in srgb,var(--metric-color) 28%,var(--border));border-radius:9px;background:color-mix(in srgb,var(--metric-color) 8%,#fffefa)}.tooltip-metric.context{--metric-color:var(--accent)}.tooltip-metric.token{--metric-color:var(--uncached)}.tooltip-metric span{display:block;color:var(--muted);font-size:10px;font-weight:750}.tooltip-metric strong{display:block;margin:3px 0 1px;color:var(--metric-color);font-size:20px;line-height:1.1;font-variant-numeric:tabular-nums}.tooltip-metric small{display:block;min-height:30px;color:var(--text);font-size:10px;line-height:1.4;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.tooltip-grid{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 12px;padding-top:7px;border-top:1px solid rgba(126,111,91,.18)}.tooltip-grid span{color:var(--muted)}.tooltip-grid b{min-width:0;overflow-wrap:anywhere;text-align:right;font-weight:650;font-variant-numeric:tabular-nums}.tooltip-section{margin-top:8px;padding-top:7px;border-top:1px solid rgba(126,111,91,.18)}.tooltip-section-label{color:var(--muted);font-size:10px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.tooltip-message{max-height:min(230px,30vh);margin-top:4px;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text);font:11.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.tooltip-truncated{margin-top:4px;color:var(--warning);font-size:10px}
+@media(max-width:900px){body.session-nav-modal-open{overflow:hidden}.shell,.shell.session-nav-closed{display:block}.sidebar{position:fixed;left:0;transform:translateX(-104%);opacity:0;visibility:hidden;width:min(320px,88vw);border-right:1px solid var(--border)}.shell.session-nav-open .sidebar{transform:translateX(0);opacity:1;visibility:visible;pointer-events:auto}.shell.session-nav-open .session-drawer-backdrop{display:block}.content{padding-top:20px}}@media(max-width:650px){.hero{flex-direction:column}.detail-grid{grid-template-columns:1fr}}
+.sidebar{overflow-x:hidden}.session-list{min-width:0}.session-button{min-width:0;max-width:100%}
+</style>
+</head>
+<body>
+<div class="shell" id="report-shell">
+  <aside class="sidebar" id="session-drawer" aria-label="会话列表">
+    <div class="sidebar-head"><div class="brand"><div class="eyebrow">Codex Token 使用分析</div><h2>会话列表</h2><div class="muted" id="range-label"></div></div><button id="session-drawer-close" type="button" aria-label="收起会话列表">收起</button></div>
+    <input class="nav-search" id="nav-search" type="search" placeholder="筛选会话……">
+    <nav class="session-list" id="session-list" aria-label="报告视图"></nav>
+  </aside>
+  <button class="session-drawer-backdrop" id="session-drawer-backdrop" type="button" tabindex="-1" aria-label="关闭会话列表"></button>
+  <main class="content">
+    <div class="content-topbar"><button class="session-drawer-toggle" id="session-drawer-toggle" type="button" aria-controls="session-drawer" aria-expanded="true"><span aria-hidden="true">☰</span><span id="session-drawer-toggle-label">收起会话</span></button></div>
+    <section class="hero"><div><div class="eyebrow" id="view-eyebrow"></div><h1 id="view-title"></h1><div class="subline" id="view-meta"></div></div><div class="sensitive" id="privacy"></div></section>
+    <section class="cards" id="cards"></section>
+    <details class="warning-box" id="warning-box"><summary id="warning-summary"></summary><ul class="warning-list" id="warning-list"></ul></details>
+    <section class="panel">
+      <div class="panel-head"><div><h2 id="composition-title"></h2><p id="composition-note"></p></div><div class="controls"><button id="linear" class="active" type="button">线性</button><button id="log" type="button">对数</button></div></div>
+      <div class="filters"><input class="content-search" id="content-search" type="search"><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span></div>
+      <div class="legend" id="legend"></div><div class="chart-scroll"><div class="chart-wrap"><svg id="composition" viewBox="0 0 1200 410" role="img"></svg></div></div>
+    </section>
+    <section class="panel"><div class="panel-head"><div><h2 id="trend-title"></h2><p id="trend-note"></p></div></div><div class="trend-wrap"><svg id="trend" viewBox="0 0 1200 270" role="img"></svg></div></section>
+    <section class="panel" id="range-context-panel" hidden><div class="panel-head"><div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开；外环按来源着色，内环按轮内快照位置阶梯展示 Context 占用率。</p></div></div><div class="source-legend" id="context-source-legend"></div><div class="context-radial-wrap"><svg id="range-context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div></section>
+    <section class="panel"><div class="panel-head"><div><h2 id="table-title"></h2><p id="table-note"></p></div></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table><div class="empty" id="table-empty" hidden></div></div></section>
+    <div class="footer" id="footer"></div>
+  </main>
+</div>
+<aside class="drawer" id="drawer" aria-hidden="true"><div class="drawer-head"><div><div class="eyebrow">轮次详情</div><h2 id="drawer-title"></h2></div><button id="drawer-close" type="button">关闭</button></div><div class="drawer-body" id="drawer-body"></div></aside>
+<div class="tooltip" id="turn-tooltip" role="tooltip"></div>
+<script id="report-data" type="application/json">__REPORT_JSON__</script>
+<script>
+(() => {
+  "use strict";
+  const data=JSON.parse(document.getElementById("report-data").textContent),sessions=data.sessions||[],messagesIncluded=data.metadata.messagesIncluded!==false;
+  const colors={cachedInput:css("--cached"),cacheWriteInput:css("--cache-write"),otherNonCachedInput:css("--uncached"),ordinaryOutput:css("--output"),reasoningOutput:css("--reasoning"),unclassified:css("--unclassified")};
+  const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
+  const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
+  const sessionNavMedia=window.matchMedia("(max-width:900px)");
+  const state={view:"total",scale:"linear",query:"",statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
+  const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
+  function byId(id){return document.getElementById(id)} function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
+  function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])}
+  function fmt(v){return Number(v||0).toLocaleString()} function compact(v){const n=Number(v||0),a=Math.abs(n);if(a>=1e9)return(n/1e9).toFixed(1)+"B";if(a>=1e6)return(n/1e6).toFixed(1)+"M";if(a>=1e3)return(n/1e3).toFixed(1)+"K";return String(n)}
+  function dateText(v){if(!v)return"—";const d=new Date(v);return Number.isNaN(d.valueOf())?v:d.toLocaleString("zh-CN")}
+  function activeSession(){return sessions.find(s=>s.metadata.threadId===state.view)||null} function isTotal(){return state.view==="total"}
+  function statusText(v){return({complete:"已完成",aborted:"已中止",incomplete:"未闭合"})[v]||v||"未知"}
+  function cacheRate(u){return u.input?100*u.cached/u.input:0} function firstPrompt(t){return(t.messages||[]).map(m=>m.text).filter(Boolean).join("\n\n↳ 追加用户消息\n")}
+  function sourceText(s){const kinds=s.metadata.sourceKinds||[];return kinds.map(k=>k==="main"?"顶层":k==="subagent"?"子代理":k==="automation"?"自动化":k).join(" + ")||"顶层"}
+  function totalRows(){return sessions.map((s,i)=>({index:i+1,turnId:s.metadata.threadId,title:s.metadata.title,sourceLabel:sourceText(s),startedAt:s.metadata.rangeLastActivityAt,status:"complete",models:[],efforts:[],messages:[],modelResponses:s.summary.turnCount,usage:s.summary.finalUsage,breakdown:s.summary.finalBreakdown,session:s}))}
+  function rowMatches(row){if(!isTotal()&&!state.statuses.has(row.status))return false;if(!state.query)return true;const rendered=[row.turnId,row.title,row.sourceLabel,row.status,(row.models||[]).join(" "),firstPrompt(row)].join(" ").toLocaleLowerCase();return rendered.includes(state.query)}
+  function rows(){const base=isTotal()?totalRows():(activeSession()?.turns||[]);return base.filter(rowMatches)}
+  function setSessionNav(open,focusTarget=false){
+    state.sessionNavOpen=Boolean(open);const shell=byId("report-shell"),drawer=byId("session-drawer"),toggle=byId("session-drawer-toggle");
+    shell.classList.toggle("session-nav-open",state.sessionNavOpen);shell.classList.toggle("session-nav-closed",!state.sessionNavOpen);drawer.setAttribute("aria-hidden",String(!state.sessionNavOpen));drawer.inert=!state.sessionNavOpen;toggle.setAttribute("aria-expanded",String(state.sessionNavOpen));byId("session-drawer-toggle-label").textContent=state.sessionNavOpen?"收起会话":"会话";document.body.classList.toggle("session-nav-modal-open",state.sessionNavOpen&&sessionNavMedia.matches);
+    if(focusTarget)(state.sessionNavOpen?byId("nav-search"):toggle).focus();
+  }
+  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>[s.metadata.title,s.metadata.threadId,s.metadata.cwd].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>`<button class="session-button ${state.view===s.metadata.threadId?"active":""}" data-view="${esc(s.metadata.threadId)}"><strong>${esc(s.metadata.title)}</strong><span>${fmt(s.summary.finalUsage.total)} Token · ${esc(dateText(s.metadata.rangeLastActivityAt))}</span></button>`).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
+  function selectView(view){state.view=view;state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
+  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总统计":"会话区间统计";byId("view-title").textContent=isTotal()?"全部会话消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截至 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话",fmt(summary.sessionCount),`${summary.zeroUsageSessions} 个零消耗会话`]:["轮次",fmt(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮零消耗`];const cards=[["区间总消耗",fmt(u.total),"按 token_count 快照时间归属"],["输入",fmt(u.input),`${compact(u.cached)} 来自缓存读取`],["非缓存输入",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["完整性",summary.integrityErrorCount?"存在错误":"通过",`${summary.warningCount} 条提示`]];byId("cards").innerHTML=cards.map(c=>`<article class="card"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("")}
+  function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个完整性错误 · 共 ${summary.warningCount} 条提示`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
+  function niceTicks(max,count=5){if(max<=0)return[0];const rough=max/count,p=10**Math.floor(Math.log10(rough)),f=rough/p,n=(f<=1?1:f<=2?2:f<=5?5:10)*p,out=[];for(let x=0;x<=max+n*.25;x+=n)out.push(x);return out}
+  function svgEl(name,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",name);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el} function text(svg,x,y,value,anchor="end"){const t=svgEl("text",{x,y,"text-anchor":anchor,fill:css("--muted"),"font-size":"11"});t.textContent=value;svg.appendChild(t)}
+  function positionTooltip(event,target){const targetRect=target?.getBoundingClientRect?.(),pointerX=Number.isFinite(event?.clientX)?event.clientX:targetRect?targetRect.left+targetRect.width/2:innerWidth/2,pointerY=Number.isFinite(event?.clientY)?event.clientY:targetRect?targetRect.top+targetRect.height/2:innerHeight/2;tooltip.style.display="block";tooltip.style.visibility="hidden";const gap=14,edge=8,width=tooltip.offsetWidth,height=tooltip.offsetHeight;let x=pointerX+gap,y=pointerY+gap;if(x+width>innerWidth-edge)x=pointerX-width-gap;if(y+height>innerHeight-edge)y=pointerY-height-gap;tooltip.style.left=`${Math.max(edge,Math.min(x,innerWidth-width-edge))}px`;tooltip.style.top=`${Math.max(edge,Math.min(y,innerHeight-height-edge))}px`;tooltip.style.visibility="visible"}
+  function initialMessagePreview(turn){const message=(turn.messages||[])[0];if(!message)return{text:messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。",truncated:false};const full=String(message.text||"");if(!full){const attachments=[message.imageCount?`${message.imageCount} 张图片`:"",message.audioCount?`${message.audioCount} 条音频`:""].filter(Boolean).join(" · ");return{text:attachments?`初始消息包含 ${attachments}，无文本。`:"初始用户消息没有文本。",truncated:false}}return{text:full.slice(0,TOOLTIP_MESSAGE_LIMIT),truncated:full.length>TOOLTIP_MESSAGE_LIMIT}}
+  function showTurnTooltip(event,turn,target,conversationTotal){if(event?.pointerType==="touch"){hideTooltip();return}const b=turn.breakdown||{},snapshot=contextSnapshot(turn),message=initialMessagePreview(turn),tokenRows=segmentKeys.map(key=>`<span>${esc(labels[key])}</span><b>${fmt(b[key]||0)}</b>`).join(""),contextPortion=snapshot.occupancyRate==null?"未知":`${Number(snapshot.occupancyRate).toFixed(2)}%`,contextAbsolute=snapshot.occupancyRate==null?"未记录 Context 快照":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`,tokenPortion=conversationTotal>0?`${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%`:"—",tokenAbsolute=`${fmt(turn.usage.total)} / ${fmt(conversationTotal)} Token`;tooltip.innerHTML=`<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div><div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div><div class="tooltip-grid"><span>来源</span><b>${esc(turn.sourceLabel||"主会话")}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${fmt(turn.compactions)}</b></div><div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${fmt(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div><div class="tooltip-section"><div class="tooltip-section-label">初始用户消息</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;positionTooltip(event,target)}
+  function moveTurnTooltip(event,target){if(event.pointerType!=="touch"&&tooltip.style.display==="block")positionTooltip(event,target)}
+  function focusTurnTooltip(event,turn,target,conversationTotal){if(target.matches(":focus-visible"))showTurnTooltip(event,turn,target,conversationTotal)}
+  function turnTargetKeydown(event,turn){if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openDrawer(turn)}}
+  function hideTooltip(){tooltip.style.display="none";tooltip.style.visibility="hidden"}
+  function contextSnapshot(turn){return turn.contextSnapshot||{snapshotType:"unknown",tokens:null,windowTokens:null,occupancyRate:null,timestamp:null}}
+  function contextTimeline(turn,tokens){const points=(turn.contextTimeline||[]).filter(point=>point.occupancyRate!=null).map(point=>({...point,turnTokenOffset:Math.max(0,Math.min(tokens,Number(point.turnTokenOffset)||0))})).sort((a,b)=>a.turnTokenOffset-b.turnTokenOffset||String(a.timestamp||"").localeCompare(String(b.timestamp||"")));if(points.length)return points;const fallback=contextSnapshot(turn);return fallback.occupancyRate==null?[]:[{...fallback,turnTokenOffset:tokens}]}
+  function contextBands(turn,tokens){if(tokens<=0)return[];const points=contextTimeline(turn,tokens);if(!points.length)return[{start:0,end:tokens,snapshot:null}];const bands=[];let cursor=0,active=null;points.forEach(point=>{if(point.turnTokenOffset>cursor){bands.push({start:cursor,end:point.turnTokenOffset,snapshot:active||point});cursor=point.turnTokenOffset}active=point});if(cursor<tokens)bands.push({start:cursor,end:tokens,snapshot:active||points.at(-1)});return bands}
+  function contextTypeText(type){return({turn_end:"结束时",range_latest:"范围内最新",current_latest:"当前最新",unknown:"未知"})[type]||"未知"}
+  function contextRateText(snapshot){return snapshot.occupancyRate==null?"—":`${Number(snapshot.occupancyRate).toFixed(2)}%`}
+  const sourcePalette=["#3b8b78","#bd7556","#8c78bd","#d9874c","#4f78a8","#b35f79","#6d8c45","#a56c3f"];
+  function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
+  function contextOrderTime(turn){const snapshot=contextSnapshot(turn);return snapshot.timestamp||turn.endedAt||turn.rangeLastActivityAt||turn.startedAt||""}
+  const contextGap=Math.PI/180,contextStart=-Math.PI/2+contextGap/2,contextSpan=2*Math.PI-contextGap;
+  function radialPoint(cx,cy,r,fraction){const angle=contextStart+Math.max(0,Math.min(1,fraction))*contextSpan;return{x:cx+r*Math.cos(angle),y:cy+r*Math.sin(angle)}}
+  function arcLinePath(cx,cy,r,start,end){const a=radialPoint(cx,cy,r,start),b=radialPoint(cx,cy,r,end),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${r},${r} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)}`}
+  function arcBandPath(cx,cy,inner,outer,start,end){if(end-start<=1e-9)return"";const a=radialPoint(cx,cy,outer,start),b=radialPoint(cx,cy,outer,end),c=radialPoint(cx,cy,inner,end),d=radialPoint(cx,cy,inner,start),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${outer},${outer} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)} L${c.x.toFixed(2)},${c.y.toFixed(2)} A${inner},${inner} 0 ${large} 0 ${d.x.toFixed(2)},${d.y.toFixed(2)} Z`}
+  function renderContext(){
+    const panel=byId("range-context-panel");panel.hidden=isTotal();if(isTotal())return;
+    const svg=byId("range-context-radial-chart");svg.replaceChildren();svg.setAttribute("viewBox","0 0 760 620");const session=activeSession(),ordered=[...(session?.turns||[])].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),cx=380,cy=300,innerBase=105,innerMax=178,outerInner=202,outerOuter=234;
+    const sources=[...new Map(ordered.map(turn=>[turn.sourceRolloutId||"main",{id:turn.sourceRolloutId||"main",label:turn.sourceLabel||"主会话"}])).values()];
+    byId("context-source-legend").innerHTML=sources.map(source=>`<span style="--source-color:${sourceColor(source.id)}">${esc(source.label)}</span>`).join("");
+    if(!ordered.length){text(svg,cx,cy,"所选会话没有 turn 数据","middle");return}
+    const defs=svgEl("defs"),pattern=svgEl("pattern",{id:"range-context-unknown-pattern",width:8,height:8,patternUnits:"userSpaceOnUse",patternTransform:"rotate(35)"}),arrow=svgEl("marker",{id:"range-context-compaction-arrow",markerWidth:8,markerHeight:8,refX:7,refY:4,orient:"auto",markerUnits:"userSpaceOnUse"});pattern.appendChild(svgEl("line",{x1:0,y1:0,x2:0,y2:8,stroke:css("--muted"),"stroke-width":2,opacity:.42}));arrow.appendChild(svgEl("path",{d:"M0,0 L8,4 L0,8 Z",fill:css("--warning")}));defs.append(pattern,arrow);svg.appendChild(defs);svg.appendChild(svgEl("path",{d:arcBandPath(cx,cy,outerInner,outerOuter,0,1),fill:"#e9e2d7"}));
+    [25,50,75,100].forEach(rate=>{const capacity=rate===100,radius=innerBase+(innerMax-innerBase)*rate/100;svg.appendChild(svgEl("path",{d:arcLinePath(cx,cy,radius,0,1),class:capacity?"context-reference context-capacity":"context-reference"}));const point=radialPoint(cx,cy,radius,0),label=svgEl("text",{x:point.x+5,y:point.y+3,fill:capacity?css("--text"):css("--muted"),"font-size":capacity?"10":"9","font-weight":capacity?"750":"400"});label.textContent=capacity?"Context 100%":`${rate}%`;svg.appendChild(label)});
+    const total=ordered.reduce((sum,turn)=>sum+Math.max(0,Number(turn.usage.total)||0),0),denominator=Math.max(total,1);let consumed=0;const entries=ordered.map(turn=>{const tokens=Math.max(0,Number(turn.usage.total)||0),entry={turn,tokens,tokenStart:consumed,start:consumed/denominator,end:(consumed+tokens)/denominator};consumed+=tokens;return entry});
+    const observed=ordered.flatMap(turn=>contextTimeline(turn,Math.max(0,Number(turn.usage.total)||0)).map(snapshot=>({turn,snapshot}))),peak=observed.reduce((best,item)=>Number(item.snapshot.occupancyRate)>Number(best?.snapshot?.occupancyRate??-1)?item:best,null),compactionCount=ordered.reduce((sum,turn)=>sum+(turn.contextCompactions||[]).length,0);
+    const centerTitle=svgEl("text",{x:cx,y:cy-38,"text-anchor":"middle",fill:css("--muted"),"font-size":"13"}),centerValue=svgEl("text",{x:cx,y:cy-4,"text-anchor":"middle",fill:css("--text"),"font-size":"27","font-weight":"760"}),centerDetail=svgEl("text",{x:cx,y:cy+24,"text-anchor":"middle",fill:css("--text"),"font-size":"12"}),centerMeta=svgEl("text",{x:cx,y:cy+48,"text-anchor":"middle",fill:css("--muted"),"font-size":"11"});svg.append(centerTitle,centerValue,centerDetail,centerMeta);
+    function resetCenter(){centerTitle.textContent="完整会话";centerValue.textContent=`${compact(total)} Token`;centerDetail.textContent=peak?`Context 峰值 ${contextRateText(peak.snapshot)}`:"Context 峰值未知";centerMeta.textContent=`${compactionCount} 次 Compaction`}
+    function showCenter(turn){const snapshot=contextSnapshot(turn);centerTitle.textContent=`${turn.sourceLabel||"主会话"} · ${statusText(turn.status)}`;centerValue.textContent=`${compact(turn.usage.total)} Token`;centerDetail.textContent=snapshot.tokens==null?"Context 未知":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`;centerMeta.textContent=snapshot.tokens==null?contextTypeText(snapshot.snapshotType):`${contextRateText(snapshot)} · ${contextTypeText(snapshot.snapshotType)}`}
+    resetCenter();let previousSource=null;
+    entries.forEach(entry=>{const {turn,tokens,tokenStart,start,end}=entry,snapshot=contextSnapshot(turn),source=turn.sourceRolloutId||"main",color=sourceColor(source),knownContext=snapshot.tokens!=null&&snapshot.occupancyRate!=null,rate=Math.max(0,Math.min(100,Number(snapshot.occupancyRate)||0)),contextOuter=innerBase+(innerMax-innerBase)*rate/100,dim=!rowMatches(turn),sourceSwitch=previousSource!==null&&previousSource!==source;previousSource=source;const group=svgEl("g",{class:`context-turn context-sector${dim?" dim":""}${state.selected===turn.turnId?" selected":""}${sourceSwitch?" source-switch":""}`,tabindex:"0",role:"button","data-turn-target":"true","aria-label":`${turn.sourceLabel||"主会话"}，${fmt(tokens)} Token，Context ${knownContext?contextRateText(snapshot):"未知"}`});
+      if(tokens>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,outerInner,outerOuter,start,end),fill:color,class:"token-sector"}));contextBands(turn,tokens).forEach(band=>{const bandStart=(tokenStart+band.start)/denominator,bandEnd=(tokenStart+band.end)/denominator,bandRate=band.snapshot?.occupancyRate,knownBand=bandRate!=null,bandOuter=innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(bandRate)||0))/100;group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,innerBase,knownBand?Math.max(innerBase+1.5,bandOuter):innerMax,bandStart,bandEnd),fill:knownBand?color:"url(#range-context-unknown-pattern)",opacity:knownBand?.44:.7,class:"context-band"}))})}else{const a=radialPoint(cx,cy,innerBase-4,start),b=radialPoint(cx,cy,outerOuter+9,start);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,stroke:color,class:"context-zero-tick"}));if(knownContext){const p=radialPoint(cx,cy,Math.max(innerBase+1.5,contextOuter),start);group.appendChild(svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:color,stroke:"#fffefa","stroke-width":1.5}))}}
+      [start,end].forEach(fraction=>{const a=radialPoint(cx,cy,innerBase,fraction),b=radialPoint(cx,cy,outerOuter,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"mapping-line"}))});const hitEnd=tokens>0?end:Math.min(1,start+.004);group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,innerBase-7,outerOuter+8,start,hitEnd),fill:"rgba(0,0,0,.001)"}));group.addEventListener("pointerenter",event=>{showCenter(turn);showTurnTooltip(event,turn,group,total)});group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",()=>{resetCenter();hideTooltip()});group.addEventListener("focus",event=>{showCenter(turn);focusTurnTooltip(event,turn,group,total)});group.addEventListener("blur",()=>{resetCenter();hideTooltip()});group.addEventListener("keydown",event=>turnTargetKeydown(event,turn));group.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(group);
+      (turn.contextCompactions||[]).forEach(event=>{const offset=Math.max(0,Math.min(tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,marker=svgEl("g",{class:"context-compaction",tabindex:"0",role:"button","data-turn-target":"true","aria-label":`Compaction，累计 Token 位置 ${(fraction*100).toFixed(2)}%`}),positionOuter=radialPoint(cx,cy,outerOuter+12,fraction),beforeRate=event.before?.occupancyRate,afterRate=event.after?.occupancyRate;if(beforeRate!=null&&afterRate!=null){const before=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(beforeRate)))/100,fraction),after=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(afterRate)))/100,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:before.x,y2:before.y,class:"compaction-position-line"}));marker.appendChild(svgEl("line",{x1:before.x,y1:before.y,x2:after.x,y2:after.y,class:"compaction-jump-line","marker-end":"url(#range-context-compaction-arrow)"}));marker.appendChild(svgEl("circle",{cx:before.x,cy:before.y,r:4,class:"compaction-before"}));marker.appendChild(svgEl("circle",{cx:after.x,cy:after.y,r:4,class:"compaction-after"}))}else{const positionInner=radialPoint(cx,cy,innerMax+5,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:positionInner.x,y2:positionInner.y,class:"compaction-position-line"}))}const title=svgEl("title");title.textContent=`Compaction · ${dateText(event.timestamp)} · ${event.before?.tokens==null?"未知":fmt(event.before.tokens)} → ${event.after?.tokens==null?"未知":fmt(event.after.tokens)} Context Token`;marker.appendChild(title);marker.addEventListener("focus",()=>showCenter(turn));marker.addEventListener("blur",resetCenter);marker.addEventListener("keydown",keyEvent=>turnTargetKeydown(keyEvent,turn));marker.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(marker)})
+    });
+    const startPoint=radialPoint(cx,cy,outerOuter+18,0),endPoint=radialPoint(cx,cy,outerOuter+18,1);[[startPoint,"Token 0%","start"],[endPoint,"Token 100%","end"]].forEach(([point,label,anchor])=>{const node=svgEl("text",{x:point.x,y:point.y+4,"text-anchor":anchor,fill:css("--muted"),"font-size":"11","font-weight":"700"});node.textContent=label;svg.appendChild(node)});const outerLabel=svgEl("text",{x:24,y:33,fill:css("--muted"),"font-size":"12","font-weight":"700"});outerLabel.textContent="外环 · Token 消耗（累计 Token 进度）";svg.appendChild(outerLabel);const innerLabel=svgEl("text",{x:24,y:53,fill:css("--muted"),"font-size":"12"});innerLabel.textContent="内环 · Context 快照（按 Token 位置阶梯变化）";svg.appendChild(innerLabel)
+  }
+  function renderComposition(){const visible=rows(),svg=byId("composition");svg.replaceChildren();byId("visible-count").textContent=`当前显示 ${visible.length} ${isTotal()?"个会话":"轮"}`;byId("composition-title").textContent=isTotal()?"各会话 Token 构成":"每轮 Token 构成";byId("composition-note").textContent=isTotal()?"点击柱形进入对应会话。":"主会话与子代理按时间合并；点击柱形查看详情。";byId("content-search").placeholder=isTotal()?"搜索会话标题、ID、来源……":messagesIncluded?"搜索消息、轮次 ID、模型、来源……":"搜索轮次 ID、模型、来源……";document.querySelectorAll(".turn-only").forEach(x=>x.hidden=isTotal());byId("legend").innerHTML=segmentKeys.map(k=>`<span style="--swatch:${colors[k]}">${esc(labels[k])}</span>`).join("");const width=Math.max(1100,visible.length*30+110),height=410,m={t:16,r:20,b:48,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);svg.style.minWidth=`${width}px`;if(!visible.length){text(svg,width/2,height/2,"没有符合条件的数据","middle");return}const max=Math.max(...visible.map(r=>r.usage.total),1),scaled=v=>state.scale==="log"?Math.log10(1+v)/Math.log10(1+max):v/max;const ticks=state.scale==="log"?[0,...Array.from({length:Math.floor(Math.log10(max))+1},(_,i)=>10**i).filter(v=>v<=max)]:niceTicks(max);ticks.forEach(tick=>{const y=m.t+ih*(1-scaled(tick));svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const step=iw/visible.length,bw=Math.max(4,Math.min(20,step*.72));visible.forEach((row,pos)=>{const x=m.l+pos*step+(step-bw)/2,total=Math.max(0,row.usage.total),totalH=ih*scaled(total);let y=m.t+ih;const g=svgEl("g",{class:"bar",tabindex:"0",role:"button","data-turn-target":"true"});segmentKeys.forEach(k=>{const value=Math.max(0,row.breakdown[k]||0);if(!value||!total)return;const h=totalH*value/Math.max(total,1);y-=h;g.appendChild(svgEl("rect",{x,y,width:bw,height:Math.max(.5,h),fill:colors[k],rx:"1"}))});const title=svgEl("title");title.textContent=`${isTotal()?row.title:`第 ${row.index} 轮`} · ${fmt(total)} Token`;g.appendChild(title);g.addEventListener("click",()=>isTotal()?selectView(row.turnId):openDrawer(row));svg.appendChild(g);if(visible.length<=35||pos%Math.ceil(visible.length/28)===0)text(svg,x+bw/2,height-22,String(row.index),"middle")});text(svg,m.l+iw/2,height-4,isTotal()?"会话序号":"轮次序号","middle")}
+  function renderTrend(){const svg=byId("trend");svg.replaceChildren();let pointsData;if(isTotal()){pointsData=data.summary.dailyUsage||[];byId("trend-title").textContent="每日 Token 消耗";byId("trend-note").textContent="按 token_count 快照发生的本地日期归属。"}else{let cumulative=0;pointsData=(activeSession()?.turns||[]).map(t=>({date:`第 ${t.index} 轮`,usage:{total:(cumulative+=Number(t.usage.total||0))}}));byId("trend-title").textContent="会话累计消耗";byId("trend-note").textContent="按统一时间线中的轮次线性累计。"}const width=1200,height=270,m={t:18,r:24,b:42,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);if(!pointsData.length){text(svg,width/2,height/2,"没有趋势数据","middle");return}const max=Math.max(...pointsData.map(p=>Number(p.usage.total||0)),1);niceTicks(max,4).forEach(tick=>{const y=m.t+ih*(1-tick/max);svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const pts=pointsData.map((p,i)=>({x:m.l+(pointsData.length===1?iw/2:i*iw/(pointsData.length-1)),y:m.t+ih*(1-Number(p.usage.total||0)/max),label:p.date,value:Number(p.usage.total||0)}));if(pts.length>1)svg.appendChild(svgEl("path",{d:pts.map((p,i)=>`${i?"L":"M"}${p.x},${p.y}`).join(" "),fill:"none",stroke:css("--accent"),"stroke-width":"2.5"}));pts.forEach((p,i)=>{const c=svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:css("--accent")});const title=svgEl("title");title.textContent=`${p.label} · ${fmt(p.value)} Token`;c.appendChild(title);svg.appendChild(c);if(pts.length<=12||i%Math.ceil(pts.length/10)===0)text(svg,p.x,height-16,p.label,"middle")})}
+  function renderTable(){
+    const visible=rows(),head=byId("table-head"),body=byId("table-body"),empty=byId("table-empty");byId("table-title").textContent=isTotal()?"会话汇总":"轮次明细";byId("table-note").textContent=isTotal()?"点击会话切换到统一逐轮时间线。":"点击轮次查看完整消息、上下文快照和裁剪信息。";
+    if(isTotal()){
+      head.innerHTML="<tr><th>#</th><th>会话</th><th>来源</th><th>最后活动</th><th>轮次</th><th>缓存读取</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>总量</th><th>缓存率</th></tr>";
+      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage;return`<tr data-id="${esc(r.turnId)}"><td>${r.index}</td><td class="title-cell" title="${esc(r.title)}">${esc(r.title)}</td><td>${esc(r.sourceLabel)}</td><td>${esc(dateText(r.startedAt))}</td><td>${fmt(r.session.summary.turnCount)}</td><td>${fmt(b.cachedInput)}</td><td>${data.metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>selectView(row.dataset.id)));
+    }else{
+      head.innerHTML="<tr><th>轮次</th><th>来源</th><th>状态</th><th>开始时间</th><th>模型响应</th><th>缓存读取</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>总量</th><th>缓存率</th><th>上下文占用</th><th>上下文率</th><th>用户消息</th></tr>";
+      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage,p=firstPrompt(r).replace(/\s+/g," ").trim(),snapshot=contextSnapshot(r),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return`<tr data-id="${esc(r.turnId)}" data-turn-target="true"><td>${r.index}${r.rangeClipped?' <span class="provisional" title="已按日期范围裁剪">◐</span>':""}</td><td>${esc(r.sourceLabel||"主会话")}</td><td>${esc(statusText(r.status))}</td><td>${esc(dateText(r.startedAt))}</td><td>${fmt(r.modelResponses)}</td><td>${fmt(b.cachedInput)}</td><td>${activeSession().metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td><td title="${esc(contextTitle)}">${snapshot.tokens==null?"—":fmt(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="title-cell" title="${esc(p)}">${esc(p||"—")}</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer((activeSession()?.turns||[]).find(t=>t.turnId===row.dataset.id))));
+    }
+    empty.hidden=visible.length>0;empty.textContent=isTotal()?"指定日期范围内没有会话活动。":"没有符合当前筛选条件的轮次。";
+  }
+  function openDrawer(turn){
+    if(!turn)return;state.selected=turn.turnId;byId("drawer-title").textContent=`第 ${turn.index} 轮 · ${turn.sourceLabel||"主会话"}`;const snapshot=contextSnapshot(turn),details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["来源",turn.sourceLabel||"主会话"],["开始时间",dateText(turn.startedAt)],["结束时间",dateText(turn.endedAt)],["范围活动",`${dateText(turn.rangeFirstActivityAt)} — ${dateText(turn.rangeLastActivityAt)}`],["日期裁剪",turn.rangeClipped?"是":"否"],["模型",(turn.models||[]).join(", ")||"—"],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":fmt(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",fmt(turn.compactions)],["总 Token",fmt(turn.usage.total)],["输入",fmt(turn.usage.input)],["输出",fmt(turn.usage.output)],["推理输出",fmt(turn.usage.reasoning)]];
+    let html=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div>`;
+    if((turn.contextCompactions||[]).length){const lines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${fmt(value.tokens)} / ${value.windowTokens==null?"—":fmt(value.windowTokens)} · ${contextRateText(value)}`:"未知";return`#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":fmt(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});html+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(lines.join("\n\n"))}</pre></div>`}
+    html+=(turn.messages||[]).length?turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i?"追加用户消息":"初始用户消息"} · ${esc(dateText(m.timestamp))}</div><pre></pre></section>`).join(""):`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;byId("drawer-body").innerHTML=html;byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>pre.textContent=turn.messages[i].text);byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();renderTable();
+  }
+  function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
+  function render(){renderHeader();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
+  byId("range-label").textContent=`${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate} · ${data.metadata.dateWindow.timezone}`;
+  byId("nav-search").addEventListener("input",renderNav);
+  byId("session-drawer-toggle").addEventListener("click",()=>setSessionNav(!state.sessionNavOpen,true));
+  byId("session-drawer-close").addEventListener("click",()=>setSessionNav(false,true));
+  byId("session-drawer-backdrop").addEventListener("click",()=>setSessionNav(false,true));
+  byId("content-search").addEventListener("input",e=>{state.query=e.target.value.trim().toLocaleLowerCase();renderComposition();renderContext();renderTable()});
+  document.querySelectorAll("[data-status]").forEach(input=>input.addEventListener("change",()=>{input.checked?state.statuses.add(input.dataset.status):state.statuses.delete(input.dataset.status);renderComposition();renderContext();renderTable()}));
+  byId("linear").addEventListener("click",()=>{state.scale="linear";byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition()});
+  byId("log").addEventListener("click",()=>{state.scale="log";byId("log").classList.add("active");byId("linear").classList.remove("active");renderComposition()});
+  byId("drawer-close").addEventListener("click",closeDrawer);
+  document.addEventListener("click",event=>{const drawer=byId("drawer");if(event.button!==0||!drawer.classList.contains("open"))return;const target=event.target instanceof Element?event.target:null;if(!target||drawer.contains(target)||target.closest("[data-turn-target=true]"))return;closeDrawer()});
+  document.addEventListener("keydown",event=>{if(event.key!=="Escape")return;if(byId("drawer").classList.contains("open"))closeDrawer();else if(state.sessionNavOpen)setSessionNav(false,true)});
+  try{setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
+})();
+</script>
+</body>
+</html>
+"""
+
+
 def render_html(report: dict[str, Any], title: str | None = None) -> str:
-    thread_id = report.get("metadata", {}).get("threadId", "unknown")
-    page_title = title or f"Codex Token 报告 · {thread_id}"
+    if report.get("mode") == "range":
+        date_window = report.get("metadata", {}).get("dateWindow", {})
+        start_date = date_window.get("startDate", "unknown")
+        end_date = date_window.get("endDate", start_date)
+        date_label = start_date if start_date == end_date else f"{start_date} — {end_date}"
+        page_title = title or f"Codex Token 日期报告 · {date_label}"
+        template = RANGE_HTML_TEMPLATE
+    else:
+        thread_id = report.get("metadata", {}).get("threadId", "unknown")
+        page_title = title or f"Codex Token 报告 · {thread_id}"
+        template = HTML_TEMPLATE
     report_json = json.dumps(
         report, ensure_ascii=False, separators=(",", ":"), sort_keys=False
     )
@@ -1151,7 +2279,7 @@ def render_html(report: dict[str, Any], title: str | None = None) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
-    return HTML_TEMPLATE.replace("__PAGE_TITLE__", html.escape(page_title)).replace(
+    return template.replace("__PAGE_TITLE__", html.escape(page_title)).replace(
         "__REPORT_JSON__", report_json
     )
 
@@ -1160,7 +2288,21 @@ def set_message_policy(report: dict[str, Any], include_messages: bool) -> None:
     """Apply the report's explicit message-embedding policy in place."""
     report.setdefault("metadata", {})["messagesIncluded"] = include_messages
     report["metadata"]["containsFullUserMessages"] = include_messages
+    if report.get("mode") == "range":
+        for session in report.get("sessions", []):
+            metadata = session.setdefault("metadata", {})
+            metadata["messagesIncluded"] = include_messages
+            metadata["containsFullUserMessages"] = include_messages
+            if not include_messages:
+                metadata["title"] = metadata.get("fallbackTitle") or metadata.get("threadId")
+                metadata["messageTitle"] = None
     if include_messages:
+        return
+    if report.get("mode") == "range":
+        for session in report.get("sessions", []):
+            for turn in session.get("turns", []):
+                turn["messages"] = []
+            session["orphanMessages"] = []
         return
     for turn in report.get("turns", []):
         turn["messages"] = []
@@ -1172,19 +2314,85 @@ def default_output_path(thread_id: str) -> Path:
     return Path(tempfile.gettempdir()) / "agenttools" / f"codex-token-{safe_id}.html"
 
 
+def default_range_output_path(window: DateWindow) -> Path:
+    label = window.start_date.isoformat()
+    if window.end_date != window.start_date:
+        label += f"-to-{window.end_date.isoformat()}"
+    return Path(tempfile.gettempdir()) / "agenttools" / f"codex-token-{label}.html"
+
+
+def _iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"日期必须采用 YYYY-MM-DD 格式：{value}"
+        ) from exc
+
+
+def _date_window_from_args(args: argparse.Namespace) -> DateWindow | None:
+    selectors = bool(args.today) + bool(args.single_date) + bool(
+        args.date_from or args.date_to
+    )
+    if args.thread and selectors:
+        raise ValueError("线程输入不能与日期范围参数同时使用。")
+    if selectors > 1:
+        raise ValueError("--today、--date 与 --from/--to 只能选择一种。")
+    if args.date_from is None and args.date_to is not None:
+        raise ValueError("--to 必须与 --from 一起使用。")
+    if args.date_from is not None and args.date_to is None:
+        raise ValueError("--from 必须与 --to 一起使用。")
+    if args.today:
+        today = datetime.now().astimezone().date()
+        return DateWindow.for_dates(today, today)
+    if args.single_date is not None:
+        return DateWindow.for_dates(args.single_date, args.single_date)
+    if args.date_from is not None and args.date_to is not None:
+        return DateWindow.for_dates(args.date_from, args.date_to)
+    if not args.thread:
+        raise ValueError(
+            "请提供线程 ID/JSONL，或使用 --today、--date、--from/--to。"
+        )
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="为一个 Codex 线程生成自包含的交互式 Token 报告。"
+        description="为一个 Codex 线程或本地日期范围生成自包含的交互式 Token 报告。"
     )
     parser.add_argument(
         "thread",
+        nargs="?",
         help="Codex 线程 ID，或明确的 rollout .jsonl 文件路径。",
+    )
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="统计本机时区今天实际发生的 Token 消耗。",
+    )
+    parser.add_argument(
+        "--date",
+        dest="single_date",
+        type=_iso_date,
+        help="统计本机时区指定日期（YYYY-MM-DD）。",
+    )
+    parser.add_argument(
+        "--from",
+        dest="date_from",
+        type=_iso_date,
+        help="日期范围起点（YYYY-MM-DD，含当日；必须与 --to 同时使用）。",
+    )
+    parser.add_argument(
+        "--to",
+        dest="date_to",
+        type=_iso_date,
+        help="日期范围终点（YYYY-MM-DD，含当日；必须与 --from 同时使用）。",
     )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="输出 HTML 路径（默认：系统临时目录/agenttools/codex-token-<线程ID>.html）。",
+        help="输出 HTML 路径（默认文件名包含线程 ID 或日期范围）。",
     )
     parser.add_argument(
         "--sessions-root",
@@ -1227,10 +2435,14 @@ def main(argv: list[str] | None = None) -> int:
     configure_console_encoding()
     args = build_parser().parse_args(argv)
     roots = [path.expanduser().resolve() for path in args.sessions_root] if args.sessions_root else None
-    requested_id = _extract_thread_id(args.thread)
     try:
-        rollout = resolve_rollout(args.thread, roots)
-        report = parse_rollout(rollout, requested_thread_id=requested_id)
+        window = _date_window_from_args(args)
+        if window is not None:
+            report = build_range_report(window, roots=roots)
+        else:
+            requested_id = _extract_thread_id(args.thread)
+            rollout = resolve_rollout(args.thread, roots)
+            report = parse_rollout(rollout, requested_thread_id=requested_id)
     except (OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
@@ -1248,8 +2460,11 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     set_message_policy(report, include_messages=not args.exclude_messages)
-    thread_id = report["metadata"]["threadId"]
-    output = args.output or default_output_path(thread_id)
+    if report.get("mode") == "range":
+        output = args.output or default_range_output_path(window)
+    else:
+        thread_id = report["metadata"]["threadId"]
+        output = args.output or default_output_path(thread_id)
     output = output.expanduser().resolve()
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1260,7 +2475,15 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = report["summary"]
     usage = summary["finalUsage"]
-    print(f"线程：{thread_id}")
+    if report.get("mode") == "range":
+        date_window = report["metadata"]["dateWindow"]
+        print(
+            f"日期：{date_window['startDate']} — {date_window['endDate']}"
+            f"（{date_window['timezone']}）"
+        )
+        print(f"会话：{summary['sessionCount']:,}")
+    else:
+        print(f"线程：{thread_id}")
     print(f"轮次：{summary['turnCount']:,}")
     print(f"总 Token：{usage['total']:,}")
     print(f"输入：{usage['input']:,}（缓存读取：{usage['cached']:,}）")

@@ -1,7 +1,7 @@
 interface:
   display_name: "Visualize Codex Tokens"
-  short_description: "Create interactive per-turn Codex token reports"
-  default_prompt: "Use $visualize-codex-tokens to generate an interactive token report for a Codex thread."
+  short_description: "Map Codex token progress to context usage"
+  default_prompt: "Use $visualize-codex-tokens to generate an interactive report for today's Codex token usage."
 
 policy:
   allow_implicit_invocation: false

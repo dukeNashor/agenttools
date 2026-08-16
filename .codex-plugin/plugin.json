@@ -1,7 +1,7 @@
 {
   "name": "agenttools",
   "version": "0.1.0",
-  "description": "Reusable agent tools for Codex, starting with interactive thread token reports.",
+  "description": "Reusable agent tools for interactive Codex token and context-window reports.",
   "author": {
     "name": "dukeNashor",
     "url": "https://github.com/dukeNashor"
@@ -13,13 +13,14 @@
     "codex",
     "skills",
     "tokens",
+    "context-window",
     "visualization"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Tools",
-    "shortDescription": "Inspect Codex thread token usage.",
-    "longDescription": "Agent Tools packages focused Codex workflows. Its first skill generates self-contained interactive reports of per-turn and total token usage from local Codex rollouts.",
+    "shortDescription": "Inspect Codex token usage by thread or date.",
+    "longDescription": "Agent Tools packages focused Codex workflows. Its first skill generates self-contained interactive reports for one thread or a local date range, with token totals, an inspectable token-progress dual-ring context view per session, a responsive session drawer, and unified subagent details.",
     "developerName": "dukeNashor",
     "category": "Productivity",
     "capabilities": [
@@ -28,7 +29,7 @@
     ],
     "websiteURL": "https://github.com/dukeNashor/agenttools",
     "defaultPrompt": [
-      "Use $visualize-codex-tokens to inspect a Codex thread's token usage."
+      "Use $visualize-codex-tokens to inspect today's Codex token usage."
     ]
   }
 }
