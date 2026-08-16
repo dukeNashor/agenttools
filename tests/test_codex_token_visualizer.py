@@ -590,6 +590,18 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn("Token 100%", template)
             self.assertIn("Token 0%", template)
 
+    def test_context_occupancy_has_high_contrast_step_contours_and_current_marker(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            compact_template = template.replace(" ", "")
+            self.assertIn("contextBandColor", template)
+            self.assertIn("context-contour", template)
+            self.assertIn("context-current-marker", template)
+            self.assertIn("context-danger-zone", template)
+            self.assertIn("context-warning", template)
+            self.assertIn('class:"context-contour"', compact_template)
+            self.assertIn('class:"context-current-marker"', compact_template)
+            self.assertIn("opacity:knownBand?.22:.7", compact_template)
+
     def test_compaction_splits_context_timeline_and_uses_a_connected_marker(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
             compact_template = template.replace(" ", "")
