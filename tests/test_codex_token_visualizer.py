@@ -507,6 +507,49 @@ class VisualizerTests(unittest.TestCase):
         self.assertNotIn('id="range-context-chart"', viz.RANGE_HTML_TEMPLATE)
         self.assertNotIn('id="range-context-ring-strip"', viz.RANGE_HTML_TEMPLATE)
 
+    def test_subagents_render_as_outer_satellites_in_both_ring_templates(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn("function radialEntries", template)
+            self.assertIn("satellite-connector", template)
+            self.assertIn("satellite-context", template)
+            self.assertIn("satellite-compaction", template)
+            self.assertIn("卫星层 · 子 agent Token", template)
+            self.assertIn("if(satellite)", template)
+
+    def test_subagent_rollout_metadata_exposes_source_kind(self) -> None:
+        thread_id = "00000000-0000-0000-0000-000000000020"
+        path = self.write_rollout(
+            [
+                rec(
+                    "2026-01-01T00:00:00Z",
+                    "session_meta",
+                    {
+                        "id": thread_id,
+                        "session_id": thread_id,
+                        "parent_thread_id": "00000000-0000-0000-0000-000000000019",
+                        "thread_source": "subagent",
+                    },
+                ),
+                rec(
+                    "2026-01-01T00:00:01Z",
+                    "event_msg",
+                    {"type": "task_started", "turn_id": "child-turn"},
+                ),
+                rec(
+                    "2026-01-01T00:00:02Z",
+                    "event_msg",
+                    {"type": "token_count", "info": token_info(usage(10, 5, 2), 120)},
+                ),
+                rec(
+                    "2026-01-01T00:00:03Z",
+                    "event_msg",
+                    {"type": "task_complete", "turn_id": "child-turn"},
+                ),
+            ]
+        )
+        report = viz.parse_rollout(path)
+        self.assertEqual(report["metadata"]["sourceKind"], "subagent")
+
     def test_dual_ring_turns_have_instant_detailed_tooltips(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
             self.assertIn('class="tooltip" id="turn-tooltip"', template)
@@ -517,6 +560,24 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn('group.addEventListener("pointermove"', template)
             self.assertIn('group.addEventListener("keydown"', template)
             self.assertIn("pointer-events:none", template.replace(" ", ""))
+
+    def test_turn_tooltip_shows_context_delta_and_current_token_only(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn("previousTurnForTooltip", template)
+            self.assertIn("previousSnapshot", template)
+            self.assertIn("contextDelta", template)
+            self.assertIn("tooltip-change", template)
+            self.assertIn("增加了", template)
+            self.assertIn("减少了", template)
+            self.assertIn("无变化", template)
+            self.assertNotIn("previousTokenPortion", template)
+            self.assertNotIn("tooltip-transition", template)
+            self.assertNotIn("上个 turn 结束：", template)
+            self.assertIn("本轮 Token 占比", template)
+            self.assertTrue(
+                "contextPortion = snapshot.occupancyRate == null ? \"—\"" in template
+                or "contextPortion=snapshot.occupancyRate==null?\"—\"" in template
+            )
 
     def test_dual_ring_uses_a_one_degree_token_seam_and_context_capacity_line(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
