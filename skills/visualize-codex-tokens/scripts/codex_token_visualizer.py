@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "2.5.0"
+VERSION = "2.8.0"
 THREAD_ID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -240,6 +240,56 @@ class WarningRecord:
         }
 
 
+TOOL_EVENT_TYPES = {
+    "tool_call",
+    "tool_use",
+    "function_call",
+    "custom_tool_call",
+    "computer_call",
+    "browser_call",
+    "browser_use",
+    "image_generation_call",
+    "mcp_tool_call",
+    "tool_result",
+    "tool_output",
+    "function_call_output",
+    "custom_tool_call_output",
+    "web_search_end",
+    "mcp_tool_call_begin",
+    "mcp_tool_call_end",
+}
+
+
+@dataclass
+class ToolCall:
+    """One observed tool invocation attached to a single turn."""
+
+    sequence: int
+    call_id: str | None
+    name: str
+    raw_name: str
+    category: str
+    timestamp: str
+    ended_at: str | None = None
+    status: str = "observed"
+    usage: Usage = field(default_factory=Usage)
+    usage_reported: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "callId": self.call_id,
+            "name": self.name,
+            "rawName": self.raw_name,
+            "category": self.category,
+            "timestamp": self.timestamp,
+            "endedAt": self.ended_at,
+            "status": self.status,
+            "usage": self.usage.to_dict(),
+            "usageReported": self.usage_reported,
+        }
+
+
 @dataclass
 class Turn:
     index: int
@@ -270,6 +320,7 @@ class Turn:
     range_latest_context_snapshot: ContextSnapshot | None = None
     context_timeline: list[ContextTimelinePoint] = field(default_factory=list)
     context_compactions: list[ContextCompaction] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
     def add_unique(self, attr: str, value: Any) -> None:
         if value is None or value == "":
@@ -287,6 +338,25 @@ class Turn:
             if self.range_first_activity_at is None:
                 self.range_first_activity_at = timestamp
             self.range_last_activity_at = timestamp
+
+    def tool_usage(self) -> Usage:
+        result = Usage()
+        for call in self.tool_calls:
+            if call.usage_reported:
+                result = result + call.usage
+        return result
+
+    def tool_summary(self) -> dict[str, Any]:
+        categories: dict[str, int] = {}
+        for call in self.tool_calls:
+            categories[call.category] = categories.get(call.category, 0) + 1
+        return {
+            "callCount": len(self.tool_calls),
+            "reportedCallCount": sum(1 for call in self.tool_calls if call.usage_reported),
+            "unknownCallCount": sum(1 for call in self.tool_calls if not call.usage_reported),
+            "usage": self.tool_usage().to_dict(),
+            "categories": categories,
+        }
 
     def to_dict(
         self,
@@ -358,6 +428,8 @@ class Turn:
             payload = point.to_dict(window=window)
             if payload["turnTokenOffset"] is not None:
                 context_timeline.append(payload)
+        tool_calls = [call.to_dict() for call in self.tool_calls]
+        tool_summary = self.tool_summary()
         return {
             "index": self.index,
             "turnId": self.turn_id,
@@ -384,6 +456,8 @@ class Turn:
             "contextSnapshot": context_payload,
             "contextTimeline": context_timeline,
             "contextCompactions": context_compactions,
+            "toolCalls": tool_calls,
+            "toolSummary": tool_summary,
         }
 
 
@@ -454,6 +528,156 @@ def _parse_timestamp(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _tool_category(raw_name: str, event_type: str) -> str:
+    rendered = f"{raw_name} {event_type}".lower().replace("_", "-")
+    if "image" in rendered or "imagegen" in rendered or "image-generation" in rendered:
+        return "imagegen"
+    if "computer" in rendered:
+        return "computer-use"
+    if "chrome" in rendered or "browser" in rendered:
+        return "chrome-use"
+    if "exec" in rendered and "reason" in rendered:
+        return "exec-reasoning"
+    if "shell" in rendered or "terminal" in rendered or "command" in rendered:
+        return "shell"
+    if "code-interpreter" in rendered or "python" in rendered:
+        return "code-interpreter"
+    if "web-search" in rendered or "search" in rendered:
+        return "web-search"
+    if "file-search" in rendered or "retrieval" in rendered:
+        return "file-search"
+    if "mcp" in rendered:
+        return "mcp"
+    if "function" in rendered or "custom-tool" in rendered:
+        return "function-calling"
+    return "other"
+
+
+def _usage_from_mapping(value: Any) -> tuple[Usage, bool]:
+    if not isinstance(value, dict):
+        return Usage(), False
+    aliases = {
+        "input_tokens": ("input_tokens", "inputTokens", "input"),
+        "cached_input_tokens": ("cached_input_tokens", "cachedInputTokens", "cached"),
+        "cache_write_input_tokens": (
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "cache_write",
+            "cacheWrite",
+        ),
+        "output_tokens": ("output_tokens", "outputTokens", "output"),
+        "reasoning_output_tokens": (
+            "reasoning_output_tokens",
+            "reasoningOutputTokens",
+            "reasoning_tokens",
+            "reasoningTokens",
+            "reasoning",
+        ),
+        "total_tokens": ("total_tokens", "totalTokens", "total"),
+    }
+    normalized: dict[str, Any] = {}
+    present = False
+    for target, candidates in aliases.items():
+        for candidate in candidates:
+            if candidate in value:
+                normalized[target] = value[candidate]
+                present = True
+                break
+    if not present:
+        return Usage(), False
+    return Usage.from_payload(normalized), True
+
+
+def _extract_tool_usage(payload: dict[str, Any]) -> tuple[Usage, bool]:
+    candidates: list[Any] = [payload]
+    for key in ("usage", "token_usage", "tokenUsage", "tool_usage", "toolUsage", "info"):
+        if key in payload:
+            candidates.append(payload.get(key))
+    for key in ("item", "tool_call", "call", "result", "output"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+            for usage_key in ("usage", "token_usage", "tokenUsage", "tool_usage", "toolUsage"):
+                if usage_key in nested:
+                    candidates.append(nested.get(usage_key))
+    for candidate in candidates:
+        usage, present = _usage_from_mapping(candidate)
+        if present:
+            return usage, True
+    return Usage(), False
+
+
+def _extract_tool_event(record_type: Any, payload: dict[str, Any]) -> dict[str, Any] | None:
+    record_name = _coerce_text(record_type).lower()
+    event_type = _coerce_text(payload.get("type")).lower()
+    item = payload.get("item")
+    item_dict = item if isinstance(item, dict) else {}
+    item_type = _coerce_text(item_dict.get("type")).lower()
+    effective_type = item_type or event_type or record_name
+    if effective_type not in TOOL_EVENT_TYPES and record_name not in {"tool_call", "tool_result", "tool_output"}:
+        return None
+    nested_tool = item_dict.get("tool")
+    nested_function = item_dict.get("function")
+    invocation = payload.get("invocation")
+    invocation_dict = invocation if isinstance(invocation, dict) else {}
+    action = payload.get("action")
+    action_dict = action if isinstance(action, dict) else {}
+    if not isinstance(nested_tool, dict):
+        nested_tool = {}
+    if not isinstance(nested_function, dict):
+        nested_function = {}
+    raw_name = _first_text(
+        payload.get("tool_name"),
+        payload.get("toolName"),
+        payload.get("name"),
+        payload.get("tool"),
+        payload.get("tool_type"),
+        item_dict.get("tool_name"),
+        item_dict.get("toolName"),
+        item_dict.get("name"),
+        nested_tool.get("name"),
+        nested_tool.get("type"),
+        nested_function.get("name"),
+        invocation_dict.get("tool"),
+        invocation_dict.get("name"),
+        action_dict.get("type"),
+    )
+    if not raw_name:
+        raw_name = effective_type.replace("_", "-") or "unknown-tool"
+    call_id = _first_text(
+        payload.get("call_id"),
+        payload.get("callId"),
+        item_dict.get("call_id"),
+        item_dict.get("callId"),
+        item_dict.get("id"),
+        invocation_dict.get("call_id"),
+        invocation_dict.get("callId"),
+    ) or None
+    usage, usage_reported = _extract_tool_usage(payload)
+    is_result = any(marker in effective_type for marker in ("result", "output", "end"))
+    status = _first_text(payload.get("status"), item_dict.get("status"))
+    if not status:
+        status = "completed" if is_result else "observed"
+    return {
+        "eventType": effective_type,
+        "callId": call_id,
+        "rawName": raw_name,
+        "name": raw_name,
+        "category": _tool_category(raw_name, effective_type),
+        "usage": usage,
+        "usageReported": usage_reported,
+        "isResult": is_result,
+        "status": status,
+    }
 
 
 def _add_usage_bucket(buckets: dict[str, Usage], key: str | None, value: Usage) -> None:
@@ -564,6 +788,8 @@ def parse_rollout(
     latest_context_snapshot: ContextSnapshot | None = None
     previous_context_snapshot: ContextSnapshot | None = None
     pending_compaction: ContextCompaction | None = None
+    tool_calls_by_key: dict[tuple[str, str], ToolCall] = {}
+    tool_sequence = 0
 
     def compaction_offsets() -> tuple[int | None, int | None]:
         if current is None:
@@ -580,6 +806,49 @@ def parse_rollout(
             if range_first_activity_at is None:
                 range_first_activity_at = timestamp
             range_last_activity_at = timestamp
+
+    def record_tool_event(
+        record_type: Any,
+        event_payload: dict[str, Any],
+        event_timestamp: str,
+    ) -> None:
+        nonlocal tool_sequence
+        event = _extract_tool_event(record_type, event_payload)
+        if (
+            event is None
+            or current is None
+            or (window is not None and not window.contains(event_timestamp))
+        ):
+            return
+        call_id = event["callId"]
+        lookup_key = (current.turn_id, call_id) if call_id else None
+        existing = tool_calls_by_key.get(lookup_key) if lookup_key is not None else None
+        if existing is not None:
+            if event["usageReported"]:
+                existing.usage = event["usage"]
+                existing.usage_reported = True
+            if event["isResult"] or event["status"] != "observed":
+                existing.ended_at = event_timestamp
+                existing.status = event["status"]
+            return
+        tool_sequence += 1
+        call = ToolCall(
+            sequence=tool_sequence,
+            call_id=call_id,
+            name=event["name"],
+            raw_name=event["rawName"],
+            category=event["category"],
+            timestamp=event_timestamp,
+            ended_at=event_timestamp if event["isResult"] else None,
+            status=event["status"],
+            usage=event["usage"],
+            usage_reported=event["usageReported"],
+        )
+        current.tool_calls.append(call)
+        if lookup_key is not None:
+            tool_calls_by_key[lookup_key] = call
+        current.note_range_activity(event_timestamp)
+        note_range_activity(event_timestamp)
 
     with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         for line_number, raw_line in enumerate(handle, 1):
@@ -668,9 +937,14 @@ def parse_rollout(
                 continue
 
             if record_type != "event_msg":
+                if record_type in {"response_item", "tool_call", "tool_result", "tool_output"}:
+                    record_tool_event(record_type, payload, timestamp)
                 continue
 
             event_type = payload.get("type")
+            if _extract_tool_event(record_type, payload) is not None:
+                record_tool_event(event_type, payload, timestamp)
+                continue
             if (
                 event_type == "thread_settings_applied"
                 and subagent_preamble
@@ -699,6 +973,7 @@ def parse_rollout(
                 latest_context_snapshot = None
                 previous_context_snapshot = None
                 pending_compaction = None
+                tool_calls_by_key.clear()
                 continue
 
             if event_type == "task_started":
@@ -1081,6 +1356,7 @@ def parse_rollout(
     status_counts: dict[str, int] = {"complete": 0, "aborted": 0, "incomplete": 0}
     for turn in relevant_turns:
         status_counts[turn.status] = status_counts.get(turn.status, 0) + 1
+    tool_stats = _tool_stats(turn_dicts)
 
     source_stat = path.stat()
     integrity_errors = sum(1 for warning in warnings if warning.severity == "error")
@@ -1133,6 +1409,7 @@ def parse_rollout(
             "containsFullUserMessages": True,
             "cacheWriteFieldAvailable": cache_write_field_present,
             "reasoningFieldAvailable": reasoning_field_present,
+            "hasToolEvents": tool_stats["callCount"] > 0,
         },
         "summary": {
             "turnCount": len(relevant_turns),
@@ -1168,6 +1445,11 @@ def parse_rollout(
                 {"date": day, "usage": daily_usage[day].to_dict()}
                 for day in sorted(daily_usage)
             ],
+            "toolCallCount": tool_stats["callCount"],
+            "toolReportedCallCount": tool_stats["reportedCallCount"],
+            "toolUnknownCallCount": tool_stats["unknownCallCount"],
+            "toolUsage": tool_stats["usage"],
+            "toolCategories": tool_stats["categories"],
         },
         "warnings": [warning.to_dict() for warning in warnings],
         "orphanMessages": orphan_messages,
@@ -1254,6 +1536,29 @@ def _sum_usage(items: Iterable[dict[str, Any]], key: str = "finalUsage") -> Usag
     for item in items:
         result = result + Usage.from_dict(item.get("summary", {}).get(key))
     return result
+
+
+def _tool_stats(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    usage = Usage()
+    call_count = 0
+    reported_call_count = 0
+    unknown_call_count = 0
+    categories: dict[str, int] = {}
+    for item in items:
+        summary = item.get("toolSummary", {})
+        call_count += _as_nonnegative_int(summary.get("callCount"))
+        reported_call_count += _as_nonnegative_int(summary.get("reportedCallCount"))
+        unknown_call_count += _as_nonnegative_int(summary.get("unknownCallCount"))
+        usage = usage + Usage.from_dict(summary.get("usage"))
+        for category, count in (summary.get("categories") or {}).items():
+            categories[category] = categories.get(category, 0) + _as_nonnegative_int(count)
+    return {
+        "callCount": call_count,
+        "reportedCallCount": reported_call_count,
+        "unknownCallCount": unknown_call_count,
+        "usage": usage.to_dict(),
+        "categories": categories,
+    }
 
 
 def _short_thread_id(thread_id: str) -> str:
@@ -1377,6 +1682,7 @@ def build_range_report(
             turn["index"] = index
 
         active_usage = _sum_usage(active_members)
+        tool_stats = _tool_stats(turns)
         cache_write_available = any(
             member.get("metadata", {}).get("cacheWriteFieldAvailable")
             for member in active_members
@@ -1426,6 +1732,7 @@ def build_range_report(
                     member.get("metadata", {}).get("reasoningFieldAvailable")
                     for member in active_members
                 ),
+                "hasToolEvents": tool_stats["callCount"] > 0,
                 "messagesIncluded": True,
                 "containsFullUserMessages": True,
             },
@@ -1454,6 +1761,11 @@ def build_range_report(
                 ),
                 "warningCount": len(member_warnings),
                 "dailyUsage": _date_buckets(window, daily),
+                "toolCallCount": tool_stats["callCount"],
+                "toolReportedCallCount": tool_stats["reportedCallCount"],
+                "toolUnknownCallCount": tool_stats["unknownCallCount"],
+                "toolUsage": tool_stats["usage"],
+                "toolCategories": tool_stats["categories"],
             },
             "warnings": member_warnings,
             "orphanMessages": [
@@ -1473,6 +1785,9 @@ def build_range_report(
         reverse=True,
     )
     total_usage = _sum_usage(sessions)
+    total_tool_stats = _tool_stats(
+        turn for session in sessions for turn in session.get("turns", [])
+    )
     cache_write_available = any(
         session.get("metadata", {}).get("cacheWriteFieldAvailable")
         for session in sessions
@@ -1500,6 +1815,7 @@ def build_range_report(
                 session.get("metadata", {}).get("reasoningFieldAvailable")
                 for session in sessions
             ),
+            "hasToolEvents": total_tool_stats["callCount"] > 0,
             "sourceRoots": [
                 str(path)
                 for path in (list(roots) if roots is not None else default_session_roots())
@@ -1522,6 +1838,11 @@ def build_range_report(
                 1 for warning in all_warnings if warning.get("severity") == "error"
             ),
             "warningCount": len(all_warnings),
+            "toolCallCount": total_tool_stats["callCount"],
+            "toolReportedCallCount": total_tool_stats["reportedCallCount"],
+            "toolUnknownCallCount": total_tool_stats["unknownCallCount"],
+            "toolUsage": total_tool_stats["usage"],
+            "toolCategories": total_tool_stats["categories"],
         },
         "warnings": all_warnings,
         "sessions": sessions,
@@ -1628,6 +1949,12 @@ h1 { font-size: clamp(28px, 4vw, 48px); line-height:1.08; margin:7px 0 10px; let
 .filter-row { padding:0 20px 15px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; color:var(--muted); }
 .filter-row input[type="search"] { min-width:min(100%,320px); flex:1; }
 .check { display:inline-flex; gap:5px; align-items:center; }
+.tool-filter-group { display:flex; align-items:center; gap:7px; margin:0; padding:0; border:0; }
+.tool-filter-group legend { color:var(--muted); font-size:11px; font-weight:700; }
+.tool-filter-list { display:flex; gap:7px; flex-wrap:wrap; }
+.tool-filter-list .check { padding:4px 7px; border:1px solid rgba(126,111,91,.24); border-radius:999px; background:rgba(255,254,250,.62); white-space:nowrap; }
+.tool-filter-list .check:has(input:checked) { border-color:var(--accent); color:var(--accent); background:rgba(59,139,120,.08); }
+.tool-filter-list input { accent-color:var(--accent); }
 .legend { display:flex; gap:13px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
 .legend span::before { content:""; width:9px; height:9px; display:inline-block; margin-right:5px; border-radius:3px; background:var(--swatch); }
 .chart-scroll { overflow-x:auto; border-top:1px solid rgba(126,111,91,.25); }
@@ -1679,6 +2006,13 @@ svg { display:block; width:100%; height:auto; overflow:visible; }
 .context-turn.satellite .satellite-connector { stroke:var(--muted); stroke-width:1.2; stroke-dasharray:3 4; opacity:.38; }
 .context-turn.satellite:hover .satellite-connector, .context-turn.satellite:focus .satellite-connector, .context-turn.satellite.selected .satellite-connector { stroke:var(--accent); stroke-width:2.4; opacity:.9; }
 .context-satellite-label { fill:var(--muted); font-size:10px; font-weight:700; }
+.tool-envelope { fill:none; stroke:#6f8fb7; stroke-width:5; stroke-dasharray:2 5; opacity:.72; }
+.tool-satellite { cursor:pointer; }
+.tool-satellite .token-sector { stroke:#fffefa; stroke-width:1.4; }
+.tool-satellite-unknown { fill:none; stroke:#6f8fb7; stroke-width:2; stroke-dasharray:2 3; }
+.tool-satellite-connector { stroke:#6f8fb7; stroke-width:1.1; stroke-dasharray:2 4; opacity:.55; }
+.tool-satellite:hover .tool-satellite-connector, .tool-satellite:focus .tool-satellite-connector, .tool-satellite.selected .tool-satellite-connector { stroke:#3b6d9b; stroke-width:2.4; opacity:1; }
+.tool-satellite-label { fill:#52749b; font-size:10px; font-weight:700; }
 .context-reference { fill:none; stroke:rgba(117,110,100,.18); stroke-width:1; stroke-dasharray:3 4; }
 .context-reference.context-capacity { stroke:rgba(45,41,36,.75); stroke-width:2.5; stroke-dasharray:none; }
 .context-reference.context-warning { stroke:rgba(210,139,61,.72); stroke-width:1.8; }
@@ -1781,6 +2115,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       </div>
       <div class="filter-row">
         <input id="search" type="search" placeholder="搜索完整用户消息、轮次 ID、模型……">
+        <fieldset class="tool-filter-group" id="tool-filter" aria-label="工具类型筛选"><legend>工具</legend><div class="tool-filter-list" id="tool-filter-list"></div></fieldset>
         <label class="check"><input type="checkbox" data-status="complete" checked> 已完成</label>
         <label class="check"><input type="checkbox" data-status="aborted" checked> 已中止</label>
         <label class="check"><input type="checkbox" data-status="incomplete" checked> 未闭合</label>
@@ -1860,9 +2195,12 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   };
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
-  const state = { tab: "context", scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
+  const DEFAULT_TOOL_CATEGORIES = ["computer-use", "chrome-use", "imagegen"];
+  const state = { tab: "context", scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
   const tooltip = byId("turn-tooltip");
   const TOOLTIP_MESSAGE_LIMIT = 800;
+  const toolLabels = {"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
+  const toolColors = {"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
 
   function byId(id) { return document.getElementById(id); }
   function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
@@ -1928,12 +2266,14 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     byId("linear-button").addEventListener("click", () => setScale("linear"));
     byId("log-button").addEventListener("click", () => setScale("log"));
     byId("search").addEventListener("input", event => { state.search = event.target.value.trim().toLocaleLowerCase(); renderAll(); });
+    populateToolFilter();
     document.querySelectorAll("[data-status]").forEach(input => input.addEventListener("change", () => {
       if (input.checked) state.statuses.add(input.dataset.status); else state.statuses.delete(input.dataset.status); renderAll();
     }));
     byId("reset-button").addEventListener("click", () => {
-      state.start = 1; state.end = Math.max(1, turns.length); state.search = ""; state.statuses = new Set(["complete","aborted","incomplete"]); state.scale = "linear";
+      state.start = 1; state.end = Math.max(1, turns.length); state.search = ""; state.toolCategories = new Set(DEFAULT_TOOL_CATEGORIES); state.statuses = new Set(["complete","aborted","incomplete"]); state.scale = "linear";
       start.value = 1; end.value = Math.max(1, turns.length); byId("search").value = "";
+      syncToolFilterInputs();
       document.querySelectorAll("[data-status]").forEach(input => input.checked = true); syncScaleButtons(); renderAll();
     });
     document.querySelectorAll("th[data-sort]").forEach(th => th.addEventListener("click", () => {
@@ -1973,6 +2313,8 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       const haystack = [turn.turnId, turn.status, turn.models.join(" "), turn.efforts.join(" "), firstPrompt(turn)].join(" ").toLocaleLowerCase();
       return haystack.includes(state.search);
   }
+  function syncToolFilterInputs() { byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input => { input.checked = state.toolCategories.has(input.value); }); }
+  function populateToolFilter() { const categories=[...new Set(turns.flatMap(turn=>(turn.toolCalls||[]).map(call=>call.category)))].sort((a,b)=>(toolLabels[a]||a).localeCompare(toolLabels[b]||b)); byId("tool-filter-list").innerHTML=categories.map(category=>`<label class="check"><input type="checkbox" data-tool-category="true" value="${esc(category)}"${state.toolCategories.has(category)?" checked":""}> ${esc(toolLabels[category]||category)}</label>`).join(""); byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input=>input.addEventListener("change",event=>{if(event.target.checked)state.toolCategories.add(event.target.value);else state.toolCategories.delete(event.target.value);renderAll()})); }
   function filteredTurns() { return turns.filter(turnMatchesFilter); }
   function renderAll() {
     byId("range-start-value").textContent = state.start; byId("range-end-value").textContent = state.end; updateRangeFill();
@@ -2067,6 +2409,13 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   function radialEntries(ordered,denominator){let consumed=0;const entries=ordered.map(turn=>{const tokens=Math.max(0,Number(turn.usage.total)||0),entry={turn,tokens,tokenStart:consumed,start:consumed/denominator,end:(consumed+tokens)/denominator,satellite:isSatelliteTurn(turn),parentEntry:null,satelliteLane:0};consumed+=tokens;return entry});const siblingCounts=new Map();entries.forEach((entry,index)=>{if(!entry.satellite)return;let parent=null;for(let cursor=index-1;cursor>=0;cursor-=1){if(!entries[cursor].satellite){parent=entries[cursor];break}}if(!parent)parent=entries.find(candidate=>!candidate.satellite)||null;const key=parent?.turn.turnId||"orphan";entry.parentEntry=parent;entry.satelliteLane=siblingCounts.get(key)||0;siblingCounts.set(key,entry.satelliteLane+1)});return entries}
   function satelliteGeometry(cx,cy,outerOuter,entry){const inner=outerOuter+24+(entry.satelliteLane%5)*14;return{inner,outer:inner+10,contextRadius:inner-8}}
   function satelliteFraction(entry){return(entry.start+entry.end)/2}
+  function toolCallLabel(call){return toolLabels[call.category]||call.name||"未知工具"}
+  function toolCallColor(call){return toolColors[call.category]||toolColors.other}
+  function toolUsage(call){return call.usageReported?Math.max(0,Number(call.usage?.total)||0):0}
+  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=call.usageReported?`${formatTokens(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${formatTokens(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
+  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["原始工具名",call.rawName||call.name||"未知"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",call.usageReported?formatTokens(usage.total):"未知"],["输入",call.usageReported?formatTokens(usage.input):"未知"],["缓存输入",call.usageReported?formatTokens(usage.cached):"未知"],["输出",call.usageReported?formatTokens(usage.output):"未知"],["推理输出",call.usageReported?formatTokens(usage.reasoning):"未知"]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${formatTokens(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContextRadial();}
+  function toolSatelliteGeometry(cx,cy,outerOuter,index){const inner=outerOuter+76+(index%3)*14;return{inner,outer:inner+9}}
+  function renderToolLayer(svg,entries,cx,cy,outerOuter,denominator){entries.forEach(entry=>{const calls=(entry.turn.toolCalls||[]).filter(call=>state.toolCategories.has(call.category));if(!calls.length)return;const parentSpan=Math.max(0,entry.end-entry.start),envelopeStart=parentSpan?entry.start:Math.max(0,entry.start-.006),envelopeEnd=parentSpan?entry.end:Math.min(1,entry.start+.012),envelopePath=arcBandPath(cx,cy,outerOuter+54,outerOuter+60,envelopeStart,envelopeEnd);if(envelopePath)svg.appendChild(svgEl("path",{d:envelopePath,class:"tool-envelope"}));const exact=calls.reduce((sum,call)=>sum+toolUsage(call),0),unknown=calls.filter(call=>!call.usageReported).length;const envelopeTitle=svgEl("title");envelopeTitle.textContent=`第 ${entry.turn.index} 轮工具包络 · ${calls.length} 次调用 · ${formatTokens(exact)} Token · ${unknown} 次 Token 未知`;const envelopeNode=svg.lastChild;if(envelopeNode)envelopeNode.appendChild(envelopeTitle);calls.forEach((call,index)=>{const fraction=parentSpan?entry.start+parentSpan*(index+.5)/calls.length:entry.start,geometry=toolSatelliteGeometry(cx,cy,outerOuter,index),usage=toolUsage(call),width=usage>0?Math.min(Math.max(parentSpan*.22,.002),usage/denominator):0,start=usage>0?Math.max(entry.start,fraction-width/2):fraction,end=usage>0?Math.min(entry.end,start+width):fraction,group=svgEl("g",{class:`tool-satellite${state.selected===entry.turn.turnId?" selected":""}`,tabindex:"0",role:"button","data-tool-target":"true","aria-label":`${toolCallLabel(call)}，${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`}),parentPoint=radialPoint(cx,cy,outerOuter+7,fraction),satellitePoint=radialPoint(cx,cy,geometry.inner-1,fraction);group.appendChild(svgEl("line",{x1:satellitePoint.x,y1:satellitePoint.y,x2:parentPoint.x,y2:parentPoint.y,class:"tool-satellite-connector"}));if(usage>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,geometry.inner,geometry.outer,start,end),fill:toolCallColor(call),class:"token-sector"}));}else{const a=radialPoint(cx,cy,geometry.inner-3,fraction),b=radialPoint(cx,cy,geometry.outer+5,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"tool-satellite-unknown"}))}const title=svgEl("title");title.textContent=`${toolCallLabel(call)} · ${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`;group.appendChild(title);group.addEventListener("pointerenter",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",hideTooltip);group.addEventListener("focus",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("blur",hideTooltip);group.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openToolDrawer(entry.turn,call)}});group.addEventListener("click",()=>{hideTooltip();openToolDrawer(entry.turn,call)});svg.appendChild(group)})})}
   function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
   function contextOrderTime(turn){const snapshot=contextSnapshot(turn);return snapshot.timestamp||turn.endedAt||turn.rangeLastActivityAt||turn.startedAt||""}
   const contextGap=Math.PI/180,contextStart=-Math.PI/2+contextGap/2,contextSpan=2*Math.PI-contextGap;
@@ -2100,6 +2449,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       const hitInner=satellite?satelliteBand.inner-9:innerBase-7,hitOuter=satellite?satelliteBand.outer+9:outerOuter+8,hitEnd=tokens>0?end:Math.min(1,start+.004);group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,hitInner,hitOuter,satellite?start:turnFraction,hitEnd),fill:"rgba(0,0,0,.001)"}));group.addEventListener("pointerenter",event=>{showCenter(turn);showTurnTooltip(event,turn,group,total)});group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",()=>{resetCenter();hideTooltip()});group.addEventListener("focus",event=>{showCenter(turn);focusTurnTooltip(event,turn,group,total)});group.addEventListener("blur",()=>{resetCenter();hideTooltip()});group.addEventListener("keydown",event=>turnTargetKeydown(event,turn));group.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(group);
       (turn.contextCompactions||[]).forEach(event=>{const offset=Math.max(0,Math.min(tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,marker=svgEl("g",{class:`context-compaction${satellite?" satellite-compaction":""}`,tabindex:"0",role:"button","data-turn-target":"true","aria-label":`Compaction，累计 Token 位置 ${((fraction)*100).toFixed(2)}%`}),positionOuter=radialPoint(cx,cy,satellite?satelliteBand.outer+8:outerOuter+12,fraction),beforeRate=event.before?.occupancyRate,afterRate=event.after?.occupancyRate;if(satellite){const point=radialPoint(cx,cy,satelliteBand.contextRadius,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:point.x,y2:point.y,class:"compaction-position-line"}));marker.appendChild(svgEl("circle",{cx:point.x,cy:point.y,r:4,class:"compaction-after"}))}else if(beforeRate!=null&&afterRate!=null){const before=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(beforeRate)))/100,fraction),after=radialPoint(cx,cy,innerBase+(innerMax-innerBase)*Math.max(0,Math.min(100,Number(afterRate)))/100,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:before.x,y2:before.y,class:"compaction-position-line"}));marker.appendChild(svgEl("line",{x1:before.x,y1:before.y,x2:after.x,y2:after.y,class:"compaction-jump-line","marker-end":"url(#context-compaction-arrow)"}));marker.appendChild(svgEl("circle",{cx:before.x,cy:before.y,r:4,class:"compaction-before"}));marker.appendChild(svgEl("circle",{cx:after.x,cy:after.y,r:4,class:"compaction-after"}))}else{const positionInner=radialPoint(cx,cy,innerMax+5,fraction);marker.appendChild(svgEl("line",{x1:positionOuter.x,y1:positionOuter.y,x2:positionInner.x,y2:positionInner.y,class:"compaction-position-line"}))}const title=svgEl("title");title.textContent=`Compaction · ${dateText(event.timestamp)} · ${event.before?.tokens==null?"未知":formatTokens(event.before.tokens)} → ${event.after?.tokens==null?"未知":formatTokens(event.after.tokens)} Context Token`;marker.appendChild(title);marker.addEventListener("focus",()=>showCenter(turn));marker.addEventListener("blur",resetCenter);marker.addEventListener("keydown",keyEvent=>turnTargetKeydown(keyEvent,turn));marker.addEventListener("click",()=>{hideTooltip();openDrawer(turn)});svg.appendChild(marker)})
     });
+    renderToolLayer(svg,entries,cx,cy,outerOuter,denominator);
     const compactionMarkers=[...svg.querySelectorAll(".context-compaction")];let compactionIndex=0;entries.forEach(entry=>{const count=(entry.turn.contextCompactions||[]).length;if(entry.satellite){const geometry=satelliteGeometry(cx,cy,outerOuter,entry);for(let index=0;index<count;index+=1){const event=entry.turn.contextCompactions[index],offset=Math.max(0,Math.min(entry.tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,from=radialPoint(cx,cy,outerOuter+12,fraction),to=radialPoint(cx,cy,geometry.outer+8,fraction),marker=compactionMarkers[compactionIndex+index];if(marker){marker.classList.add("satellite-compaction");marker.setAttribute("transform",`translate(${(to.x-from.x).toFixed(2)} ${(to.y-from.y).toFixed(2)})`)}}}compactionIndex+=count});
     const startPoint=radialPoint(cx,cy,outerOuter+18,0),endPoint=radialPoint(cx,cy,outerOuter+18,1);[[startPoint,"Token 0%","start"],[endPoint,"Token 100%","end"]].forEach(([point,label,anchor])=>{const node=svgEl("text",{x:point.x,y:point.y+4,"text-anchor":anchor,fill:css("--muted"),"font-size":"11","font-weight":"700"});node.textContent=label;svg.appendChild(node)});
     const outerLabel=svgEl("text",{x:24,y:33,fill:css("--muted"),"font-size":"12","font-weight":"700"});outerLabel.textContent="主圈 · Token 消耗（累计 Token 进度）";svg.appendChild(outerLabel);const satelliteLabel=svgEl("text",{x:24,y:53,fill:css("--muted"),"font-size":"12"});satelliteLabel.textContent="卫星层 · 子 agent Token（连接至主 turn）";svg.appendChild(satelliteLabel);const innerLabel=svgEl("text",{x:24,y:73,fill:css("--muted"),"font-size":"12"});innerLabel.textContent="内环 · Context 快照（按 Token 位置阶梯变化）";svg.appendChild(innerLabel)
@@ -2194,9 +2544,9 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
 <title>__PAGE_TITLE__</title>
 <style>
 :root{--bg:#f5f2ec;--panel:#fffefa;--panel2:#f0e9dd;--text:#2d2924;--muted:#756e64;--border:#ddd5c9;--accent:#3b8b78;--danger:#c95561;--warning:#b77a26;--cached:#4f9d87;--cache-write:#8c78bd;--uncached:#d9874c;--output:#dca83e;--reasoning:#cf6f78;--unclassified:#928a80;--shadow:0 16px 42px rgba(92,75,54,.12)}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -15%,rgba(87,166,141,.16),transparent 38rem),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input{font:inherit}button{cursor:pointer;color:inherit}.shell{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh;transition:grid-template-columns .2s ease}.shell.session-nav-closed{grid-template-columns:0 minmax(0,1fr)}.sidebar{position:sticky;z-index:60;top:0;width:300px;height:100vh;overflow:auto;padding:22px 16px;background:rgba(238,231,220,.96);border-right:1px solid var(--border);backdrop-filter:blur(18px);transition:transform .2s ease,opacity .2s ease,visibility .2s}.shell.session-nav-closed .sidebar{transform:translateX(-104%);opacity:0;visibility:hidden;pointer-events:none}.sidebar-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.sidebar-head button,.session-drawer-toggle{border:1px solid var(--border);border-radius:9px;background:var(--panel);padding:7px 9px}.brand{padding:0 8px 16px;min-width:0;flex:1}.eyebrow{color:var(--accent);text-transform:uppercase;letter-spacing:.14em;font-size:11px;font-weight:800}.brand h2{margin:5px 0 4px;font-size:20px}.muted{color:var(--muted)}.nav-search,.content-search{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:9px;background:var(--panel);color:var(--text)}.session-list{display:grid;gap:7px;margin-top:12px}.session-button{width:100%;text-align:left;padding:11px;border:1px solid transparent;border-radius:11px;background:transparent}.session-button:hover,.session-button.active{background:var(--panel);border-color:var(--accent);box-shadow:0 6px 18px rgba(92,75,54,.08)}.session-button strong,.session-button span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-button span{color:var(--muted);font-size:11px;margin-top:3px}.session-drawer-backdrop{display:none;position:fixed;z-index:55;inset:0;border:0;border-radius:0;padding:0;background:rgba(45,41,36,.28)}.content{min-width:0;padding:28px clamp(16px,3vw,44px) 64px}.content-topbar{display:flex;align-items:center;min-height:36px;margin-bottom:10px}.session-drawer-toggle{display:inline-flex;align-items:center;gap:7px}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.hero h1{font-size:clamp(28px,4vw,46px);line-height:1.08;margin:7px 0 9px;letter-spacing:-.035em}.subline{color:var(--muted);overflow-wrap:anywhere}.sensitive{color:#984b55;background:#fae9e8;border:1px solid #e8c4c2;border-radius:999px;padding:7px 11px;font-size:12px;white-space:nowrap}.sensitive.safe{color:#3f765f;background:#e8f3eb;border-color:#c3ddcb}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:11px;margin:20px 0}.card,.panel{background:linear-gradient(180deg,rgba(255,254,250,.98),rgba(252,249,243,.98));border:1px solid var(--border);box-shadow:var(--shadow)}.card{padding:15px;border-radius:14px;min-height:100px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.07em}.value{font-size:clamp(21px,2.2vw,30px);font-weight:760;margin-top:7px;font-variant-numeric:tabular-nums}.note{color:var(--muted);font-size:11px}.panel{border-radius:16px;margin-top:15px;overflow:hidden}.panel-head{padding:17px 19px 12px;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.panel-head h2{font-size:18px;margin:0}.panel-head p{color:var(--muted);margin:3px 0 0}.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.controls button{border:1px solid var(--border);border-radius:8px;padding:7px 9px;background:var(--panel)}.controls button.active{border-color:var(--accent);color:var(--accent)}.filters{padding:0 19px 14px;display:flex;gap:11px;align-items:center;flex-wrap:wrap;color:var(--muted)}.filters .content-search{min-width:260px;flex:1}.check{display:inline-flex;align-items:center;gap:4px}.legend{padding:0 19px 13px;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:11px}.legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;background:var(--swatch)}.chart-scroll,.table-wrap{overflow:auto;border-top:1px solid var(--border)}.chart-wrap{min-width:900px;padding:8px 10px 2px}.trend-wrap{padding:4px 16px 12px;overflow:auto}.trend-wrap svg{min-width:760px}svg{display:block;width:100%;height:auto}.grid{stroke:rgba(117,110,100,.2)}.bar{cursor:pointer}.bar:hover{filter:brightness(1.16)}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1430px}th{position:sticky;top:0;z-index:2;background:#eee7dc;color:#5f584f;text-align:right;padding:10px;border-bottom:1px solid var(--border);font-size:10px;letter-spacing:.04em;text-transform:uppercase}th:first-child,th:nth-child(2),th:nth-child(3),th:last-child,td:first-child,td:nth-child(2),td:nth-child(3),td:last-child{text-align:left}td{padding:9px 10px;border-bottom:1px solid rgba(126,111,91,.18);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}tbody tr{cursor:pointer}tbody tr:hover{outline:1px solid rgba(59,139,120,.3);outline-offset:-1px}.title-cell{max-width:390px;overflow:hidden;text-overflow:ellipsis}.warning-box{margin:15px 0;border:1px solid var(--border);border-radius:12px;overflow:hidden}.warning-box summary{cursor:pointer;padding:12px 15px;color:var(--warning);font-weight:700}.warning-list{max-height:260px;overflow:auto;margin:0;padding:4px 18px 14px 34px}.warning-list li{margin:5px 0;color:var(--muted)}.warning-list li.error{color:#a74450}.empty{padding:36px;text-align:center;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:11px;margin-top:25px}.drawer{position:fixed;z-index:50;top:0;right:0;width:min(620px,94vw);height:100vh;transform:translateX(104%);transition:transform .2s;background:#fbf8f2;border-left:1px solid var(--border);box-shadow:-24px 0 60px rgba(92,75,54,.22);display:flex;flex-direction:column}.drawer.open{transform:translateX(0)}.drawer-head{padding:18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}.drawer-head h2{margin:2px 0}.drawer-head button{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:7px 10px}.drawer-body{overflow:auto;padding:16px 18px 50px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.detail{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.detail b{display:block;margin-top:3px;overflow-wrap:anywhere}.message{margin-top:12px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.message-head{padding:7px 10px;background:var(--panel2);color:var(--muted);font-size:11px}.message pre{margin:0;padding:11px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.provisional{color:var(--warning)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -15%,rgba(87,166,141,.16),transparent 38rem),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input{font:inherit}button{cursor:pointer;color:inherit}.shell{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh;transition:grid-template-columns .2s ease}.shell.session-nav-closed{grid-template-columns:0 minmax(0,1fr)}.sidebar{position:sticky;z-index:60;top:0;width:300px;height:100vh;overflow:auto;padding:22px 16px;background:rgba(238,231,220,.96);border-right:1px solid var(--border);backdrop-filter:blur(18px);transition:transform .2s ease,opacity .2s ease,visibility .2s}.shell.session-nav-closed .sidebar{transform:translateX(-104%);opacity:0;visibility:hidden;pointer-events:none}.sidebar-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.sidebar-head button,.session-drawer-toggle{border:1px solid var(--border);border-radius:9px;background:var(--panel);padding:7px 9px}.brand{padding:0 8px 16px;min-width:0;flex:1}.eyebrow{color:var(--accent);text-transform:uppercase;letter-spacing:.14em;font-size:11px;font-weight:800}.brand h2{margin:5px 0 4px;font-size:20px}.muted{color:var(--muted)}.nav-search,.content-search{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:9px;background:var(--panel);color:var(--text)}.session-list{display:grid;gap:7px;margin-top:12px}.session-button{width:100%;text-align:left;padding:11px;border:1px solid transparent;border-radius:11px;background:transparent}.session-button:hover,.session-button.active{background:var(--panel);border-color:var(--accent);box-shadow:0 6px 18px rgba(92,75,54,.08)}.session-button strong,.session-button span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-button span{color:var(--muted);font-size:11px;margin-top:3px}.session-drawer-backdrop{display:none;position:fixed;z-index:55;inset:0;border:0;border-radius:0;padding:0;background:rgba(45,41,36,.28)}.content{min-width:0;padding:28px clamp(16px,3vw,44px) 64px}.content-topbar{display:flex;align-items:center;min-height:36px;margin-bottom:10px}.session-drawer-toggle{display:inline-flex;align-items:center;gap:7px}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}.hero h1{font-size:clamp(28px,4vw,46px);line-height:1.08;margin:7px 0 9px;letter-spacing:-.035em}.subline{color:var(--muted);overflow-wrap:anywhere}.sensitive{color:#984b55;background:#fae9e8;border:1px solid #e8c4c2;border-radius:999px;padding:7px 11px;font-size:12px;white-space:nowrap}.sensitive.safe{color:#3f765f;background:#e8f3eb;border-color:#c3ddcb}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:11px;margin:20px 0}.card,.panel{background:linear-gradient(180deg,rgba(255,254,250,.98),rgba(252,249,243,.98));border:1px solid var(--border);box-shadow:var(--shadow)}.card{padding:15px;border-radius:14px;min-height:100px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.07em}.value{font-size:clamp(21px,2.2vw,30px);font-weight:760;margin-top:7px;font-variant-numeric:tabular-nums}.note{color:var(--muted);font-size:11px}.panel{border-radius:16px;margin-top:15px;overflow:hidden}.panel-head{padding:17px 19px 12px;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}.panel-head h2{font-size:18px;margin:0}.panel-head p{color:var(--muted);margin:3px 0 0}.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.controls button{border:1px solid var(--border);border-radius:8px;padding:7px 9px;background:var(--panel)}.controls button.active{border-color:var(--accent);color:var(--accent)}.filters{padding:0 19px 14px;display:flex;gap:11px;align-items:center;flex-wrap:wrap;color:var(--muted)}.filters .content-search{min-width:260px;flex:1}.check{display:inline-flex;align-items:center;gap:4px}.legend{padding:0 19px 13px;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:11px}.legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px;background:var(--swatch)}.chart-scroll,.table-wrap{overflow:auto;border-top:1px solid var(--border)}.chart-wrap{min-width:900px;padding:8px 10px 2px}.trend-wrap{padding:4px 16px 12px;overflow:auto}.trend-wrap svg{min-width:760px}svg{display:block;width:100%;height:auto}.grid{stroke:rgba(117,110,100,.2)}.bar{cursor:pointer}.bar:hover{filter:brightness(1.16)}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1430px}th{position:sticky;top:0;z-index:2;background:#eee7dc;color:#5f584f;text-align:right;padding:10px;border-bottom:1px solid var(--border);font-size:10px;letter-spacing:.04em;text-transform:uppercase}th:first-child,th:nth-child(2),th:nth-child(3),th:last-child,td:first-child,td:nth-child(2),td:nth-child(3),td:last-child{text-align:left}td{padding:9px 10px;border-bottom:1px solid rgba(126,111,91,.18);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}tbody tr{cursor:pointer}tbody tr:hover{outline:1px solid rgba(59,139,120,.3);outline-offset:-1px}.title-cell{max-width:390px;overflow:hidden;text-overflow:ellipsis}.warning-box{margin:15px 0;border:1px solid var(--border);border-radius:12px;overflow:hidden}.warning-box summary{cursor:pointer;padding:12px 15px;color:var(--warning);font-weight:700}.warning-list{max-height:260px;overflow:auto;margin:0;padding:4px 18px 14px 34px}.warning-list li{margin:5px 0;color:var(--muted)}.warning-list li.error{color:#a74450}.empty{padding:36px;text-align:center;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:11px;margin-top:25px}.drawer{position:fixed;z-index:50;top:0;right:0;width:min(620px,94vw);height:100vh;transform:translateX(104%);transition:transform .2s;background:#fbf8f2;border-left:1px solid var(--border);box-shadow:-24px 0 60px rgba(92,75,54,.22);display:flex;flex-direction:column}.drawer.open{transform:translateX(0)}.drawer-head{padding:18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}.drawer-head h2{margin:2px 0}.drawer-head button{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:7px 10px}.drawer-body{overflow:auto;padding:16px 18px 50px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.detail{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.detail b{display:block;margin-top:3px;overflow-wrap:anywhere}.message{margin-top:12px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.message-head{padding:7px 10px;background:var(--panel2);color:var(--muted);font-size:11px}.message pre{margin:0;padding:11px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.provisional{color:var(--warning)}.tool-filter-group{display:flex;align-items:center;gap:7px;margin:0;padding:0;border:0}.tool-filter-group legend{color:var(--muted);font-size:11px;font-weight:700}.tool-filter-list{display:flex;gap:7px;flex-wrap:wrap}.tool-filter-list .check{padding:4px 7px;border:1px solid rgba(126,111,91,.24);border-radius:999px;background:rgba(255,254,250,.62);white-space:nowrap}.tool-filter-list .check:has(input:checked){border-color:var(--accent);color:var(--accent);background:rgba(59,139,120,.08)}.tool-filter-list input{accent-color:var(--accent)}
 .context-radial-wrap{padding:4px 18px 18px;border-top:1px solid var(--border)}.context-radial-wrap svg{width:min(100%,900px);margin:auto;max-height:680px}.source-legend{display:flex;justify-content:center;gap:11px;flex-wrap:wrap;padding:0 18px 12px;color:var(--muted);font-size:11px}.source-legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;background:var(--source-color)}.context-turn{cursor:pointer;transition:opacity .14s ease,filter .14s ease}.context-turn.dim{opacity:.14}.context-turn:hover,.context-turn:focus,.context-turn.selected{filter:brightness(1.12) saturate(1.15);outline:none}.context-turn .mapping-line{stroke:var(--text);stroke-width:1;opacity:.2}.context-turn:hover .mapping-line,.context-turn:focus .mapping-line,.context-turn.selected .mapping-line{stroke-width:2.4;opacity:.78}.context-turn .token-sector{stroke:#fffefa;stroke-width:1.2}.context-turn.source-switch .token-sector{stroke-width:4}.context-reference{fill:none;stroke:rgba(117,110,100,.18);stroke-width:1;stroke-dasharray:3 4}.context-reference.context-capacity{stroke:rgba(45,41,36,.75);stroke-width:2.5;stroke-dasharray:none}.context-compaction{cursor:pointer}.context-compaction line{stroke:var(--warning);stroke-width:3}.context-compaction circle{fill:#fffefa;stroke:var(--warning);stroke-width:2}.context-zero-tick{stroke-width:2;opacity:.78}
-.context-compaction .compaction-position-line{stroke-dasharray:4 4;opacity:.78}.context-compaction .compaction-jump-line{stroke-width:3.5}.context-compaction .compaction-after{fill:var(--warning)}
+.context-compaction .compaction-position-line{stroke-dasharray:4 4;opacity:.78}.context-compaction .compaction-jump-line{stroke-width:3.5}.context-compaction .compaction-after{fill:var(--warning)}.tool-envelope{fill:none;stroke:#6f8fb7;stroke-width:5;stroke-dasharray:2 5;opacity:.72}.tool-satellite{cursor:pointer}.tool-satellite .token-sector{stroke:#fffefa;stroke-width:1.4}.tool-satellite-unknown{fill:none;stroke:#6f8fb7;stroke-width:2;stroke-dasharray:2 3}.tool-satellite-connector{stroke:#6f8fb7;stroke-width:1.1;stroke-dasharray:2 4;opacity:.55}.tool-satellite:hover .tool-satellite-connector,.tool-satellite:focus .tool-satellite-connector,.tool-satellite.selected .tool-satellite-connector{stroke:#3b6d9b;stroke-width:2.4;opacity:1}.tool-satellite-label{fill:#52749b;font-size:10px;font-weight:700}
 .tooltip{position:fixed;z-index:80;pointer-events:none;display:none;visibility:hidden;width:min(440px,calc(100vw - 16px));max-height:calc(100vh - 16px);overflow:hidden;padding:12px 13px;border:1px solid var(--border);border-radius:11px;background:#fffefa;box-shadow:var(--shadow);font-size:12px;transition:none}.tooltip-title{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px}.tooltip-title strong{font-size:13px}.tooltip-badge{flex:none;border-radius:999px;padding:2px 7px;background:var(--panel2);color:var(--accent);font-size:10px;font-weight:750}.tooltip-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}.tooltip-metric{min-width:0;padding:9px 10px;border:1px solid color-mix(in srgb,var(--metric-color) 28%,var(--border));border-radius:9px;background:color-mix(in srgb,var(--metric-color) 8%,#fffefa)}.tooltip-metric.context{--metric-color:var(--accent)}.tooltip-metric.token{--metric-color:var(--uncached)}.tooltip-metric span{display:block;color:var(--muted);font-size:10px;font-weight:750}.tooltip-metric strong{display:block;margin:3px 0 1px;color:var(--metric-color);font-size:20px;line-height:1.1;font-variant-numeric:tabular-nums}.tooltip-metric small{display:block;min-height:30px;color:var(--text);font-size:10px;line-height:1.4;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.tooltip-grid{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 12px;padding-top:7px;border-top:1px solid rgba(126,111,91,.18)}.tooltip-grid span{color:var(--muted)}.tooltip-grid b{min-width:0;overflow-wrap:anywhere;text-align:right;font-weight:650;font-variant-numeric:tabular-nums}.tooltip-section{margin-top:8px;padding-top:7px;border-top:1px solid rgba(126,111,91,.18)}.tooltip-section-label{color:var(--muted);font-size:10px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.tooltip-message{max-height:min(230px,30vh);margin-top:4px;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text);font:11.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}.tooltip-truncated{margin-top:4px;color:var(--warning);font-size:10px}
 @media(max-width:900px){body.session-nav-modal-open{overflow:hidden}.shell,.shell.session-nav-closed{display:block}.sidebar{position:fixed;left:0;transform:translateX(-104%);opacity:0;visibility:hidden;width:min(320px,88vw);border-right:1px solid var(--border)}.shell.session-nav-open .sidebar{transform:translateX(0);opacity:1;visibility:visible;pointer-events:auto}.shell.session-nav-open .session-drawer-backdrop{display:block}.content{padding-top:20px}}@media(max-width:650px){.hero{flex-direction:column}.detail-grid{grid-template-columns:1fr}}
 .sidebar{overflow-x:hidden}.session-list{min-width:0}.session-button{min-width:0;max-width:100%}
@@ -2226,7 +2576,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
         <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">轮次明细</button>
       </nav>
       <div class="analysis-controls">
-        <div class="filters"><input class="content-search" id="content-search" type="search"><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span><button id="reset-filters" type="button">重置筛选</button></div>
+        <div class="filters"><input class="content-search" id="content-search" type="search"><fieldset class="tool-filter-group" id="tool-filter" aria-label="工具类型筛选"><legend>工具</legend><div class="tool-filter-list" id="tool-filter-list"></div></fieldset><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span><button id="reset-filters" type="button">重置筛选</button></div>
       </div>
     </section>
     <section class="panel tab-panel" data-tab-panel="composition" role="tabpanel" hidden>
@@ -2250,8 +2600,11 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
   const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
   const sessionNavMedia=window.matchMedia("(max-width:900px)");
-  const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
+  const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen"];
+  const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
+  const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
+  const toolColors={"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
   function byId(id){return document.getElementById(id)} function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
   function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])}
   function fmt(v){return Number(v||0).toLocaleString()} function compact(v){const n=Number(v||0),a=Math.abs(n);if(a>=1e9)return(n/1e9).toFixed(1)+"B";if(a>=1e6)return(n/1e6).toFixed(1)+"M";if(a>=1e3)return(n/1e3).toFixed(1)+"K";return String(n)}
@@ -2263,13 +2616,15 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   function totalRows(){return sessions.map((s,i)=>({index:i+1,turnId:s.metadata.threadId,title:s.metadata.title,sourceLabel:sourceText(s),startedAt:s.metadata.rangeLastActivityAt,status:"complete",models:[],efforts:[],messages:[],modelResponses:s.summary.turnCount,usage:s.summary.finalUsage,breakdown:s.summary.finalBreakdown,session:s}))}
   function rowMatches(row){if(!isTotal()&&!state.statuses.has(row.status))return false;if(!state.query)return true;const rendered=[row.turnId,row.title,row.sourceLabel,row.status,(row.models||[]).join(" "),firstPrompt(row)].join(" ").toLocaleLowerCase();return rendered.includes(state.query)}
   function rows(){const base=isTotal()?totalRows():(activeSession()?.turns||[]);return base.filter(rowMatches)}
+  function syncToolFilterInputs(){byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input=>{input.checked=state.toolCategories.has(input.value)})}
+  function populateToolFilter(){const categories=[...new Set(sessions.flatMap(session=>(session.turns||[]).flatMap(turn=>(turn.toolCalls||[]).map(call=>call.category))))].sort((a,b)=>(toolLabels[a]||a).localeCompare(toolLabels[b]||b));byId("tool-filter-list").innerHTML=categories.map(category=>`<label class="check"><input type="checkbox" data-tool-category="true" value="${esc(category)}"${state.toolCategories.has(category)?" checked":""}> ${esc(toolLabels[category]||category)}</label>`).join("");byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input=>input.addEventListener("change",event=>{if(event.target.checked)state.toolCategories.add(event.target.value);else state.toolCategories.delete(event.target.value);render()}))}
   function setSessionNav(open,focusTarget=false){
     state.sessionNavOpen=Boolean(open);const shell=byId("report-shell"),drawer=byId("session-drawer"),toggle=byId("session-drawer-toggle");
     shell.classList.toggle("session-nav-open",state.sessionNavOpen);shell.classList.toggle("session-nav-closed",!state.sessionNavOpen);drawer.setAttribute("aria-hidden",String(!state.sessionNavOpen));drawer.inert=!state.sessionNavOpen;toggle.setAttribute("aria-expanded",String(state.sessionNavOpen));byId("session-drawer-toggle-label").textContent=state.sessionNavOpen?"收起会话":"会话";document.body.classList.toggle("session-nav-modal-open",state.sessionNavOpen&&sessionNavMedia.matches);
     if(focusTarget)(state.sessionNavOpen?byId("nav-search"):toggle).focus();
   }
   function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>[s.metadata.title,s.metadata.threadId,s.metadata.cwd].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>范围汇总 · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>`<button class="session-button ${state.view===s.metadata.threadId?"active":""}" data-view="${esc(s.metadata.threadId)}"><strong>${esc(s.metadata.title)}</strong><span>${fmt(s.summary.finalUsage.total)} Token · ${esc(dateText(s.metadata.rangeLastActivityAt))}</span></button>`).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
-  function selectView(view){const previousView=state.view;state.view=view;state.tab=view==="total"?"composition":previousView==="total"?"context":state.tab;state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
+  function selectView(view){const previousView=state.view;state.view=view;state.tab=view==="total"?"composition":previousView==="total"?"context":state.tab;state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
   function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总统计":"会话区间统计";byId("view-title").textContent=isTotal()?"全部会话消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截至 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话",fmt(summary.sessionCount),`${summary.zeroUsageSessions} 个零消耗会话`]:["轮次",fmt(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮零消耗`];const cards=[["区间总消耗",fmt(u.total),"按 token_count 快照时间归属"],["输入",fmt(u.input),`${compact(u.cached)} 来自缓存读取`],["非缓存输入",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["完整性",summary.integrityErrorCount?"存在错误":"通过",`${summary.warningCount} 条提示`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("")}
   function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个完整性错误 · 共 ${summary.warningCount} 条提示`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
   function niceTicks(max,count=5){if(max<=0)return[0];const rough=max/count,p=10**Math.floor(Math.log10(rough)),f=rough/p,n=(f<=1?1:f<=2?2:f<=5?5:10)*p,out=[];for(let x=0;x<=max+n*.25;x+=n)out.push(x);return out}
@@ -2293,13 +2648,18 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   function radialEntries(ordered,denominator){let consumed=0;const entries=ordered.map(turn=>{const tokens=Math.max(0,Number(turn.usage.total)||0),entry={turn,tokens,tokenStart:consumed,start:consumed/denominator,end:(consumed+tokens)/denominator,satellite:isSatelliteTurn(turn),parentEntry:null,satelliteLane:0};consumed+=tokens;return entry});const siblingCounts=new Map();entries.forEach((entry,index)=>{if(!entry.satellite)return;let parent=null;for(let cursor=index-1;cursor>=0;cursor-=1){if(!entries[cursor].satellite){parent=entries[cursor];break}}if(!parent)parent=entries.find(candidate=>!candidate.satellite)||null;const key=parent?.turn.turnId||"orphan";entry.parentEntry=parent;entry.satelliteLane=siblingCounts.get(key)||0;siblingCounts.set(key,entry.satelliteLane+1)});return entries}
   function satelliteGeometry(cx,cy,outerOuter,entry){const inner=outerOuter+24+(entry.satelliteLane%5)*14;return{inner,outer:inner+10,contextRadius:inner-8}}
   function satelliteFraction(entry){return(entry.start+entry.end)/2}
+  function toolCallLabel(call){return toolLabels[call.category]||call.name||"未知工具"} function toolCallColor(call){return toolColors[call.category]||toolColors.other} function toolUsage(call){return call.usageReported?Math.max(0,Number(call.usage?.total)||0):0}
+  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=call.usageReported?`${fmt(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${fmt(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
+  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["原始工具名",call.rawName||call.name||"未知"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",call.usageReported?fmt(usage.total):"未知"],["输入",call.usageReported?fmt(usage.input):"未知"],["缓存输入",call.usageReported?fmt(usage.cached):"未知"],["输出",call.usageReported?fmt(usage.output):"未知"],["推理输出",call.usageReported?fmt(usage.reasoning):"未知"]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${fmt(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();}
+  function toolSatelliteGeometry(cx,cy,outerOuter,index){const inner=outerOuter+76+(index%3)*14;return{inner,outer:inner+9}}
+  function renderToolLayer(svg,entries,cx,cy,outerOuter,denominator){entries.forEach(entry=>{const calls=(entry.turn.toolCalls||[]).filter(call=>state.toolCategories.has(call.category));if(!calls.length)return;const parentSpan=Math.max(0,entry.end-entry.start),envelopeStart=parentSpan?entry.start:Math.max(0,entry.start-.006),envelopeEnd=parentSpan?entry.end:Math.min(1,entry.start+.012),envelopePath=arcBandPath(cx,cy,outerOuter+54,outerOuter+60,envelopeStart,envelopeEnd);if(envelopePath)svg.appendChild(svgEl("path",{d:envelopePath,class:"tool-envelope"}));const exact=calls.reduce((sum,call)=>sum+toolUsage(call),0),unknown=calls.filter(call=>!call.usageReported).length,envelopeNode=svg.lastChild;if(envelopeNode){const title=svgEl("title");title.textContent=`第 ${entry.turn.index} 轮工具包络 · ${calls.length} 次调用 · ${fmt(exact)} Token · ${unknown} 次 Token 未知`;envelopeNode.appendChild(title)}calls.forEach((call,index)=>{const fraction=parentSpan?entry.start+parentSpan*(index+.5)/calls.length:entry.start,geometry=toolSatelliteGeometry(cx,cy,outerOuter,index),usage=toolUsage(call),width=usage>0?Math.min(Math.max(parentSpan*.22,.002),usage/denominator):0,start=usage>0?Math.max(entry.start,fraction-width/2):fraction,end=usage>0?Math.min(entry.end,start+width):fraction,group=svgEl("g",{class:`tool-satellite${state.selected===entry.turn.turnId?" selected":""}`,tabindex:"0",role:"button","data-tool-target":"true","aria-label":`${toolCallLabel(call)}，${call.usageReported?fmt(usage)+" Token":"Token 未知"}`}),parentPoint=radialPoint(cx,cy,outerOuter+7,fraction),satellitePoint=radialPoint(cx,cy,geometry.inner-1,fraction);group.appendChild(svgEl("line",{x1:satellitePoint.x,y1:satellitePoint.y,x2:parentPoint.x,y2:parentPoint.y,class:"tool-satellite-connector"}));if(usage>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,geometry.inner,geometry.outer,start,end),fill:toolCallColor(call),class:"token-sector"}))}else{const a=radialPoint(cx,cy,geometry.inner-3,fraction),b=radialPoint(cx,cy,geometry.outer+5,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"tool-satellite-unknown"}))}const title=svgEl("title");title.textContent=`${toolCallLabel(call)} · ${call.usageReported?fmt(usage)+" Token":"Token 未知"}`;group.appendChild(title);group.addEventListener("pointerenter",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",hideTooltip);group.addEventListener("focus",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("blur",hideTooltip);group.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openToolDrawer(entry.turn,call)}});group.addEventListener("click",()=>{hideTooltip();openToolDrawer(entry.turn,call)});svg.appendChild(group)})})}
   function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
   function contextOrderTime(turn){const snapshot=contextSnapshot(turn);return snapshot.timestamp||turn.endedAt||turn.rangeLastActivityAt||turn.startedAt||""}
   const contextGap=Math.PI/180,contextStart=-Math.PI/2+contextGap/2,contextSpan=2*Math.PI-contextGap;
   function radialPoint(cx,cy,r,fraction){const angle=contextStart+Math.max(0,Math.min(1,fraction))*contextSpan;return{x:cx+r*Math.cos(angle),y:cy+r*Math.sin(angle)}}
   function arcLinePath(cx,cy,r,start,end){const a=radialPoint(cx,cy,r,start),b=radialPoint(cx,cy,r,end),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${r},${r} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)}`}
   function arcBandPath(cx,cy,inner,outer,start,end){if(end-start<=1e-9)return"";const a=radialPoint(cx,cy,outer,start),b=radialPoint(cx,cy,outer,end),c=radialPoint(cx,cy,inner,end),d=radialPoint(cx,cy,inner,start),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${outer},${outer} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)} L${c.x.toFixed(2)},${c.y.toFixed(2)} A${inner},${inner} 0 ${large} 0 ${d.x.toFixed(2)},${d.y.toFixed(2)} Z`}
-  function renderContext(){
+  function renderContextBase(){
     if(isTotal())return;
     const svg=byId("range-context-radial-chart");svg.replaceChildren();svg.setAttribute("viewBox","0 0 760 620");const session=activeSession(),ordered=[...(session?.turns||[])].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),cx=380,cy=300,innerBase=105,innerMax=178,outerInner=202,outerOuter=234;
     const sources=[...new Map(ordered.map(turn=>[turn.sourceRolloutId||"main",{id:turn.sourceRolloutId||"main",label:turn.sourceLabel||"主会话"}])).values()];
@@ -2323,6 +2683,8 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     const compactionMarkers=[...svg.querySelectorAll(".context-compaction")];let compactionIndex=0;entries.forEach(entry=>{const count=(entry.turn.contextCompactions||[]).length;if(entry.satellite){const geometry=satelliteGeometry(cx,cy,outerOuter,entry);for(let index=0;index<count;index+=1){const event=entry.turn.contextCompactions[index],offset=Math.max(0,Math.min(entry.tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,from=radialPoint(cx,cy,outerOuter+12,fraction),to=radialPoint(cx,cy,geometry.outer+8,fraction),marker=compactionMarkers[compactionIndex+index];if(marker){marker.classList.add("satellite-compaction");marker.setAttribute("transform",`translate(${(to.x-from.x).toFixed(2)} ${(to.y-from.y).toFixed(2)})`)}}}compactionIndex+=count});
     const startPoint=radialPoint(cx,cy,outerOuter+18,0),endPoint=radialPoint(cx,cy,outerOuter+18,1);[[startPoint,"Token 0%","start"],[endPoint,"Token 100%","end"]].forEach(([point,label,anchor])=>{const node=svgEl("text",{x:point.x,y:point.y+4,"text-anchor":anchor,fill:css("--muted"),"font-size":"11","font-weight":"700"});node.textContent=label;svg.appendChild(node)});const outerLabel=svgEl("text",{x:24,y:33,fill:css("--muted"),"font-size":"12","font-weight":"700"});outerLabel.textContent="主圈 · Token 消耗（累计 Token 进度）";svg.appendChild(outerLabel);const satelliteLabel=svgEl("text",{x:24,y:53,fill:css("--muted"),"font-size":"12"});satelliteLabel.textContent="卫星层 · 子 agent Token（连接至主 turn）";svg.appendChild(satelliteLabel);const innerLabel=svgEl("text",{x:24,y:73,fill:css("--muted"),"font-size":"12"});innerLabel.textContent="内环 · Context 快照（按 Token 位置阶梯变化）";svg.appendChild(innerLabel)
   }
+  function renderToolsStandalone(){if(isTotal())return;const session=activeSession(),ordered=[...(session?.turns||[])].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),total=ordered.reduce((sum,turn)=>sum+Math.max(0,Number(turn.usage.total)||0),0),denominator=Math.max(total,1);renderToolLayer(byId("range-context-radial-chart"),radialEntries(ordered,denominator),380,300,234,denominator)}
+  function renderContext(){renderContextBase();renderToolsStandalone()}
   function renderComposition(){const visible=rows(),svg=byId("composition");svg.replaceChildren();byId("visible-count").textContent=`当前显示 ${visible.length} ${isTotal()?"个会话":"轮"}`;byId("composition-title").textContent=isTotal()?"各会话 Token 构成":"每轮 Token 构成";byId("composition-note").textContent=isTotal()?"点击柱形进入对应会话。":"主会话与子代理按时间合并；点击柱形查看详情。";byId("content-search").placeholder=isTotal()?"搜索会话标题、ID、来源……":messagesIncluded?"搜索消息、轮次 ID、模型、来源……":"搜索轮次 ID、模型、来源……";document.querySelectorAll(".turn-only").forEach(x=>x.hidden=isTotal());byId("legend").innerHTML=segmentKeys.map(k=>`<span style="--swatch:${colors[k]}">${esc(labels[k])}</span>`).join("");const width=Math.max(1100,visible.length*30+110),height=410,m={t:16,r:20,b:48,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);svg.style.minWidth=`${width}px`;if(!visible.length){text(svg,width/2,height/2,"没有符合条件的数据","middle");return}const max=Math.max(...visible.map(r=>r.usage.total),1),scaled=v=>state.scale==="log"?Math.log10(1+v)/Math.log10(1+max):v/max;const ticks=state.scale==="log"?[0,...Array.from({length:Math.floor(Math.log10(max))+1},(_,i)=>10**i).filter(v=>v<=max)]:niceTicks(max);ticks.forEach(tick=>{const y=m.t+ih*(1-scaled(tick));svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const step=iw/visible.length,bw=Math.max(4,Math.min(20,step*.72));visible.forEach((row,pos)=>{const x=m.l+pos*step+(step-bw)/2,total=Math.max(0,row.usage.total),totalH=ih*scaled(total);let y=m.t+ih;const g=svgEl("g",{class:"bar",tabindex:"0",role:"button","data-turn-target":"true"});segmentKeys.forEach(k=>{const value=Math.max(0,row.breakdown[k]||0);if(!value||!total)return;const h=totalH*value/Math.max(total,1);y-=h;g.appendChild(svgEl("rect",{x,y,width:bw,height:Math.max(.5,h),fill:colors[k],rx:"1"}))});const title=svgEl("title");title.textContent=`${isTotal()?row.title:`第 ${row.index} 轮`} · ${fmt(total)} Token`;g.appendChild(title);g.addEventListener("click",()=>isTotal()?selectView(row.turnId):openDrawer(row));svg.appendChild(g);if(visible.length<=35||pos%Math.ceil(visible.length/28)===0)text(svg,x+bw/2,height-22,String(row.index),"middle")});text(svg,m.l+iw/2,height-4,isTotal()?"会话序号":"轮次序号","middle")}
   function renderTrend(){const svg=byId("trend");svg.replaceChildren();let pointsData;if(isTotal()){pointsData=data.summary.dailyUsage||[];byId("trend-title").textContent="每日 Token 消耗";byId("trend-note").textContent="按 token_count 快照发生的本地日期归属。"}else{let cumulative=0;pointsData=(activeSession()?.turns||[]).map(t=>({date:`第 ${t.index} 轮`,usage:{total:(cumulative+=Number(t.usage.total||0))}}));byId("trend-title").textContent="会话累计消耗";byId("trend-note").textContent="按统一时间线中的轮次线性累计。"}const width=1200,height=270,m={t:18,r:24,b:42,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);if(!pointsData.length){text(svg,width/2,height/2,"没有趋势数据","middle");return}const max=Math.max(...pointsData.map(p=>Number(p.usage.total||0)),1);niceTicks(max,4).forEach(tick=>{const y=m.t+ih*(1-tick/max);svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const pts=pointsData.map((p,i)=>({x:m.l+(pointsData.length===1?iw/2:i*iw/(pointsData.length-1)),y:m.t+ih*(1-Number(p.usage.total||0)/max),label:p.date,value:Number(p.usage.total||0)}));if(pts.length>1)svg.appendChild(svgEl("path",{d:pts.map((p,i)=>`${i?"L":"M"}${p.x},${p.y}`).join(" "),fill:"none",stroke:css("--accent"),"stroke-width":"2.5"}));pts.forEach((p,i)=>{const c=svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:css("--accent")});const title=svgEl("title");title.textContent=`${p.label} · ${fmt(p.value)} Token`;c.appendChild(title);svg.appendChild(c);if(pts.length<=12||i%Math.ceil(pts.length/10)===0)text(svg,p.x,height-16,p.label,"middle")})}
   function renderTable(){
@@ -2344,7 +2706,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   }
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
   function setTab(tab){const contextButton=byId("tab-context"),contextDisabled=isTotal();contextButton.disabled=contextDisabled;if(contextDisabled&&tab==="context")tab="composition";if(!["composition","trend","context","table"].includes(tab))tab="composition";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab})}
-  function resetFilters(){state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition();renderContext();renderTable()}
+  function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition();renderContext();renderTable()}
   function render(){renderHeader();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
   byId("range-label").textContent=`${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate} · ${data.metadata.dateWindow.timezone}`;
   byId("nav-search").addEventListener("input",renderNav);
@@ -2360,7 +2722,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   byId("drawer-close").addEventListener("click",closeDrawer);
   document.addEventListener("click",event=>{const drawer=byId("drawer");if(event.button!==0||!drawer.classList.contains("open"))return;const target=event.target instanceof Element?event.target:null;if(!target||drawer.contains(target)||target.closest("[data-turn-target=true]"))return;closeDrawer()});
   document.addEventListener("keydown",event=>{if(event.key!=="Escape")return;if(byId("drawer").classList.contains("open"))closeDrawer();else if(state.sessionNavOpen)setSessionNav(false,true)});
-  try{setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
+  try{populateToolFilter();setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
 })();
 </script>
 </body>

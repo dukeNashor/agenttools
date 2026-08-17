@@ -108,6 +108,131 @@ class VisualizerTests(unittest.TestCase):
         self.assertEqual(report["summary"]["reconciliationDifference"]["total"], 0)
         self.assertEqual(report["summary"]["integrityErrorCount"], 0)
 
+    def test_tool_calls_are_exactly_attributed_without_changing_turn_total(self) -> None:
+        lines = [
+            rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec(
+                "2026-01-01T00:00:01Z",
+                "event_msg",
+                {
+                    "type": "tool_call",
+                    "tool_name": "computer_use",
+                    "call_id": "c1",
+                    "usage": {
+                        "input_tokens": 5,
+                        "cached_input_tokens": 2,
+                        "output_tokens": 3,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 8,
+                    },
+                },
+            ),
+            rec(
+                "2026-01-01T00:00:02Z",
+                "event_msg",
+                {"type": "tool_call", "tool_name": "chrome_use", "call_id": "c2"},
+            ),
+            rec(
+                "2026-01-01T00:00:03Z",
+                "event_msg",
+                {"type": "token_count", "info": {"total_token_usage": usage(100, 20, 10, 4)}},
+            ),
+            rec("2026-01-01T00:00:04Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        report = viz.parse_rollout(self.write_rollout(lines))
+        turn = report["turns"][0]
+        self.assertEqual(turn["usage"]["total"], 110)
+        self.assertEqual(turn["toolSummary"]["callCount"], 2)
+        self.assertEqual(turn["toolSummary"]["reportedCallCount"], 1)
+        self.assertEqual(turn["toolSummary"]["unknownCallCount"], 1)
+        self.assertEqual(turn["toolSummary"]["usage"]["total"], 8)
+        self.assertEqual(turn["toolSummary"]["categories"], {"computer-use": 1, "chrome-use": 1})
+        self.assertEqual(report["summary"]["toolCallCount"], 2)
+        self.assertEqual(report["summary"]["toolUsage"]["total"], 8)
+
+        rendered = viz.render_html(report)
+        self.assertIn("tool-envelope", rendered)
+        self.assertIn("tool-satellite", rendered)
+        self.assertIn("tool-filter", rendered)
+        self.assertIn("openToolDrawer", rendered)
+
+    def test_tool_result_updates_same_call_and_date_window_clips_other_calls(self) -> None:
+        window = viz.DateWindow.for_dates(date(2026, 1, 2), date(2026, 1, 2), local_tz=timezone.utc)
+        lines = [
+            rec("2026-01-01T23:59:59Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec(
+                "2026-01-02T00:00:01Z",
+                "event_msg",
+                {"type": "tool_call", "tool_name": "imagegen", "call_id": "img-1"},
+            ),
+            rec(
+                "2026-01-02T00:00:02Z",
+                "event_msg",
+                {
+                    "type": "tool_result",
+                    "call_id": "img-1",
+                    "usage": {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+                },
+            ),
+            rec(
+                "2026-01-01T23:59:58Z",
+                "event_msg",
+                {"type": "tool_call", "tool_name": "shell", "call_id": "outside"},
+            ),
+            rec("2026-01-02T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        turn = viz.parse_rollout(self.write_rollout(lines), window=window)["turns"][0]
+        self.assertEqual(len(turn["toolCalls"]), 1)
+        call = turn["toolCalls"][0]
+        self.assertEqual(call["category"], "imagegen")
+        self.assertEqual(call["usage"]["total"], 10)
+        self.assertTrue(call["usageReported"])
+        self.assertEqual(call["endedAt"], "2026-01-02T00:00:02Z")
+
+    def test_non_tool_response_items_are_not_counted_as_tool_calls(self) -> None:
+        lines = [
+            rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec("2026-01-01T00:00:01Z", "response_item", {"type": "reasoning", "id": "r1"}),
+            rec("2026-01-01T00:00:02Z", "response_item", {"type": "message", "id": "m1"}),
+            rec(
+                "2026-01-01T00:00:03Z",
+                "response_item",
+                {"type": "custom_tool_call", "call_id": "c1", "name": "exec"},
+            ),
+            rec("2026-01-01T00:00:04Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        turn = viz.parse_rollout(self.write_rollout(lines))["turns"][0]
+        self.assertEqual(turn["toolSummary"]["callCount"], 1)
+        self.assertEqual(turn["toolCalls"][0]["rawName"], "exec")
+
+    def test_search_and_mcp_end_events_are_classified_as_tools(self) -> None:
+        lines = [
+            rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec(
+                "2026-01-01T00:00:01Z",
+                "event_msg",
+                {
+                    "type": "web_search_end",
+                    "call_id": "search-1",
+                    "action": {"type": "search", "queries": ["Codex"]},
+                },
+            ),
+            rec(
+                "2026-01-01T00:00:02Z",
+                "event_msg",
+                {
+                    "type": "mcp_tool_call_end",
+                    "call_id": "mcp-1",
+                    "invocation": {"server": "node_repl", "tool": "js"},
+                },
+            ),
+            rec("2026-01-01T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        calls = viz.parse_rollout(self.write_rollout(lines))["turns"][0]["toolCalls"]
+        self.assertEqual([call["category"] for call in calls], ["web-search", "mcp"])
+        self.assertEqual([call["rawName"] for call in calls], ["search", "js"])
+        self.assertTrue(all(call["status"] == "completed" for call in calls))
+
     def test_steering_messages_stay_in_the_active_turn(self) -> None:
         lines = [
             rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
@@ -538,6 +663,19 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn("satellite-compaction", template)
             self.assertIn("卫星层 · 子 agent Token", template)
             self.assertIn("if(satellite)", template)
+
+    def test_tool_filter_is_a_multi_select_checkbox_list_with_curated_defaults(self) -> None:
+        self.assertEqual(viz._tool_category("exec_reasoning", "tool_call"), "exec-reasoning")
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn('id="tool-filter-list"', template)
+            self.assertIn("type=\"checkbox\" data-tool-category", template)
+            self.assertIn('const DEFAULT_TOOL_CATEGORIES', template)
+            self.assertIn('computer-use', template)
+            self.assertIn('chrome-use', template)
+            self.assertIn('imagegen', template)
+            self.assertIn('"exec-reasoning":"Exec Reasoning"', template)
+            self.assertIn("state.toolCategories.has(call.category)", template)
+            self.assertNotIn('<select id="tool-filter"', template)
 
     def test_subagent_rollout_metadata_exposes_source_kind(self) -> None:
         thread_id = "00000000-0000-0000-0000-000000000020"
