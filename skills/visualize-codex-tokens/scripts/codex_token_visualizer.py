@@ -23,6 +23,49 @@ from typing import Any, Iterable
 
 
 VERSION = "2.8.0"
+
+TOOL_SATELLITE_HIT_SCRIPT = """
+<style>
+.tool-envelope { stroke:var(--muted); stroke-width:2.5; stroke-dasharray:none; opacity:.38; }
+.tool-satellite .tool-satellite-unknown { stroke:var(--tool-color,#6f8fb7); stroke-width:2.6; stroke-dasharray:none; stroke-linecap:round; opacity:.82; }
+.tool-satellite .tool-satellite-connector { stroke:var(--tool-color,#6f8fb7); stroke-width:1.5; stroke-dasharray:none; stroke-linecap:round; opacity:.44; }
+.tool-satellite:hover .tool-satellite-connector, .tool-satellite:focus .tool-satellite-connector, .tool-satellite.selected .tool-satellite-connector { stroke:var(--tool-color,#6f8fb7); stroke-width:2.7; stroke-dasharray:none; opacity:.96; }
+</style>
+<script>
+(() => {
+  const TOOL_COLORS = {
+    "Computer Use":"#4f78a8", "Chrome Use / Browser Use":"#3b8b78", ImageGen:"#bd7556",
+    "Exec Reasoning":"#9a8f84", "Shell / Terminal":"#8c78bd", "Code Interpreter":"#6d8c45",
+    "Web Search":"#4f9d87", "File Search":"#d9874c", MCP:"#b35f79",
+    "Function Calling":"#a56c3f", "其他工具":"#6f8fb7"
+  };
+  function decorateToolSatellite(group) {
+    const label = (group.getAttribute("aria-label") || "").split(/[，,]/)[0];
+    group.style.setProperty("--tool-color", TOOL_COLORS[label] || "#6f8fb7");
+  }
+  function installToolSatelliteHitTargets() {
+    document.querySelectorAll(".tool-satellite").forEach(group => {
+      decorateToolSatellite(group);
+      if (group.querySelector(".tool-satellite-hit-line, .tool-satellite-hit-band")) return;
+      group.querySelectorAll(".tool-satellite-connector, .tool-satellite-unknown, .token-sector").forEach(node => {
+        const band = node.classList.contains("token-sector");
+        const hit = node.cloneNode(false);
+        hit.setAttribute("class", band ? "tool-satellite-hit-band" : "tool-satellite-hit-line");
+        hit.setAttribute("aria-hidden", "true");
+        hit.setAttribute("pointer-events", band ? "all" : "stroke");
+        hit.setAttribute("vector-effect", "non-scaling-stroke");
+        hit.setAttribute("stroke-width", "20");
+        hit.setAttribute("stroke", "transparent");
+        if (band) hit.setAttribute("fill", "transparent");
+        group.appendChild(hit);
+      });
+    });
+  }
+  installToolSatelliteHitTargets();
+  new MutationObserver(installToolSatelliteHitTargets).observe(document.body, {childList:true, subtree:true});
+})();
+</script>
+"""
 THREAD_ID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -270,10 +313,15 @@ class ToolCall:
     raw_name: str
     category: str
     timestamp: str
+    provider: str | None = None
+    semantic_tool: str | None = None
+    classification_source: str = "raw"
+    transport_wrapper: bool = False
     ended_at: str | None = None
     status: str = "observed"
     usage: Usage = field(default_factory=Usage)
     usage_reported: bool = False
+    usage_known: set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -282,11 +330,16 @@ class ToolCall:
             "name": self.name,
             "rawName": self.raw_name,
             "category": self.category,
+            "provider": self.provider,
+            "semanticTool": self.semantic_tool,
+            "classificationSource": self.classification_source,
+            "transportWrapper": self.transport_wrapper,
             "timestamp": self.timestamp,
             "endedAt": self.ended_at,
             "status": self.status,
             "usage": self.usage.to_dict(),
             "usageReported": self.usage_reported,
+            "usageKnown": sorted(self.usage_known),
         }
 
 
@@ -537,8 +590,78 @@ def _first_text(*values: Any) -> str:
     return ""
 
 
-def _tool_category(raw_name: str, event_type: str) -> str:
-    rendered = f"{raw_name} {event_type}".lower().replace("_", "-")
+SKY_UI_METHODS = frozenset(
+    {
+        "activate_window",
+        "click",
+        "double_click",
+        "drag",
+        "get_window",
+        "get_window_state",
+        "key",
+        "launch_app",
+        "list_apps",
+        "list_windows",
+        "press",
+        "scroll",
+        "type",
+    }
+)
+
+
+def _tool_semantics(
+    payload: dict[str, Any],
+    invocation: dict[str, Any],
+    raw_name: str,
+    effective_type: str,
+) -> tuple[str | None, str | None, str, bool]:
+    explicit_provider = _first_text(
+        payload.get("provider"),
+        payload.get("provider_name"),
+        payload.get("providerName"),
+        invocation.get("provider"),
+        invocation.get("server"),
+    ) or None
+    explicit_semantic = _first_text(
+        payload.get("semantic_tool"),
+        payload.get("semanticTool"),
+        payload.get("semantic"),
+        invocation.get("semantic_tool"),
+        invocation.get("semanticTool"),
+    ) or None
+    is_mcp = "mcp" in effective_type or explicit_provider is not None
+    provider = explicit_provider
+    semantic_tool = explicit_semantic
+    source = "explicit" if explicit_provider or explicit_semantic else "raw"
+    if is_mcp:
+        semantic_tool = semantic_tool or raw_name or None
+        source = "explicit" if provider or semantic_tool else source
+
+    arguments = invocation.get("arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    code = _coerce_text(arguments.get("code"))
+    if (
+        provider == "node_repl"
+        and semantic_tool == "js"
+        and any(
+            re.search(rf"\bsky\s*\.\s*{re.escape(method)}\s*\(", code)
+            for method in SKY_UI_METHODS
+        )
+    ):
+        return "sky", "computer-use", "inferred", False
+
+    input_text = _coerce_text(payload.get("input"))
+    transport_wrapper = raw_name in {"exec", "js"} and "mcp__" in input_text
+    return provider, semantic_tool, source, transport_wrapper
+
+
+def _tool_category(
+    raw_name: str,
+    event_type: str,
+    semantic_tool: str | None = None,
+    provider: str | None = None,
+) -> str:
+    rendered = f"{raw_name} {event_type} {semantic_tool or ''} {provider or ''}".lower().replace("_", "-")
     if "image" in rendered or "imagegen" in rendered or "image-generation" in rendered:
         return "imagegen"
     if "computer" in rendered:
@@ -562,7 +685,7 @@ def _tool_category(raw_name: str, event_type: str) -> str:
     return "other"
 
 
-def _usage_from_mapping(value: Any) -> tuple[Usage, bool]:
+def _usage_from_mapping(value: Any) -> tuple[Usage, bool, set[str]]:
     if not isinstance(value, dict):
         return Usage(), False
     aliases = {
@@ -585,19 +708,31 @@ def _usage_from_mapping(value: Any) -> tuple[Usage, bool]:
         "total_tokens": ("total_tokens", "totalTokens", "total"),
     }
     normalized: dict[str, Any] = {}
+    known: set[str] = set()
     present = False
+    known_names = {
+        "input_tokens": "input",
+        "cached_input_tokens": "cached",
+        "cache_write_input_tokens": "cache_write",
+        "output_tokens": "output",
+        "reasoning_output_tokens": "reasoning",
+        "total_tokens": "total",
+    }
     for target, candidates in aliases.items():
         for candidate in candidates:
             if candidate in value:
                 normalized[target] = value[candidate]
+                known.add(known_names[target])
                 present = True
                 break
     if not present:
-        return Usage(), False
-    return Usage.from_payload(normalized), True
+        return Usage(), False, set()
+    if {"input", "output"}.issubset(known) and "total" not in known:
+        known.add("total")
+    return Usage.from_payload(normalized), True, known
 
 
-def _extract_tool_usage(payload: dict[str, Any]) -> tuple[Usage, bool]:
+def _extract_tool_usage(payload: dict[str, Any]) -> tuple[Usage, bool, set[str]]:
     candidates: list[Any] = [payload]
     for key in ("usage", "token_usage", "tokenUsage", "tool_usage", "toolUsage", "info"):
         if key in payload:
@@ -610,10 +745,10 @@ def _extract_tool_usage(payload: dict[str, Any]) -> tuple[Usage, bool]:
                 if usage_key in nested:
                     candidates.append(nested.get(usage_key))
     for candidate in candidates:
-        usage, present = _usage_from_mapping(candidate)
+        usage, present, known = _usage_from_mapping(candidate)
         if present:
-            return usage, True
-    return Usage(), False
+            return usage, True, known
+    return Usage(), False, set()
 
 
 def _extract_tool_event(record_type: Any, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -662,7 +797,10 @@ def _extract_tool_event(record_type: Any, payload: dict[str, Any]) -> dict[str, 
         invocation_dict.get("call_id"),
         invocation_dict.get("callId"),
     ) or None
-    usage, usage_reported = _extract_tool_usage(payload)
+    provider, semantic_tool, classification_source, transport_wrapper = _tool_semantics(
+        payload, invocation_dict, raw_name, effective_type
+    )
+    usage, usage_reported, usage_known = _extract_tool_usage(payload)
     is_result = any(marker in effective_type for marker in ("result", "output", "end"))
     status = _first_text(payload.get("status"), item_dict.get("status"))
     if not status:
@@ -672,9 +810,16 @@ def _extract_tool_event(record_type: Any, payload: dict[str, Any]) -> dict[str, 
         "callId": call_id,
         "rawName": raw_name,
         "name": raw_name,
-        "category": _tool_category(raw_name, effective_type),
+        "category": _tool_category(
+            raw_name, effective_type, semantic_tool, provider
+        ),
+        "provider": provider,
+        "semanticTool": semantic_tool,
+        "classificationSource": classification_source,
+        "transportWrapper": transport_wrapper,
         "usage": usage,
         "usageReported": usage_reported,
+        "usageKnown": usage_known,
         "isResult": is_result,
         "status": status,
     }
@@ -684,6 +829,23 @@ def _add_usage_bucket(buckets: dict[str, Usage], key: str | None, value: Usage) 
     if key is None:
         return
     buckets[key] = buckets.get(key, Usage()) + value
+
+
+def _merge_tool_usage(
+    current: Usage,
+    current_known: set[str],
+    incoming: Usage,
+    incoming_known: set[str],
+) -> tuple[Usage, set[str]]:
+    values = current.to_dict()
+    known = set(current_known)
+    for key in incoming_known:
+        values[key] = getattr(incoming, key)
+        known.add(key)
+    if {"input", "output"}.issubset(known) and "total" not in known:
+        values["total"] = values["input"] + values["output"]
+        known.add("total")
+    return Usage.from_dict(values), known
 
 
 def _extract_thread_id(text: str) -> str | None:
@@ -824,9 +986,28 @@ def parse_rollout(
         lookup_key = (current.turn_id, call_id) if call_id else None
         existing = tool_calls_by_key.get(lookup_key) if lookup_key is not None else None
         if existing is not None:
-            if event["usageReported"]:
-                existing.usage = event["usage"]
-                existing.usage_reported = True
+            existing.usage, existing.usage_known = _merge_tool_usage(
+                existing.usage,
+                existing.usage_known,
+                event["usage"],
+                event["usageKnown"],
+            )
+            existing.usage_reported = bool(existing.usage_known)
+            if event["provider"] is not None:
+                existing.provider = event["provider"]
+            if event["semanticTool"] is not None:
+                existing.semantic_tool = event["semanticTool"]
+            if event["classificationSource"] != "raw":
+                existing.classification_source = event["classificationSource"]
+            existing.transport_wrapper = (
+                existing.transport_wrapper or event["transportWrapper"]
+            )
+            existing.category = _tool_category(
+                existing.raw_name,
+                event["eventType"],
+                existing.semantic_tool,
+                existing.provider,
+            )
             if event["isResult"] or event["status"] != "observed":
                 existing.ended_at = event_timestamp
                 existing.status = event["status"]
@@ -839,10 +1020,15 @@ def parse_rollout(
             raw_name=event["rawName"],
             category=event["category"],
             timestamp=event_timestamp,
+            provider=event["provider"],
+            semantic_tool=event["semanticTool"],
+            classification_source=event["classificationSource"],
+            transport_wrapper=event["transportWrapper"],
             ended_at=event_timestamp if event["isResult"] else None,
             status=event["status"],
             usage=event["usage"],
             usage_reported=event["usageReported"],
+            usage_known=set(event["usageKnown"]),
         )
         current.tool_calls.append(call)
         if lookup_key is not None:
@@ -2195,7 +2381,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   };
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
-  const DEFAULT_TOOL_CATEGORIES = ["computer-use", "chrome-use", "imagegen"];
+  const DEFAULT_TOOL_CATEGORIES = ["computer-use", "chrome-use", "imagegen", "web-search"];
   const state = { tab: "context", scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
   const tooltip = byId("turn-tooltip");
   const TOOLTIP_MESSAGE_LIMIT = 800;
@@ -2411,9 +2597,10 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   function satelliteFraction(entry){return(entry.start+entry.end)/2}
   function toolCallLabel(call){return toolLabels[call.category]||call.name||"未知工具"}
   function toolCallColor(call){return toolColors[call.category]||toolColors.other}
-  function toolUsage(call){return call.usageReported?Math.max(0,Number(call.usage?.total)||0):0}
-  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=call.usageReported?`${formatTokens(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${formatTokens(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
-  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["原始工具名",call.rawName||call.name||"未知"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",call.usageReported?formatTokens(usage.total):"未知"],["输入",call.usageReported?formatTokens(usage.input):"未知"],["缓存输入",call.usageReported?formatTokens(usage.cached):"未知"],["输出",call.usageReported?formatTokens(usage.output):"未知"],["推理输出",call.usageReported?formatTokens(usage.reasoning):"未知"]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${formatTokens(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContextRadial();}
+  function toolField(call,key){return Array.isArray(call.usageKnown)&&call.usageKnown.includes(key)?formatTokens(call.usage?.[key]||0):"未知"}
+  function toolUsage(call){return Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?Math.max(0,Number(call.usage?.total)||0):0}
+  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?`${formatTokens(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>语义工具</span><b>${esc(call.semanticTool||toolCallLabel(call))}</b><span>Provider</span><b>${esc(call.provider||"未知")}</b><span>识别方式</span><b>${esc(call.classificationSource||"raw")}</b><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${formatTokens(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
+  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["语义工具",call.semanticTool||"未知"],["Provider",call.provider||"未知"],["识别方式",call.classificationSource||"raw"],["原始工具名",call.rawName||call.name||"未知"],["传输包装",call.transportWrapper?"是":"否"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",toolField(call,"total")],["输入",toolField(call,"input")],["缓存输入",toolField(call,"cached")],["输出",toolField(call,"output")],["推理输出",toolField(call,"reasoning")]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${formatTokens(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContextRadial();}
   function toolSatelliteGeometry(cx,cy,outerOuter,index){const inner=outerOuter+76+(index%3)*14;return{inner,outer:inner+9}}
   function renderToolLayer(svg,entries,cx,cy,outerOuter,denominator){entries.forEach(entry=>{const calls=(entry.turn.toolCalls||[]).filter(call=>state.toolCategories.has(call.category));if(!calls.length)return;const parentSpan=Math.max(0,entry.end-entry.start),envelopeStart=parentSpan?entry.start:Math.max(0,entry.start-.006),envelopeEnd=parentSpan?entry.end:Math.min(1,entry.start+.012),envelopePath=arcBandPath(cx,cy,outerOuter+54,outerOuter+60,envelopeStart,envelopeEnd);if(envelopePath)svg.appendChild(svgEl("path",{d:envelopePath,class:"tool-envelope"}));const exact=calls.reduce((sum,call)=>sum+toolUsage(call),0),unknown=calls.filter(call=>!call.usageReported).length;const envelopeTitle=svgEl("title");envelopeTitle.textContent=`第 ${entry.turn.index} 轮工具包络 · ${calls.length} 次调用 · ${formatTokens(exact)} Token · ${unknown} 次 Token 未知`;const envelopeNode=svg.lastChild;if(envelopeNode)envelopeNode.appendChild(envelopeTitle);calls.forEach((call,index)=>{const fraction=parentSpan?entry.start+parentSpan*(index+.5)/calls.length:entry.start,geometry=toolSatelliteGeometry(cx,cy,outerOuter,index),usage=toolUsage(call),width=usage>0?Math.min(Math.max(parentSpan*.22,.002),usage/denominator):0,start=usage>0?Math.max(entry.start,fraction-width/2):fraction,end=usage>0?Math.min(entry.end,start+width):fraction,group=svgEl("g",{class:`tool-satellite${state.selected===entry.turn.turnId?" selected":""}`,tabindex:"0",role:"button","data-tool-target":"true","aria-label":`${toolCallLabel(call)}，${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`}),parentPoint=radialPoint(cx,cy,outerOuter+7,fraction),satellitePoint=radialPoint(cx,cy,geometry.inner-1,fraction);group.appendChild(svgEl("line",{x1:satellitePoint.x,y1:satellitePoint.y,x2:parentPoint.x,y2:parentPoint.y,class:"tool-satellite-connector"}));if(usage>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,geometry.inner,geometry.outer,start,end),fill:toolCallColor(call),class:"token-sector"}));}else{const a=radialPoint(cx,cy,geometry.inner-3,fraction),b=radialPoint(cx,cy,geometry.outer+5,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"tool-satellite-unknown"}))}const title=svgEl("title");title.textContent=`${toolCallLabel(call)} · ${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`;group.appendChild(title);group.addEventListener("pointerenter",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",hideTooltip);group.addEventListener("focus",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("blur",hideTooltip);group.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openToolDrawer(entry.turn,call)}});group.addEventListener("click",()=>{hideTooltip();openToolDrawer(entry.turn,call)});svg.appendChild(group)})})}
   function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
@@ -2600,7 +2787,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
   const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
   const sessionNavMedia=window.matchMedia("(max-width:900px)");
-  const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen"];
+  const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
   const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
@@ -2648,9 +2835,9 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   function radialEntries(ordered,denominator){let consumed=0;const entries=ordered.map(turn=>{const tokens=Math.max(0,Number(turn.usage.total)||0),entry={turn,tokens,tokenStart:consumed,start:consumed/denominator,end:(consumed+tokens)/denominator,satellite:isSatelliteTurn(turn),parentEntry:null,satelliteLane:0};consumed+=tokens;return entry});const siblingCounts=new Map();entries.forEach((entry,index)=>{if(!entry.satellite)return;let parent=null;for(let cursor=index-1;cursor>=0;cursor-=1){if(!entries[cursor].satellite){parent=entries[cursor];break}}if(!parent)parent=entries.find(candidate=>!candidate.satellite)||null;const key=parent?.turn.turnId||"orphan";entry.parentEntry=parent;entry.satelliteLane=siblingCounts.get(key)||0;siblingCounts.set(key,entry.satelliteLane+1)});return entries}
   function satelliteGeometry(cx,cy,outerOuter,entry){const inner=outerOuter+24+(entry.satelliteLane%5)*14;return{inner,outer:inner+10,contextRadius:inner-8}}
   function satelliteFraction(entry){return(entry.start+entry.end)/2}
-  function toolCallLabel(call){return toolLabels[call.category]||call.name||"未知工具"} function toolCallColor(call){return toolColors[call.category]||toolColors.other} function toolUsage(call){return call.usageReported?Math.max(0,Number(call.usage?.total)||0):0}
-  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=call.usageReported?`${fmt(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${fmt(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
-  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["原始工具名",call.rawName||call.name||"未知"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",call.usageReported?fmt(usage.total):"未知"],["输入",call.usageReported?fmt(usage.input):"未知"],["缓存输入",call.usageReported?fmt(usage.cached):"未知"],["输出",call.usageReported?fmt(usage.output):"未知"],["推理输出",call.usageReported?fmt(usage.reasoning):"未知"]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${fmt(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();}
+  function toolCallLabel(call){return toolLabels[call.category]||call.name||"未知工具"} function toolCallColor(call){return toolColors[call.category]||toolColors.other} function toolField(call,key){return Array.isArray(call.usageKnown)&&call.usageKnown.includes(key)?fmt(call.usage?.[key]||0):"未知"} function toolUsage(call){return Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?Math.max(0,Number(call.usage?.total)||0):0}
+  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?`${fmt(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>语义工具</span><b>${esc(call.semanticTool||toolCallLabel(call))}</b><span>Provider</span><b>${esc(call.provider||"未知")}</b><span>识别方式</span><b>${esc(call.classificationSource||"raw")}</b><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${fmt(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
+  function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const details=[["工具分类",toolCallLabel(call)],["语义工具",call.semanticTool||"未知"],["Provider",call.provider||"未知"],["识别方式",call.classificationSource||"raw"],["原始工具名",call.rawName||call.name||"未知"],["传输包装",call.transportWrapper?"是":"否"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",toolField(call,"total")],["输入",toolField(call,"input")],["缓存输入",toolField(call,"cached")],["输出",toolField(call,"output")],["推理输出",toolField(call,"reasoning")]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${fmt(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();}
   function toolSatelliteGeometry(cx,cy,outerOuter,index){const inner=outerOuter+76+(index%3)*14;return{inner,outer:inner+9}}
   function renderToolLayer(svg,entries,cx,cy,outerOuter,denominator){entries.forEach(entry=>{const calls=(entry.turn.toolCalls||[]).filter(call=>state.toolCategories.has(call.category));if(!calls.length)return;const parentSpan=Math.max(0,entry.end-entry.start),envelopeStart=parentSpan?entry.start:Math.max(0,entry.start-.006),envelopeEnd=parentSpan?entry.end:Math.min(1,entry.start+.012),envelopePath=arcBandPath(cx,cy,outerOuter+54,outerOuter+60,envelopeStart,envelopeEnd);if(envelopePath)svg.appendChild(svgEl("path",{d:envelopePath,class:"tool-envelope"}));const exact=calls.reduce((sum,call)=>sum+toolUsage(call),0),unknown=calls.filter(call=>!call.usageReported).length,envelopeNode=svg.lastChild;if(envelopeNode){const title=svgEl("title");title.textContent=`第 ${entry.turn.index} 轮工具包络 · ${calls.length} 次调用 · ${fmt(exact)} Token · ${unknown} 次 Token 未知`;envelopeNode.appendChild(title)}calls.forEach((call,index)=>{const fraction=parentSpan?entry.start+parentSpan*(index+.5)/calls.length:entry.start,geometry=toolSatelliteGeometry(cx,cy,outerOuter,index),usage=toolUsage(call),width=usage>0?Math.min(Math.max(parentSpan*.22,.002),usage/denominator):0,start=usage>0?Math.max(entry.start,fraction-width/2):fraction,end=usage>0?Math.min(entry.end,start+width):fraction,group=svgEl("g",{class:`tool-satellite${state.selected===entry.turn.turnId?" selected":""}`,tabindex:"0",role:"button","data-tool-target":"true","aria-label":`${toolCallLabel(call)}，${call.usageReported?fmt(usage)+" Token":"Token 未知"}`}),parentPoint=radialPoint(cx,cy,outerOuter+7,fraction),satellitePoint=radialPoint(cx,cy,geometry.inner-1,fraction);group.appendChild(svgEl("line",{x1:satellitePoint.x,y1:satellitePoint.y,x2:parentPoint.x,y2:parentPoint.y,class:"tool-satellite-connector"}));if(usage>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,geometry.inner,geometry.outer,start,end),fill:toolCallColor(call),class:"token-sector"}))}else{const a=radialPoint(cx,cy,geometry.inner-3,fraction),b=radialPoint(cx,cy,geometry.outer+5,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"tool-satellite-unknown"}))}const title=svgEl("title");title.textContent=`${toolCallLabel(call)} · ${call.usageReported?fmt(usage)+" Token":"Token 未知"}`;group.appendChild(title);group.addEventListener("pointerenter",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",hideTooltip);group.addEventListener("focus",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("blur",hideTooltip);group.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openToolDrawer(entry.turn,call)}});group.addEventListener("click",()=>{hideTooltip();openToolDrawer(entry.turn,call)});svg.appendChild(group)})})}
   function sourceColor(source){const value=String(source||"main");let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))>>>0;return sourcePalette[hash%sourcePalette.length]}
@@ -2755,9 +2942,10 @@ def render_html(report: dict[str, Any], title: str | None = None) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
-    return template.replace("__PAGE_TITLE__", html.escape(page_title)).replace(
+    rendered = template.replace("__PAGE_TITLE__", html.escape(page_title)).replace(
         "__REPORT_JSON__", report_json
     )
+    return rendered.replace("</body>", TOOL_SATELLITE_HIT_SCRIPT + "\n</body>")
 
 
 def set_message_policy(report: dict[str, Any], include_messages: bool) -> None:

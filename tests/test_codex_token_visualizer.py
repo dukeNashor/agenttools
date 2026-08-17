@@ -153,6 +153,8 @@ class VisualizerTests(unittest.TestCase):
         rendered = viz.render_html(report)
         self.assertIn("tool-envelope", rendered)
         self.assertIn("tool-satellite", rendered)
+        self.assertIn("tool-satellite-hit-line", rendered)
+        self.assertIn("tool-satellite-hit-band", rendered)
         self.assertIn("tool-filter", rendered)
         self.assertIn("openToolDrawer", rendered)
 
@@ -231,7 +233,69 @@ class VisualizerTests(unittest.TestCase):
         calls = viz.parse_rollout(self.write_rollout(lines))["turns"][0]["toolCalls"]
         self.assertEqual([call["category"] for call in calls], ["web-search", "mcp"])
         self.assertEqual([call["rawName"] for call in calls], ["search", "js"])
+        self.assertEqual(calls[1]["provider"], "node_repl")
+        self.assertEqual(calls[1]["semanticTool"], "js")
+        self.assertEqual(calls[1]["classificationSource"], "explicit")
         self.assertTrue(all(call["status"] == "completed" for call in calls))
+
+    def test_mcp_semantics_infer_sky_and_merge_partial_usage(self) -> None:
+        lines = [
+            rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec(
+                "2026-01-01T00:00:01Z",
+                "event_msg",
+                {
+                    "type": "mcp_tool_call_begin",
+                    "call_id": "mcp-1",
+                    "invocation": {
+                        "server": "node_repl",
+                        "tool": "js",
+                        "arguments": {"code": "await sky.list_apps();"},
+                    },
+                    "usage": {"input_tokens": 5},
+                },
+            ),
+            rec(
+                "2026-01-01T00:00:02Z",
+                "event_msg",
+                {
+                    "type": "mcp_tool_call_end",
+                    "call_id": "mcp-1",
+                    "invocation": {
+                        "server": "node_repl",
+                        "tool": "js",
+                        "arguments": {"code": "await sky.list_apps();"},
+                    },
+                    "usage": {"output_tokens": 3, "total_tokens": 8},
+                },
+            ),
+            rec("2026-01-01T00:00:03Z", "response_item", {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-1",
+                "name": "exec",
+                "input": "tools.mcp__node_repl__js({code: `await sky.click()`})",
+            }),
+            rec("2026-01-01T00:00:04Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        turn = self.write_rollout(lines)
+        calls = viz.parse_rollout(turn)["turns"][0]["toolCalls"]
+        sky_call = calls[0]
+        wrapper_call = calls[1]
+        self.assertEqual(sky_call["provider"], "sky")
+        self.assertEqual(sky_call["semanticTool"], "computer-use")
+        self.assertEqual(sky_call["classificationSource"], "inferred")
+        self.assertEqual(sky_call["category"], "computer-use")
+        self.assertEqual(sky_call["usage"]["total"], 8)
+        self.assertEqual(set(sky_call["usageKnown"]), {"input", "output", "total"})
+        self.assertNotIn("cached", sky_call["usageKnown"])
+        self.assertTrue(wrapper_call["transportWrapper"])
+        self.assertIsNone(wrapper_call["provider"])
+        self.assertEqual(wrapper_call["category"], "function-calling")
+
+        rendered = viz.render_html(viz.parse_rollout(turn))
+        self.assertIn("semanticTool", rendered)
+        self.assertIn("classificationSource", rendered)
+        self.assertIn("usageKnown", rendered)
 
     def test_steering_messages_stay_in_the_active_turn(self) -> None:
         lines = [
@@ -673,9 +737,13 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn('computer-use', template)
             self.assertIn('chrome-use', template)
             self.assertIn('imagegen', template)
+            self.assertIn('web-search', template)
             self.assertIn('"exec-reasoning":"Exec Reasoning"', template)
             self.assertIn("state.toolCategories.has(call.category)", template)
             self.assertNotIn('<select id="tool-filter"', template)
+        self.assertIn("stroke-dasharray:none", viz.TOOL_SATELLITE_HIT_SCRIPT)
+        self.assertIn('"Computer Use":"#4f78a8"', viz.TOOL_SATELLITE_HIT_SCRIPT)
+        self.assertIn('"Web Search":"#4f9d87"', viz.TOOL_SATELLITE_HIT_SCRIPT)
 
     def test_subagent_rollout_metadata_exposes_source_kind(self) -> None:
         thread_id = "00000000-0000-0000-0000-000000000020"
@@ -721,6 +789,9 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn('group.addEventListener("pointermove"', template)
             self.assertIn('group.addEventListener("keydown"', template)
             self.assertIn("pointer-events:none", template.replace(" ", ""))
+        self.assertIn('pointer-events", band ? "all" : "stroke"', viz.TOOL_SATELLITE_HIT_SCRIPT)
+        self.assertIn("tool-satellite-hit-line", viz.TOOL_SATELLITE_HIT_SCRIPT)
+        self.assertIn("tool-satellite-hit-band", viz.TOOL_SATELLITE_HIT_SCRIPT)
 
     def test_turn_tooltip_shows_context_delta_and_current_token_only(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
