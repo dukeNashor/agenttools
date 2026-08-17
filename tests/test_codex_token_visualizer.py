@@ -207,6 +207,57 @@ class VisualizerTests(unittest.TestCase):
         self.assertEqual(turn["toolSummary"]["callCount"], 1)
         self.assertEqual(turn["toolCalls"][0]["rawName"], "exec")
 
+    def test_agent_outputs_are_captured_and_prefer_final_answer(self) -> None:
+        lines = [
+            rec(
+                "2026-01-01T00:00:00Z",
+                "session_meta",
+                {
+                    "id": "00000000-0000-0000-0000-000000000020",
+                    "session_id": "00000000-0000-0000-0000-000000000019",
+                    "parent_thread_id": "00000000-0000-0000-0000-000000000019",
+                    "thread_source": "subagent",
+                },
+            ),
+            rec("2026-01-01T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "child-turn"}),
+            rec(
+                "2026-01-01T00:00:02Z",
+                "event_msg",
+                {"type": "agent_message", "phase": "commentary", "message": "intermediate"},
+            ),
+            rec(
+                "2026-01-01T00:00:02Z",
+                "response_item",
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "intermediate"}],
+                },
+            ),
+            rec(
+                "2026-01-01T00:00:03Z",
+                "event_msg",
+                {"type": "agent_message", "phase": "final_answer", "message": "final result"},
+            ),
+            rec("2026-01-01T00:00:04Z", "event_msg", {"type": "task_complete", "turn_id": "child-turn"}),
+        ]
+        turn = viz.parse_rollout(self.write_rollout(lines))["turns"][0]
+        self.assertEqual(turn["outputs"], [
+            {"timestamp": "2026-01-01T00:00:02Z", "text": "intermediate", "phase": "commentary"},
+            {"timestamp": "2026-01-01T00:00:03Z", "text": "final result", "phase": "final_answer"},
+        ])
+
+    def test_subagent_tooltip_uses_bounded_output_fallback(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            compact_template = template.replace(" ", "")
+            self.assertIn("function outputPreview", template)
+            self.assertIn("代理输出", template)
+            self.assertIn("该轮没有可读代理输出。", template)
+            self.assertIn("TOOLTIP_MESSAGE_LIMIT-3", compact_template)
+            self.assertIn("Array.from", template)
+            self.assertIn("tooltipMessageLabel", template)
+            self.assertIn("drawerOutputSection", template)
+
     def test_search_and_mcp_end_events_are_classified_as_tools(self) -> None:
         lines = [
             rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),

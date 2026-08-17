@@ -357,6 +357,7 @@ class Turn:
     time_to_first_token_ms: int | None = None
     abort_reason: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
+    outputs: list[dict[str, Any]] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
     efforts: list[str] = field(default_factory=list)
     context_windows: list[int] = field(default_factory=list)
@@ -381,6 +382,22 @@ class Turn:
         items = getattr(self, attr)
         if value not in items:
             items.append(value)
+
+    def add_output(self, timestamp: str, text: str, phase: Any = None) -> None:
+        text = _coerce_text(text)
+        if not text.strip():
+            return
+        entry = {
+            "timestamp": timestamp,
+            "text": text,
+            "phase": _coerce_text(phase) or None,
+        }
+        if self.outputs and self.outputs[-1]["text"] == text:
+            if entry["phase"] and not self.outputs[-1].get("phase"):
+                self.outputs[-1]["phase"] = entry["phase"]
+            self.outputs[-1]["timestamp"] = timestamp
+            return
+        self.outputs.append(entry)
 
     def usage_delta(self) -> Usage:
         return (self.end_usage - self.start_usage).clamp_nonnegative()
@@ -493,6 +510,7 @@ class Turn:
             "timeToFirstTokenMs": self.time_to_first_token_ms,
             "abortReason": self.abort_reason,
             "messages": self.messages,
+            "outputs": self.outputs,
             "models": self.models,
             "efforts": self.efforts,
             "contextWindows": self.context_windows,
@@ -569,6 +587,17 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _response_item_text(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, list):
+        return "".join(
+            _coerce_text(item.get("text"))
+            for item in content
+            if isinstance(item, dict) and item.get("text") is not None
+        )
+    return _coerce_text(payload.get("text"))
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -1124,6 +1153,18 @@ def parse_rollout(
 
             if record_type != "event_msg":
                 if record_type in {"response_item", "tool_call", "tool_result", "tool_output"}:
+                    if (
+                        record_type == "response_item"
+                        and current is not None
+                        and payload.get("type") == "message"
+                        and payload.get("role") == "assistant"
+                        and (window is None or in_window)
+                    ):
+                        current.add_output(
+                            timestamp,
+                            _response_item_text(payload),
+                            payload.get("phase"),
+                        )
                     record_tool_event(record_type, payload, timestamp)
                 continue
 
@@ -1194,6 +1235,17 @@ def parse_rollout(
                     )
                 turns_by_id[turn_id] = current
                 if window is not None and in_window:
+                    current.note_range_activity(timestamp)
+                    note_range_activity(timestamp)
+                continue
+
+            if event_type == "agent_message":
+                if current is not None and (window is None or in_window):
+                    current.add_output(
+                        timestamp,
+                        _coerce_text(payload.get("message") or payload.get("text")),
+                        payload.get("phase"),
+                    )
                     current.note_range_activity(timestamp)
                     note_range_activity(timestamp)
                 continue
@@ -2531,7 +2583,8 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   }
   function showTooltip(event, turn) {
     const b = turn.breakdown;
-    tooltip.innerHTML = `<strong>第 ${turn.index} 轮 · ${esc(statusText(turn.status))}</strong>` + segmentKeys.filter(key => b[key]).map(key => `<div class="row"><span>${esc(segmentLabels[key])}</span><b>${formatTokens(b[key])}</b></div>`).join("") + `<div class="row"><span>总量</span><b>${formatTokens(turn.usage.total)}</b></div><div style="margin-top:6px;color:var(--muted);max-height:48px;overflow:hidden">${esc(firstPrompt(turn) || "未记录用户消息")}</div>`;
+    const message = tooltipMessage(turn);
+    tooltip.innerHTML = `<strong>第 ${turn.index} 轮 · ${esc(statusText(turn.status))}</strong>` + segmentKeys.filter(key => b[key]).map(key => `<div class="row"><span>${esc(segmentLabels[key])}</span><b>${formatTokens(b[key])}</b></div>`).join("") + `<div class="row"><span>总量</span><b>${formatTokens(turn.usage.total)}</b></div><div style="margin-top:6px;color:var(--muted);max-height:48px;overflow:hidden">${esc(message.text)}</div>`;
     positionTooltip(event,event.currentTarget);
   }
   function previousTurnForTooltip(turn) { const sequence=[...turns].sort((a,b)=>Number(a.index)-Number(b.index)); const index=sequence.findIndex(candidate=>candidate.turnId===turn.turnId); return index>0?sequence[index-1]:null; }
@@ -2542,9 +2595,28 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     if (!full) { const attachments=[message.imageCount?`${message.imageCount} 张图片`:"",message.audioCount?`${message.audioCount} 条音频`:""].filter(Boolean).join(" · "); return {text:attachments?`初始消息包含 ${attachments}，无文本。`:"初始用户消息没有文本。",truncated:false}; }
     return {text:full.slice(0,TOOLTIP_MESSAGE_LIMIT),truncated:full.length>TOOLTIP_MESSAGE_LIMIT};
   }
+  function outputPreview(turn) {
+    const outputs = (turn.outputs || []).filter(output => String(output.text || "").trim());
+    const finalOutputs = outputs.filter(output => String(output.phase || "").toLowerCase() === "final_answer");
+    const selected = (finalOutputs.length ? finalOutputs : outputs).at(-1);
+    if (!selected) return {text:"该轮没有可读代理输出。",truncated:false};
+    const full = String(selected.text || "");
+    const characters = Array.from(full);
+    return characters.length > TOOLTIP_MESSAGE_LIMIT
+      ? {text:characters.slice(0, TOOLTIP_MESSAGE_LIMIT - 3).join("") + "...",truncated:true}
+      : {text:full,truncated:false};
+  }
+  function tooltipMessage(turn) { return isSatelliteTurn(turn) ? outputPreview(turn) : initialMessagePreview(turn); }
+  function tooltipMessageLabel(turn) { return isSatelliteTurn(turn) ? "代理输出" : "初始用户消息"; }
+  function drawerOutputSection(turn) {
+    if (!isSatelliteTurn(turn)) return "";
+    const outputs = (turn.outputs || []).filter(output => String(output.text || "").trim());
+    const text = outputs.length ? outputs.map(output => String(output.text || "")).join("\n\n") : "该轮没有可读代理输出。";
+    return `<div class="message"><div class="message-head">代理输出${outputs.length ? ` · ${outputs.length} 条` : ""}</div><pre>${esc(text)}</pre></div>`;
+  }
   function showTurnTooltip(event, turn, target, conversationTotal) {
     if (event?.pointerType === "touch") { hideTooltip(); return; }
-    const b = turn.breakdown || {}, snapshot = contextSnapshot(turn), previous = previousTurnForTooltip(turn), previousSnapshot = previous ? contextSnapshot(previous) : null, message = initialMessagePreview(turn);
+    const b = turn.breakdown || {}, snapshot = contextSnapshot(turn), previous = previousTurnForTooltip(turn), previousSnapshot = previous ? contextSnapshot(previous) : null, message = tooltipMessage(turn);
     const tokenRows = segmentKeys.map(key => `<span>${esc(segmentLabels[key])}</span><b>${formatTokens(b[key]||0)}</b>`).join("");
     const contextPortion = snapshot.occupancyRate == null ? "—" : `${Number(snapshot.occupancyRate).toFixed(2)}%`;
     const contextAbsolute = snapshot.occupancyRate == null ? "未记录 Context 快照" : `${formatTokens(snapshot.tokens)} / ${snapshot.windowTokens == null ? "—" : formatTokens(snapshot.windowTokens)} Token`;
@@ -2555,7 +2627,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       + `<div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div>`
       + `<div class="tooltip-grid"><span>来源</span><b>${esc(sourceLabel(turn))}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${formatTokens(turn.compactions)}</b></div>`
       + `<div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${formatTokens(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div>`
-      + `<div class="tooltip-section"><div class="tooltip-section-label">初始用户消息</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;
+      + `<div class="tooltip-section"><div class="tooltip-section-label">${tooltipMessageLabel(turn)}</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;
     positionTooltip(event,target);
   }
   function moveTurnTooltip(event, target) { if (event.pointerType !== "touch" && tooltip.style.display === "block") positionTooltip(event,target); }
@@ -2705,7 +2777,8 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     let body=`<div class="detail-grid">${details.map(([k,v])=>`<div class="detail-item"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
     body+=`<div class="message"><div class="message-head">Token 构成</div><pre>${segmentKeys.map(key=>`${segmentLabels[key]}：${formatTokens(b[key]||0)}`).join("\n")}</pre></div>`;
     if((turn.contextCompactions||[]).length){const compactionLines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${formatTokens(value.tokens)} / ${value.windowTokens==null?"—":formatTokens(value.windowTokens)} · ${contextRateText(value)}`:"未知";return `#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":formatTokens(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});body+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(compactionLines.join("\n\n"))}</pre></div>`;}
-    if (turn.messages.length) body+=turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i===0?"初始用户消息":"追加用户消息"} · ${esc(dateText(m.timestamp))}${m.imageCount?` · ${m.imageCount} 张图片`:""}${m.audioCount?` · ${m.audioCount} 条音频`:""}</div><pre></pre></section>`).join("");
+    if (isSatelliteTurn(turn)) body+=drawerOutputSection(turn);
+    else if (turn.messages.length) body+=turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i===0?"初始用户消息":"追加用户消息"} · ${esc(dateText(m.timestamp))}${m.imageCount?` · ${m.imageCount} 张图片`:""}${m.audioCount?` · ${m.audioCount} 条音频`:""}</div><pre></pre></section>`).join("");
     else body+=`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;
     byId("drawer-body").innerHTML=body;
     byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>{pre.textContent=turn.messages[i].text;});
@@ -2818,8 +2891,11 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   function svgEl(name,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",name);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el} function text(svg,x,y,value,anchor="end"){const t=svgEl("text",{x,y,"text-anchor":anchor,fill:css("--muted"),"font-size":"11"});t.textContent=value;svg.appendChild(t)}
   function positionTooltip(event,target){const targetRect=target?.getBoundingClientRect?.(),pointerX=Number.isFinite(event?.clientX)?event.clientX:targetRect?targetRect.left+targetRect.width/2:innerWidth/2,pointerY=Number.isFinite(event?.clientY)?event.clientY:targetRect?targetRect.top+targetRect.height/2:innerHeight/2;tooltip.style.display="block";tooltip.style.visibility="hidden";const gap=14,edge=8,width=tooltip.offsetWidth,height=tooltip.offsetHeight;let x=pointerX+gap,y=pointerY+gap;if(x+width>innerWidth-edge)x=pointerX-width-gap;if(y+height>innerHeight-edge)y=pointerY-height-gap;tooltip.style.left=`${Math.max(edge,Math.min(x,innerWidth-width-edge))}px`;tooltip.style.top=`${Math.max(edge,Math.min(y,innerHeight-height-edge))}px`;tooltip.style.visibility="visible"}
   function initialMessagePreview(turn){const message=(turn.messages||[])[0];if(!message)return{text:messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。",truncated:false};const full=String(message.text||"");if(!full){const attachments=[message.imageCount?`${message.imageCount} 张图片`:"",message.audioCount?`${message.audioCount} 条音频`:""].filter(Boolean).join(" · ");return{text:attachments?`初始消息包含 ${attachments}，无文本。`:"初始用户消息没有文本。",truncated:false}}return{text:full.slice(0,TOOLTIP_MESSAGE_LIMIT),truncated:full.length>TOOLTIP_MESSAGE_LIMIT}}
+  function outputPreview(turn){const outputs=(turn.outputs||[]).filter(output=>String(output.text||"").trim()),finalOutputs=outputs.filter(output=>String(output.phase||"").toLowerCase()==="final_answer"),selected=(finalOutputs.length?finalOutputs:outputs).at(-1);if(!selected)return{text:"该轮没有可读代理输出。",truncated:false};const full=String(selected.text||""),characters=Array.from(full);return characters.length>TOOLTIP_MESSAGE_LIMIT?{text:characters.slice(0,TOOLTIP_MESSAGE_LIMIT-3).join("")+"...",truncated:true}:{text:full,truncated:false}}
+  function tooltipMessage(turn){return isSatelliteTurn(turn)?outputPreview(turn):initialMessagePreview(turn)} function tooltipMessageLabel(turn){return isSatelliteTurn(turn)?"代理输出":"初始用户消息"}
+  function drawerOutputSection(turn){if(!isSatelliteTurn(turn))return"";const outputs=(turn.outputs||[]).filter(output=>String(output.text||"").trim()),text=outputs.length?outputs.map(output=>String(output.text||"")).join("\n\n"):"该轮没有可读代理输出。";return `<div class="message"><div class="message-head">代理输出${outputs.length?` · ${outputs.length} 条`:""}</div><pre>${esc(text)}</pre></div>`}
   function previousTurnForTooltip(turn){const sequence=[...(activeSession()?.turns||[])].sort((a,b)=>Number(a.index)-Number(b.index)),index=sequence.findIndex(candidate=>candidate.turnId===turn.turnId);return index>0?sequence[index-1]:null}
-  function showTurnTooltip(event,turn,target,conversationTotal){if(event?.pointerType==="touch"){hideTooltip();return}const b=turn.breakdown||{},snapshot=contextSnapshot(turn),previous=previousTurnForTooltip(turn),previousSnapshot=previous?contextSnapshot(previous):null,message=initialMessagePreview(turn),tokenRows=segmentKeys.map(key=>`<span>${esc(labels[key])}</span><b>${fmt(b[key]||0)}</b>`).join(""),contextPortion=snapshot.occupancyRate==null?"—":`${Number(snapshot.occupancyRate).toFixed(2)}%`,contextAbsolute=snapshot.occupancyRate==null?"未记录 Context 快照":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`,tokenPortion=conversationTotal>0?`${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%`:"—",tokenAbsolute=`${fmt(turn.usage.total)} / ${fmt(conversationTotal)} Token`,contextDelta=previousSnapshot?.occupancyRate==null||snapshot.occupancyRate==null?"":(()=>{const delta=Number(snapshot.occupancyRate)-Number(previousSnapshot.occupancyRate);if(Math.abs(delta)<0.005)return"无变化";return delta>0?`增加了 ${delta.toFixed(2)}%`:`减少了 ${Math.abs(delta).toFixed(2)}%`})();tooltip.innerHTML=`<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div><div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change" style="font-size:11px;font-weight:550;color:var(--muted);white-space:nowrap">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div><div class="tooltip-grid"><span>来源</span><b>${esc(turn.sourceLabel||"主会话")}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${fmt(turn.compactions)}</b></div><div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${fmt(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div><div class="tooltip-section"><div class="tooltip-section-label">初始用户消息</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;positionTooltip(event,target)}
+  function showTurnTooltip(event,turn,target,conversationTotal){if(event?.pointerType==="touch"){hideTooltip();return}const b=turn.breakdown||{},snapshot=contextSnapshot(turn),previous=previousTurnForTooltip(turn),previousSnapshot=previous?contextSnapshot(previous):null,message=tooltipMessage(turn),tokenRows=segmentKeys.map(key=>`<span>${esc(labels[key])}</span><b>${fmt(b[key]||0)}</b>`).join(""),contextPortion=snapshot.occupancyRate==null?"—":`${Number(snapshot.occupancyRate).toFixed(2)}%`,contextAbsolute=snapshot.occupancyRate==null?"未记录 Context 快照":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`,tokenPortion=conversationTotal>0?`${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%`:"—",tokenAbsolute=`${fmt(turn.usage.total)} / ${fmt(conversationTotal)} Token`,contextDelta=previousSnapshot?.occupancyRate==null||snapshot.occupancyRate==null?"":(()=>{const delta=Number(snapshot.occupancyRate)-Number(previousSnapshot.occupancyRate);if(Math.abs(delta)<0.005)return"无变化";return delta>0?`增加了 ${delta.toFixed(2)}%`:`减少了 ${Math.abs(delta).toFixed(2)}%`})();tooltip.innerHTML=`<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div><div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change" style="font-size:11px;font-weight:550;color:var(--muted);white-space:nowrap">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div><div class="tooltip-grid"><span>来源</span><b>${esc(turn.sourceLabel||"主会话")}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${fmt(turn.compactions)}</b></div><div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${fmt(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div><div class="tooltip-section"><div class="tooltip-section-label">${tooltipMessageLabel(turn)}</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;positionTooltip(event,target)}
   function moveTurnTooltip(event,target){if(event.pointerType!=="touch"&&tooltip.style.display==="block")positionTooltip(event,target)}
   function focusTurnTooltip(event,turn,target,conversationTotal){if(target.matches(":focus-visible"))showTurnTooltip(event,turn,target,conversationTotal)}
   function turnTargetKeydown(event,turn){if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openDrawer(turn)}}
@@ -2889,7 +2965,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     if(!turn)return;state.selected=turn.turnId;byId("drawer-title").textContent=`第 ${turn.index} 轮 · ${turn.sourceLabel||"主会话"}`;const snapshot=contextSnapshot(turn),details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["来源",turn.sourceLabel||"主会话"],["开始时间",dateText(turn.startedAt)],["结束时间",dateText(turn.endedAt)],["范围活动",`${dateText(turn.rangeFirstActivityAt)} — ${dateText(turn.rangeLastActivityAt)}`],["日期裁剪",turn.rangeClipped?"是":"否"],["模型",(turn.models||[]).join(", ")||"—"],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":fmt(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",fmt(turn.compactions)],["总 Token",fmt(turn.usage.total)],["输入",fmt(turn.usage.input)],["输出",fmt(turn.usage.output)],["推理输出",fmt(turn.usage.reasoning)]];
     let html=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div>`;
     if((turn.contextCompactions||[]).length){const lines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${fmt(value.tokens)} / ${value.windowTokens==null?"—":fmt(value.windowTokens)} · ${contextRateText(value)}`:"未知";return`#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":fmt(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});html+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(lines.join("\n\n"))}</pre></div>`}
-    html+=(turn.messages||[]).length?turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i?"追加用户消息":"初始用户消息"} · ${esc(dateText(m.timestamp))}</div><pre></pre></section>`).join(""):`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;byId("drawer-body").innerHTML=html;byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>pre.textContent=turn.messages[i].text);byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();renderTable();
+    if(isSatelliteTurn(turn))html+=drawerOutputSection(turn);else html+=(turn.messages||[]).length?turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i?"追加用户消息":"初始用户消息"} · ${esc(dateText(m.timestamp))}</div><pre></pre></section>`).join(""):`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;byId("drawer-body").innerHTML=html;byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>pre.textContent=turn.messages[i].text);byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();renderTable();
   }
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
   function setTab(tab){const contextButton=byId("tab-context"),contextDisabled=isTotal();contextButton.disabled=contextDisabled;if(contextDisabled&&tab==="context")tab="composition";if(!["composition","trend","context","table"].includes(tab))tab="composition";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab})}
