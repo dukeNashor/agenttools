@@ -1574,12 +1574,30 @@ button { cursor: pointer; }
 button:hover, button.active { border-color: var(--accent); color: var(--accent); }
 main { max-width: 1680px; margin: 0 auto; padding: 30px clamp(16px, 3vw, 44px) 70px; }
 .hero { display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:22px; }
+.hero-copy { min-width:0; flex:1; }
 .eyebrow { color: var(--accent); text-transform:uppercase; letter-spacing:.14em; font-size:12px; font-weight:800; }
 h1 { font-size: clamp(28px, 4vw, 48px); line-height:1.08; margin:7px 0 10px; letter-spacing:-.035em; }
 .subline { color:var(--muted); max-width:920px; overflow-wrap:anywhere; }
 .sensitive { color:#984b55; background:#fae9e8; border:1px solid #e8c4c2; border-radius:999px; padding:7px 11px; font-size:12px; white-space:nowrap; }
 .sensitive.safe { color:#3f765f; background:#e8f3eb; border-color:#c3ddcb; }
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(172px,1fr)); gap:12px; margin:20px 0; }
+.summary-brief { width:min(560px,48%); padding:12px 14px; border:1px solid var(--border); border-radius:14px; background:rgba(255,254,250,.86); box-shadow:var(--shadow); }
+.brief-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:9px; color:var(--muted); font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+.brief-head .sensitive { font-size:10px; letter-spacing:0; text-transform:none; padding:4px 8px; }
+.brief-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 16px; }
+.brief-item { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:baseline; padding-bottom:6px; border-bottom:1px solid rgba(126,111,91,.16); }
+.brief-item .label { color:var(--muted); font-size:10px; }
+.brief-item .value { margin:0; font-size:16px; font-weight:760; font-variant-numeric:tabular-nums; text-align:right; }
+.brief-item .note { grid-column:1 / -1; color:var(--muted); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.analysis-shell { margin-top:16px; }
+.analysis-tabs { display:flex; gap:5px; padding:5px; border:1px solid var(--border); border-radius:13px 13px 0 0; background:var(--panel-2); overflow-x:auto; }
+.analysis-tab { flex:1 0 auto; border:1px solid transparent; border-radius:9px; padding:9px 13px; background:transparent; color:var(--muted); font-size:12px; font-weight:750; white-space:nowrap; }
+.analysis-tab:hover, .analysis-tab.active { border-color:var(--accent); background:var(--panel); color:var(--accent); }
+.analysis-tab:disabled { cursor:not-allowed; opacity:.42; }
+.analysis-controls { padding:14px 0 0; }
+.analysis-controls .range-row, .analysis-controls .filter-row { padding-left:0; padding-right:0; }
+.tab-panel { margin-top:12px; }
+.tab-panel[hidden] { display:none; }
 .card, .panel { background:linear-gradient(180deg, rgba(255,254,250,.98), rgba(252,249,243,.98)); border:1px solid var(--border); box-shadow:var(--shadow); }
 .card { border-radius:14px; padding:16px; min-height:105px; }
 .card .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.07em; }
@@ -1711,66 +1729,85 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
 .footer { color:var(--muted); text-align:center; margin-top:28px; font-size:12px; }
 @media (max-width:720px) {
   .hero { flex-direction:column; }
+  .summary-brief { width:100%; }
+  .brief-grid { gap:7px 12px; }
   .range-row { align-items:flex-start; flex-direction:column; gap:4px; }
   .dual-range-shell { width:100%; }
   .detail-grid { grid-template-columns:1fr; }
 }
 </style>
+<style>
+.hero-copy{min-width:0;flex:1}.summary-brief{width:min(560px,48%);padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:rgba(255,254,250,.86);box-shadow:var(--shadow)}.brief-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.brief-head .sensitive{font-size:10px;letter-spacing:0;text-transform:none;padding:4px 8px}.brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}.brief-item{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:baseline;padding-bottom:6px;border-bottom:1px solid rgba(126,111,91,.16)}.brief-item .label{color:var(--muted);font-size:10px}.brief-item .value{margin:0;font-size:16px;font-weight:760;font-variant-numeric:tabular-nums;text-align:right}.brief-item .note{grid-column:1 / -1;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.analysis-shell{margin-top:16px}.analysis-tabs{display:flex;gap:5px;padding:5px;border:1px solid var(--border);border-radius:13px 13px 0 0;background:var(--panel2);overflow-x:auto}.analysis-tab{flex:1 0 auto;border:1px solid transparent;border-radius:9px;padding:9px 13px;background:transparent;color:var(--muted);font-size:12px;font-weight:750;white-space:nowrap}.analysis-tab:hover,.analysis-tab.active{border-color:var(--accent);background:var(--panel);color:var(--accent)}.analysis-tab:disabled{cursor:not-allowed;opacity:.42}.analysis-controls{padding:14px 0 0}.analysis-controls .filters{padding-left:0;padding-right:0}.tab-panel{margin-top:12px}.tab-panel[hidden]{display:none}
+@media(max-width:650px){.summary-brief{width:100%}.brief-grid{gap:7px 12px}}
+</style>
 </head>
 <body>
 <main>
   <section class="hero">
-    <div>
+    <div class="hero-copy">
       <div class="eyebrow">Codex Token 使用分析</div>
       <h1>线程逐轮消耗</h1>
       <div class="subline" id="thread-meta"></div>
     </div>
-    <div class="sensitive" id="privacy-indicator"></div>
+    <aside class="summary-brief" aria-label="报告摘要">
+      <div class="brief-head"><span>报告摘要</span><span class="sensitive" id="privacy-indicator"></span></div>
+      <div class="brief-grid" id="summary-cards"></div>
+    </aside>
   </section>
 
-  <section class="cards" id="summary-cards"></section>
   <details class="warning-box" id="warning-box">
     <summary id="warning-summary"></summary>
     <ul class="warning-list" id="warning-list"></ul>
   </details>
 
-  <section class="panel">
+  <section class="analysis-shell">
+    <nav class="analysis-tabs" role="tablist" aria-label="统计视图">
+      <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">Context 双环</button>
+      <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">每轮 Token 构成</button>
+      <button class="analysis-tab" id="tab-cumulative" data-tab-target="cumulative" role="tab" aria-selected="false" type="button">累计总消耗</button>
+      <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">轮次明细</button>
+    </nav>
+    <div class="analysis-controls">
+      <div class="range-row">
+        <label for="range-start">轮次范围</label>
+        <div class="dual-range-shell">
+          <div class="dual-range-values"><output id="range-start-value"></output><span>—</span><output id="range-end-value"></output></div>
+          <div class="dual-range">
+            <div class="dual-range-track"></div><div class="dual-range-fill" id="range-fill"></div>
+            <input id="range-start" type="range" aria-label="起始轮次">
+            <input id="range-end" type="range" aria-label="结束轮次">
+          </div>
+        </div>
+      </div>
+      <div class="filter-row">
+        <input id="search" type="search" placeholder="搜索完整用户消息、轮次 ID、模型……">
+        <label class="check"><input type="checkbox" data-status="complete" checked> 已完成</label>
+        <label class="check"><input type="checkbox" data-status="aborted" checked> 已中止</label>
+        <label class="check"><input type="checkbox" data-status="incomplete" checked> 未闭合</label>
+        <span id="visible-count"></span>
+        <button id="reset-button" type="button">重置筛选</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel tab-panel" data-tab-panel="composition" role="tabpanel" hidden>
     <div class="panel-head">
       <div><h2>每轮 Token 构成</h2><p>各色段互不重叠，柱形总高度等于该轮总消耗。</p></div>
       <div class="controls">
         <button id="linear-button" class="active" type="button">线性</button>
         <button id="log-button" type="button">对数</button>
-        <button id="reset-button" type="button">重置筛选</button>
       </div>
-    </div>
-    <div class="range-row">
-      <label for="range-start">轮次范围</label>
-      <div class="dual-range-shell">
-        <div class="dual-range-values"><output id="range-start-value"></output><span>—</span><output id="range-end-value"></output></div>
-        <div class="dual-range">
-          <div class="dual-range-track"></div><div class="dual-range-fill" id="range-fill"></div>
-          <input id="range-start" type="range" aria-label="起始轮次">
-          <input id="range-end" type="range" aria-label="结束轮次">
-        </div>
-      </div>
-    </div>
-    <div class="filter-row">
-      <input id="search" type="search" placeholder="搜索完整用户消息、轮次 ID、模型……">
-      <label class="check"><input type="checkbox" data-status="complete" checked> 已完成</label>
-      <label class="check"><input type="checkbox" data-status="aborted" checked> 已中止</label>
-      <label class="check"><input type="checkbox" data-status="incomplete" checked> 未闭合</label>
-      <span id="visible-count"></span>
     </div>
     <div class="filter-row legend" id="legend"></div>
     <div class="chart-scroll"><div class="chart-wrap" id="turn-chart-wrap"><svg id="turn-chart" role="img" aria-label="每轮 Token 使用图表"></svg></div></div>
   </section>
 
-  <section class="panel">
+  <section class="panel tab-panel" data-tab-panel="cumulative" role="tabpanel" hidden>
     <div class="panel-head"><div><h2>累计总消耗</h2><p>按任务轮次展示线性累计 Token 使用量。</p></div></div>
     <div class="cumulative-wrap"><svg id="cumulative-chart" role="img" aria-label="累计 Token 使用图表"></svg></div>
   </section>
 
-  <section class="panel">
+  <section class="panel tab-panel" data-tab-panel="context" role="tabpanel">
     <div class="panel-head">
       <div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开：外环弧长表示 Token 消耗，内环按轮内快照位置阶梯展示 Context 占用率。</p></div>
     </div>
@@ -1778,7 +1815,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     <div class="context-radial-wrap"><svg id="context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div>
   </section>
 
-  <section class="panel">
+  <section class="panel tab-panel" data-tab-panel="table" role="tabpanel" hidden>
     <div class="panel-head"><div><h2>轮次明细</h2><p>数值列使用按列计算的条件格式；点击行或柱形可查看完整用户消息。</p></div></div>
     <div class="table-wrap">
       <table>
@@ -1823,7 +1860,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   };
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
-  const state = { scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
+  const state = { tab: "context", scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
   const tooltip = byId("turn-tooltip");
   const TOOLTIP_MESSAGE_LIMIT = 800;
 
@@ -1865,7 +1902,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       ["轮次", formatTokens(report.summary.turnCount), `${report.summary.statusCounts.aborted || 0} 轮中止 · ${report.summary.zeroUsageTurns} 轮零消耗`],
       ["对账", reconciliationOk() ? "完全一致" : "存在差异", reconciliationOk() ? "逐轮总和与最终计数闭合" : "请查看完整性警告"]
     ];
-    byId("summary-cards").innerHTML = cards.map(([label,value,note]) => `<article class="card"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join("");
+    byId("summary-cards").innerHTML = cards.map(([label,value,note]) => `<article class="brief-item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join("");
     byId("footer").textContent = `生成时间：${dateText(report.metadata.generatedAt)} · 工具：${report.generator.name} ${report.generator.version} · 来源：${report.metadata.sourcePath}`;
   }
 
@@ -1902,6 +1939,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     document.querySelectorAll("th[data-sort]").forEach(th => th.addEventListener("click", () => {
       const key = th.dataset.sort; if (state.sort === key) state.direction *= -1; else { state.sort = key; state.direction = key === "index" ? 1 : -1; } renderTable(filteredTurns());
     }));
+    document.querySelectorAll("[data-tab-target]").forEach(button => button.addEventListener("click", () => setTab(button.dataset.tabTarget)));
     byId("drawer-close").addEventListener("click", closeDrawer);
     document.addEventListener("keydown", event => { if (event.key === "Escape") closeDrawer(); });
     document.addEventListener("click", event => {
@@ -1911,7 +1949,13 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       if (!target || drawer.contains(target) || target.closest("[data-turn-target=true]")) return;
       closeDrawer();
     });
-    renderLegend(); syncScaleButtons();
+    renderLegend(); syncScaleButtons(); setTab(state.tab);
+  }
+  function setTab(tab) {
+    if (!["composition","cumulative","context","table"].includes(tab)) tab = "context";
+    state.tab = tab;
+    document.querySelectorAll("[data-tab-target]").forEach(button => { const active = button.dataset.tabTarget === tab; button.classList.toggle("active", active); button.setAttribute("aria-selected", String(active)); });
+    document.querySelectorAll("[data-tab-panel]").forEach(panel => { panel.hidden = panel.dataset.tabPanel !== tab; });
   }
   function setScale(scale) { state.scale = scale; syncScaleButtons(); renderTurnChart(filteredTurns()); }
   function syncScaleButtons() { byId("linear-button").classList.toggle("active", state.scale === "linear"); byId("log-button").classList.toggle("active", state.scale === "log"); }
@@ -2157,6 +2201,10 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
 @media(max-width:900px){body.session-nav-modal-open{overflow:hidden}.shell,.shell.session-nav-closed{display:block}.sidebar{position:fixed;left:0;transform:translateX(-104%);opacity:0;visibility:hidden;width:min(320px,88vw);border-right:1px solid var(--border)}.shell.session-nav-open .sidebar{transform:translateX(0);opacity:1;visibility:visible;pointer-events:auto}.shell.session-nav-open .session-drawer-backdrop{display:block}.content{padding-top:20px}}@media(max-width:650px){.hero{flex-direction:column}.detail-grid{grid-template-columns:1fr}}
 .sidebar{overflow-x:hidden}.session-list{min-width:0}.session-button{min-width:0;max-width:100%}
 </style>
+<style>
+.hero-copy{min-width:0;flex:1}.summary-brief{width:min(560px,48%);padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:rgba(255,254,250,.86);box-shadow:var(--shadow)}.brief-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.brief-head .sensitive{font-size:10px;letter-spacing:0;text-transform:none;padding:4px 8px}.brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}.brief-item{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:baseline;padding-bottom:6px;border-bottom:1px solid rgba(126,111,91,.16)}.brief-item .label{color:var(--muted);font-size:10px}.brief-item .value{margin:0;font-size:16px;font-weight:760;font-variant-numeric:tabular-nums;text-align:right}.brief-item .note{grid-column:1 / -1;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.analysis-shell{margin-top:15px}.analysis-tabs{display:flex;gap:5px;padding:5px;border:1px solid var(--border);border-radius:13px 13px 0 0;background:var(--panel2);overflow-x:auto}.analysis-tab{flex:1 0 auto;border:1px solid transparent;border-radius:9px;padding:9px 13px;background:transparent;color:var(--muted);font-size:12px;font-weight:750;white-space:nowrap}.analysis-tab:hover,.analysis-tab.active{border-color:var(--accent);background:var(--panel);color:var(--accent)}.analysis-tab:disabled{cursor:not-allowed;opacity:.42}.analysis-controls{padding:14px 0 0}.analysis-controls .filters{padding-left:0;padding-right:0}.tab-panel{margin-top:12px}.tab-panel[hidden]{display:none}.session-total-button{margin:0 0 8px;padding:9px 11px;border-color:rgba(126,111,91,.28);border-radius:9px;background:rgba(240,233,221,.62)}.session-total-button:hover{border-color:var(--border);background:var(--panel2);color:var(--text);box-shadow:none}.session-total-button.active{border-color:rgba(126,111,91,.5);background:#e7ddcf;color:var(--text);box-shadow:inset 3px 0 0 #8c6f4d,0 4px 12px rgba(92,75,54,.08)}.session-total-button strong{font-size:12px}.session-total-button span{color:var(--muted);font-size:10px}
+@media(max-width:650px){.summary-brief{width:100%}.brief-grid{gap:7px 12px}}
+</style>
 </head>
 <body>
 <div class="shell" id="report-shell">
@@ -2168,17 +2216,26 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   <button class="session-drawer-backdrop" id="session-drawer-backdrop" type="button" tabindex="-1" aria-label="关闭会话列表"></button>
   <main class="content">
     <div class="content-topbar"><button class="session-drawer-toggle" id="session-drawer-toggle" type="button" aria-controls="session-drawer" aria-expanded="true"><span aria-hidden="true">☰</span><span id="session-drawer-toggle-label">收起会话</span></button></div>
-    <section class="hero"><div><div class="eyebrow" id="view-eyebrow"></div><h1 id="view-title"></h1><div class="subline" id="view-meta"></div></div><div class="sensitive" id="privacy"></div></section>
-    <section class="cards" id="cards"></section>
+    <section class="hero"><div class="hero-copy"><div class="eyebrow" id="view-eyebrow"></div><h1 id="view-title"></h1><div class="subline" id="view-meta"></div></div><aside class="summary-brief" aria-label="报告摘要"><div class="brief-head"><span>报告摘要</span><span class="sensitive" id="privacy"></span></div><div class="brief-grid" id="cards"></div></aside></section>
     <details class="warning-box" id="warning-box"><summary id="warning-summary"></summary><ul class="warning-list" id="warning-list"></ul></details>
-    <section class="panel">
+    <section class="analysis-shell">
+      <nav class="analysis-tabs" role="tablist" aria-label="统计视图">
+        <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">Context 双环</button>
+        <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">每轮 Token 构成</button>
+        <button class="analysis-tab" id="tab-trend" data-tab-target="trend" role="tab" aria-selected="false" type="button">累计总消耗</button>
+        <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">轮次明细</button>
+      </nav>
+      <div class="analysis-controls">
+        <div class="filters"><input class="content-search" id="content-search" type="search"><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span><button id="reset-filters" type="button">重置筛选</button></div>
+      </div>
+    </section>
+    <section class="panel tab-panel" data-tab-panel="composition" role="tabpanel" hidden>
       <div class="panel-head"><div><h2 id="composition-title"></h2><p id="composition-note"></p></div><div class="controls"><button id="linear" class="active" type="button">线性</button><button id="log" type="button">对数</button></div></div>
-      <div class="filters"><input class="content-search" id="content-search" type="search"><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span></div>
       <div class="legend" id="legend"></div><div class="chart-scroll"><div class="chart-wrap"><svg id="composition" viewBox="0 0 1200 410" role="img"></svg></div></div>
     </section>
-    <section class="panel"><div class="panel-head"><div><h2 id="trend-title"></h2><p id="trend-note"></p></div></div><div class="trend-wrap"><svg id="trend" viewBox="0 0 1200 270" role="img"></svg></div></section>
-    <section class="panel" id="range-context-panel" hidden><div class="panel-head"><div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开；外环按来源着色，内环按轮内快照位置阶梯展示 Context 占用率。</p></div></div><div class="source-legend" id="context-source-legend"></div><div class="context-radial-wrap"><svg id="range-context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div></section>
-    <section class="panel"><div class="panel-head"><div><h2 id="table-title"></h2><p id="table-note"></p></div></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table><div class="empty" id="table-empty" hidden></div></div></section>
+    <section class="panel tab-panel" data-tab-panel="trend" role="tabpanel" hidden><div class="panel-head"><div><h2 id="trend-title"></h2><p id="trend-note"></p></div></div><div class="trend-wrap"><svg id="trend" viewBox="0 0 1200 270" role="img"></svg></div></section>
+    <section class="panel tab-panel" data-tab-panel="context" role="tabpanel" id="range-context-panel"><div class="panel-head"><div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开；外环按来源着色，内环按轮内快照位置阶梯展示 Context 占用率。</p></div></div><div class="source-legend" id="context-source-legend"></div><div class="context-radial-wrap"><svg id="range-context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div></section>
+    <section class="panel tab-panel" data-tab-panel="table" role="tabpanel" hidden><div class="panel-head"><div><h2 id="table-title"></h2><p id="table-note"></p></div></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table><div class="empty" id="table-empty" hidden></div></div></section>
     <div class="footer" id="footer"></div>
   </main>
 </div>
@@ -2193,7 +2250,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
   const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
   const sessionNavMedia=window.matchMedia("(max-width:900px)");
-  const state={view:"total",scale:"linear",query:"",statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
+  const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   function byId(id){return document.getElementById(id)} function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
   function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])}
@@ -2211,9 +2268,9 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     shell.classList.toggle("session-nav-open",state.sessionNavOpen);shell.classList.toggle("session-nav-closed",!state.sessionNavOpen);drawer.setAttribute("aria-hidden",String(!state.sessionNavOpen));drawer.inert=!state.sessionNavOpen;toggle.setAttribute("aria-expanded",String(state.sessionNavOpen));byId("session-drawer-toggle-label").textContent=state.sessionNavOpen?"收起会话":"会话";document.body.classList.toggle("session-nav-modal-open",state.sessionNavOpen&&sessionNavMedia.matches);
     if(focusTarget)(state.sessionNavOpen?byId("nav-search"):toggle).focus();
   }
-  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>[s.metadata.title,s.metadata.threadId,s.metadata.cwd].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>`<button class="session-button ${state.view===s.metadata.threadId?"active":""}" data-view="${esc(s.metadata.threadId)}"><strong>${esc(s.metadata.title)}</strong><span>${fmt(s.summary.finalUsage.total)} Token · ${esc(dateText(s.metadata.rangeLastActivityAt))}</span></button>`).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
-  function selectView(view){state.view=view;state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
-  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总统计":"会话区间统计";byId("view-title").textContent=isTotal()?"全部会话消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截至 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话",fmt(summary.sessionCount),`${summary.zeroUsageSessions} 个零消耗会话`]:["轮次",fmt(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮零消耗`];const cards=[["区间总消耗",fmt(u.total),"按 token_count 快照时间归属"],["输入",fmt(u.input),`${compact(u.cached)} 来自缓存读取`],["非缓存输入",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["完整性",summary.integrityErrorCount?"存在错误":"通过",`${summary.warningCount} 条提示`]];byId("cards").innerHTML=cards.map(c=>`<article class="card"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("")}
+  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>[s.metadata.title,s.metadata.threadId,s.metadata.cwd].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>范围汇总 · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>`<button class="session-button ${state.view===s.metadata.threadId?"active":""}" data-view="${esc(s.metadata.threadId)}"><strong>${esc(s.metadata.title)}</strong><span>${fmt(s.summary.finalUsage.total)} Token · ${esc(dateText(s.metadata.rangeLastActivityAt))}</span></button>`).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
+  function selectView(view){const previousView=state.view;state.view=view;state.tab=view==="total"?"composition":previousView==="total"?"context":state.tab;state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
+  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总统计":"会话区间统计";byId("view-title").textContent=isTotal()?"全部会话消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截至 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话",fmt(summary.sessionCount),`${summary.zeroUsageSessions} 个零消耗会话`]:["轮次",fmt(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮零消耗`];const cards=[["区间总消耗",fmt(u.total),"按 token_count 快照时间归属"],["输入",fmt(u.input),`${compact(u.cached)} 来自缓存读取`],["非缓存输入",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["完整性",summary.integrityErrorCount?"存在错误":"通过",`${summary.warningCount} 条提示`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("")}
   function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个完整性错误 · 共 ${summary.warningCount} 条提示`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
   function niceTicks(max,count=5){if(max<=0)return[0];const rough=max/count,p=10**Math.floor(Math.log10(rough)),f=rough/p,n=(f<=1?1:f<=2?2:f<=5?5:10)*p,out=[];for(let x=0;x<=max+n*.25;x+=n)out.push(x);return out}
   function svgEl(name,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",name);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el} function text(svg,x,y,value,anchor="end"){const t=svgEl("text",{x,y,"text-anchor":anchor,fill:css("--muted"),"font-size":"11"});t.textContent=value;svg.appendChild(t)}
@@ -2243,7 +2300,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   function arcLinePath(cx,cy,r,start,end){const a=radialPoint(cx,cy,r,start),b=radialPoint(cx,cy,r,end),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${r},${r} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)}`}
   function arcBandPath(cx,cy,inner,outer,start,end){if(end-start<=1e-9)return"";const a=radialPoint(cx,cy,outer,start),b=radialPoint(cx,cy,outer,end),c=radialPoint(cx,cy,inner,end),d=radialPoint(cx,cy,inner,start),large=(end-start)*contextSpan>Math.PI?1:0;return`M${a.x.toFixed(2)},${a.y.toFixed(2)} A${outer},${outer} 0 ${large} 1 ${b.x.toFixed(2)},${b.y.toFixed(2)} L${c.x.toFixed(2)},${c.y.toFixed(2)} A${inner},${inner} 0 ${large} 0 ${d.x.toFixed(2)},${d.y.toFixed(2)} Z`}
   function renderContext(){
-    const panel=byId("range-context-panel");panel.hidden=isTotal();if(isTotal())return;
+    if(isTotal())return;
     const svg=byId("range-context-radial-chart");svg.replaceChildren();svg.setAttribute("viewBox","0 0 760 620");const session=activeSession(),ordered=[...(session?.turns||[])].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),cx=380,cy=300,innerBase=105,innerMax=178,outerInner=202,outerOuter=234;
     const sources=[...new Map(ordered.map(turn=>[turn.sourceRolloutId||"main",{id:turn.sourceRolloutId||"main",label:turn.sourceLabel||"主会话"}])).values()];
     byId("context-source-legend").innerHTML=sources.map(source=>`<span style="--source-color:${sourceColor(source.id)}">${esc(source.label)}</span>`).join("");
@@ -2286,14 +2343,18 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     html+=(turn.messages||[]).length?turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i?"追加用户消息":"初始用户消息"} · ${esc(dateText(m.timestamp))}</div><pre></pre></section>`).join(""):`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;byId("drawer-body").innerHTML=html;byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>pre.textContent=turn.messages[i].text);byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();renderTable();
   }
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
-  function render(){renderHeader();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
+  function setTab(tab){const contextButton=byId("tab-context"),contextDisabled=isTotal();contextButton.disabled=contextDisabled;if(contextDisabled&&tab==="context")tab="composition";if(!["composition","trend","context","table"].includes(tab))tab="composition";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab})}
+  function resetFilters(){state.query="";state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition();renderContext();renderTable()}
+  function render(){renderHeader();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
   byId("range-label").textContent=`${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate} · ${data.metadata.dateWindow.timezone}`;
   byId("nav-search").addEventListener("input",renderNav);
   byId("session-drawer-toggle").addEventListener("click",()=>setSessionNav(!state.sessionNavOpen,true));
   byId("session-drawer-close").addEventListener("click",()=>setSessionNav(false,true));
   byId("session-drawer-backdrop").addEventListener("click",()=>setSessionNav(false,true));
+  document.querySelectorAll("[data-tab-target]").forEach(button=>button.addEventListener("click",()=>setTab(button.dataset.tabTarget)));
   byId("content-search").addEventListener("input",e=>{state.query=e.target.value.trim().toLocaleLowerCase();renderComposition();renderContext();renderTable()});
   document.querySelectorAll("[data-status]").forEach(input=>input.addEventListener("change",()=>{input.checked?state.statuses.add(input.dataset.status):state.statuses.delete(input.dataset.status);renderComposition();renderContext();renderTable()}));
+  byId("reset-filters").addEventListener("click",resetFilters);
   byId("linear").addEventListener("click",()=>{state.scale="linear";byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition()});
   byId("log").addEventListener("click",()=>{state.scale="log";byId("log").classList.add("active");byId("linear").classList.remove("active");renderComposition()});
   byId("drawer-close").addEventListener("click",closeDrawer);

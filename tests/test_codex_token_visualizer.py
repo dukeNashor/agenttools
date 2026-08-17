@@ -507,6 +507,29 @@ class VisualizerTests(unittest.TestCase):
         self.assertNotIn('id="range-context-chart"', viz.RANGE_HTML_TEMPLATE)
         self.assertNotIn('id="range-context-ring-strip"', viz.RANGE_HTML_TEMPLATE)
 
+    def test_report_views_use_tabs_and_compact_summary_brief(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn("summary-brief", template)
+            self.assertIn("brief-grid", template)
+            self.assertIn("analysis-tabs", template)
+            self.assertIn('data-tab-target="context"', template)
+            self.assertIn('data-tab-target="composition"', template)
+            self.assertIn('data-tab-target="table"', template)
+            self.assertIn("setTab", template)
+            self.assertIn("analysis-controls", template)
+        self.assertIn('data-tab-target="trend"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('data-tab-target="cumulative"', viz.HTML_TEMPLATE)
+        self.assertIn("contextDisabled=isTotal()", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("reset-filters", viz.RANGE_HTML_TEMPLATE)
+
+    def test_range_report_distinguishes_total_summary_and_defaults_to_first_session(self) -> None:
+        self.assertIn("session-total-button", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("session-total-button.active", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("inset 3px 0 0 #8c6f4d", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('范围汇总 · ${sessions.length} 个会话', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('view:sessions[0]?.metadata.threadId||"total"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('tab:sessions.length?"context":"composition"', viz.RANGE_HTML_TEMPLATE)
+
     def test_subagents_render_as_outer_satellites_in_both_ring_templates(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
             self.assertIn("function radialEntries", template)
