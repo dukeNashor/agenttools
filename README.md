@@ -8,8 +8,14 @@ Generate a self-contained Chinese interactive HTML report for one local Codex th
 
 - per-turn mutually exclusive token composition;
 - total and cumulative token usage;
-- a responsive session-list drawer that switches between total statistics and individual sessions;
+- a responsive session-list drawer with a single state-aware toggle, a compact desktop rail, and mobile close affordance;
 - top-level task totals with subagent usage folded into the parent task;
+- date-range total statistics with raw per-model Token and official-rate-adjusted Sol-equivalent Token doughnut charts;
+- bold oversized diagonal session-list model labels in the lower-right corner, model-tinted backgrounds, compact model labels, and effort badges;
+- total-statistics model doughnuts with an outer per-session ring subdivided inside the matching model sector, using the same model colors; multi-model sessions are visually omitted from that outer ring;
+- hoverable outer session segments with a cursor-following session brief and synchronized sidebar highlighting;
+- total statistics with a clean overview surface; detailed search, tool, and status filters remain available inside individual sessions;
+- Spark-only sessions display `Spark` with a dedicated magenta theme and secondary `计划外` badge, while Spark remains in overall totals but excluded from plan-level model comparisons;
 - daily trends for date ranges and unified main/subagent turn timelines;
 - exact in-scope context-window snapshots placed at their turn-local Token offsets;
 - one token-progress dual-ring chart per session: a near-closed outer ring maps Token consumption, while sampled inner step bands and a prominent 100% capacity boundary map Context occupancy;
@@ -83,8 +89,19 @@ MIT
 
 - 每轮互不重叠的 Token 构成；
 - 总消耗与累计消耗；
-- 可折叠并在移动端覆盖显示的会话列表抽屉，用于切换总统计与各会话；
+- 带侧栏内左箭头关闭、桌面窄轨道右箭头重开的响应式会话列表抽屉，用于切换总统计与各会话；
 - 将子代理消耗汇入父任务的顶层会话统计；
+- 日期范围总统计中的按模型原始 Token 与官方费率折算 Sol 等价 Token 环形图，外圈在对应模型扇区内按单模型会话细分并沿用模型配色，多模型会话隐去；
+- 悬停外圈会话扇面时显示跟随鼠标的会话 Brief，并同步高亮左侧对应会话；
+- 会话列表中的右下角加粗斜向模型 Label、模型背景色、简化模型名与 effort 标签；
+- 搜索框下方提供按模型主题色显示的 Toggle，可只保留指定模型的会话；
+- 总统计模型图的外圈会话扇面支持单选与 Ctrl/Cmd/Shift 多选，并同步高亮左侧会话；单会话视图可一键定位回总统计中的对应扇面；
+- 总统计外圈会话扇面支持双击进入独立会话报告，并在会话视图顶部提供临时居中的悬浮“返回总统计”按钮；
+- 费率折算图中的 Sol 等价 Token 展示值按原始值四舍五入，扇区比例仍基于未取整数据计算；
+- 总统计保持简洁概览，搜索、工具和状态筛选保留在单独会话中；
+- 两类报告的概览数字使用 LCD 计数器风格，Token 数值从右侧每四位以窄空格分组；
+- 独立会话报告统一工具与轮次状态筛选栏，并提供原始、K、M、B 四档 Token 单位显示切换，默认使用原始值；
+- Spark-only 会话使用独立洋红主题色，显示 `Spark` 并附加 `计划外` 二级标签；同时将 Spark 保留在总 Token 中但排除出计划级模型比较，并显示排除提示；
 - 日期趋势，以及主会话／子代理统一轮次时间线；
 - 按轮内累计 Token 位置记录的全部范围内 Context 快照；
 - 每个会话一张近乎闭合的累计 Token 进度双环图：外环弧长映射 Token 消耗，内环采样阶梯及醒目的 100% 容量线映射 Context 占用率；

@@ -656,7 +656,90 @@ class VisualizerTests(unittest.TestCase):
             report = viz.build_range_report(window, roots=[Path(temp)])
         self.assertEqual(report["summary"]["sessionCount"], 0)
         self.assertEqual(report["summary"]["finalUsage"]["total"], 0)
+        self.assertEqual(report["summary"]["modelUsage"], [])
         self.assertEqual(report["sessions"], [])
+
+    def test_model_usage_keeps_multi_model_bucket_and_applies_official_rates(self) -> None:
+        turns = [
+            {
+                "models": ["gpt-5.6-sol"],
+                "usage": {"input": 100, "cached": 20, "output": 50, "total": 150},
+                "breakdown": {
+                    "cachedInput": 20,
+                    "otherNonCachedInput": 80,
+                    "ordinaryOutput": 50,
+                    "reasoningOutput": 0,
+                    "unclassified": 0,
+                },
+            },
+            {
+                "models": ["gpt-5.6-luna"],
+                "usage": {"input": 100, "cached": 20, "output": 50, "total": 150},
+                "breakdown": {
+                    "cachedInput": 20,
+                    "otherNonCachedInput": 80,
+                    "ordinaryOutput": 50,
+                    "reasoningOutput": 0,
+                    "unclassified": 0,
+                },
+            },
+            {
+                "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+                "usage": {"input": 10, "cached": 0, "output": 5, "total": 15},
+                "breakdown": {
+                    "cachedInput": 0,
+                    "otherNonCachedInput": 10,
+                    "ordinaryOutput": 5,
+                    "reasoningOutput": 0,
+                    "unclassified": 0,
+                },
+            },
+        ]
+        result = viz._model_usage_buckets(turns)
+        by_model = {entry["model"]: entry for entry in result}
+        self.assertEqual(by_model["GPT-5.6 Sol"]["rawTokens"], 150)
+        self.assertEqual(by_model["GPT-5.6 Luna"]["rawTokens"], 150)
+        self.assertEqual(by_model["GPT-5.6 Luna"]["rateMultiplier"], 0.04)
+        self.assertEqual(by_model["多模型"]["rawTokens"], 15)
+        self.assertEqual(by_model["多模型"]["rateStatus"], "fallback")
+        self.assertEqual(by_model["GPT-5.6 Sol"]["weightedTokens"], 150.0)
+        self.assertEqual(by_model["GPT-5.6 Luna"]["weightedTokens"], 6.0)
+
+    def test_spark_is_excluded_from_plan_model_buckets_but_kept_in_excluded_summary(self) -> None:
+        spark_turn = {
+            "models": ["gpt-5.3-codex-spark"],
+            "usage": {"input": 8, "cached": 0, "output": 4, "total": 12},
+        }
+        mixed_turn = {
+            "models": ["gpt-5.3-codex-spark", "gpt-5.6-luna"],
+            "usage": {"input": 10, "cached": 0, "output": 10, "total": 20},
+        }
+        buckets = viz._model_usage_buckets([spark_turn, mixed_turn])
+        excluded = viz._plan_excluded_usage([spark_turn, mixed_turn])
+        self.assertEqual([entry["model"] for entry in buckets], ["GPT-5.6 Luna"])
+        self.assertEqual(buckets[0]["rawTokens"], 20)
+        self.assertEqual(excluded, {"models": ["Spark"], "rawTokens": 12, "turnCount": 1})
+        self.assertEqual(viz._primary_model([], excluded), "Spark")
+
+    def test_range_report_records_rate_card_audit_metadata_and_session_model_identity(self) -> None:
+        root_id = "00000000-0000-0000-0000-000000000016"
+        window = viz.DateWindow.for_dates(date(2026, 1, 2), date(2026, 1, 2), local_tz=timezone.utc)
+        lines = [
+            rec("2026-01-02T00:00:00Z", "session_meta", {"id": root_id, "session_id": root_id}),
+            rec("2026-01-02T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+            rec("2026-01-02T00:00:01Z", "turn_context", {"turn_id": "t1", "model": "gpt-5.6-luna", "effort": "high"}),
+            rec("2026-01-02T00:00:02Z", "event_msg", {"type": "token_count", "info": {"total_token_usage": usage(10, 5, 2)}}),
+            rec("2026-01-02T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions"
+            sessions.mkdir()
+            self.write_named_rollout(sessions, root_id, lines)
+            report = viz.build_range_report(window, roots=[sessions])
+        self.assertEqual(report["metadata"]["rateCard"]["effectiveDate"], "2026-07-30")
+        self.assertEqual(report["metadata"]["rateCard"]["checkedAt"], viz.RATE_CARD_CHECKED_AT)
+        self.assertEqual(report["sessions"][0]["metadata"]["primaryModel"], "GPT-5.6 Luna")
+        self.assertEqual(report["sessions"][0]["metadata"]["efforts"], ["high"])
 
     def test_date_range_cli_generates_range_report(self) -> None:
         root_id = "00000000-0000-0000-0000-000000000013"
@@ -710,6 +793,19 @@ class VisualizerTests(unittest.TestCase):
         self.assertEqual(viz.main([str(path), "--strict", "--output", str(output)]), 3)
         self.assertFalse(output.exists())
 
+    def test_default_cli_mode_generates_best_effort_report(self) -> None:
+        path = self.write_rollout(
+            [
+                rec("2026-01-01T00:00:00Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+                '{"timestamp":"broken"',
+            ],
+            trailing_newline=False,
+        )
+        output = path.with_name("best-effort.html")
+        self.assertEqual(viz.main([str(path), "--output", str(output)]), 0)
+        self.assertTrue(output.exists())
+        self.assertIn('"integrityErrorCount":2', output.read_text(encoding="utf-8"))
+
     def test_exclude_messages_and_default_temp_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(viz.tempfile, "gettempdir", return_value=temp):
@@ -759,16 +855,134 @@ class VisualizerTests(unittest.TestCase):
             self.assertIn("analysis-controls", template)
         self.assertIn('data-tab-target="trend"', viz.RANGE_HTML_TEMPLATE)
         self.assertIn('data-tab-target="cumulative"', viz.HTML_TEMPLATE)
-        self.assertIn("contextDisabled=isTotal()", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('contextButton.disabled=false', viz.RANGE_HTML_TEMPLATE)
         self.assertIn("reset-filters", viz.RANGE_HTML_TEMPLATE)
 
-    def test_range_report_distinguishes_total_summary_and_defaults_to_first_session(self) -> None:
+    def test_report_summary_uses_lcd_counters_and_four_digit_token_groups(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn("formatGroupedNumber", template)
+            self.assertIn(r"/\B(?=(\d{4})+(?!\d))/g", template)
+            self.assertIn("lcd-value", template)
+            self.assertIn("font-family:ui-monospace", template)
+            self.assertIn("font-size:12px", template)
+            self.assertIn("clamp(14px,1.5vw,20px)", template)
+            self.assertIn("[KMB]?", template)
+        self.assertIn("输入 Token", viz.HTML_TEMPLATE)
+        self.assertIn("未命中缓存的输入 Token", viz.HTML_TEMPLATE)
+        self.assertIn("输出 Token", viz.HTML_TEMPLATE)
+        self.assertIn("输入 Token", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("未命中缓存的输入 Token", viz.RANGE_HTML_TEMPLATE)
+
+    def test_session_filters_share_toolbar_and_token_unit_slider(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn("filter-group", template)
+            self.assertIn("status-filter-group", template)
+            self.assertIn("summary-token-unit", template)
+            self.assertIn('data-token-unit-slider', template)
+            self.assertIn('id="token-unit-output"', template)
+            self.assertNotIn("data-token-unit value=", template)
+            self.assertIn("filter-group+ .filter-group", template)
+            self.assertIn("TOKEN_UNIT_CONFIG", template)
+            self.assertTrue('tokenUnit: "raw"' in template or 'tokenUnit:"raw"' in template)
+            self.assertIn("function setTokenUnit", template)
+            self.assertIn("formatCount", template)
+
+    def test_cumulative_token_tab_hides_tool_and_turn_filters(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertIn('data-hide-on-cumulative', template)
+        self.assertIn('tab === "cumulative"', viz.HTML_TEMPLATE)
+        self.assertIn('tab==="trend"', viz.RANGE_HTML_TEMPLATE)
+
+    def test_range_view_navigation_uses_browser_history(self) -> None:
+        self.assertIn('history.pushState', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('history.replaceState', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('window.addEventListener("popstate"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function applyView', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function navigateView', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('navigateView("total")', viz.RANGE_HTML_TEMPLATE)
+
+    def test_range_report_distinguishes_total_summary_and_defaults_to_total(self) -> None:
         self.assertIn("session-total-button", viz.RANGE_HTML_TEMPLATE)
         self.assertIn("session-total-button.active", viz.RANGE_HTML_TEMPLATE)
         self.assertIn("inset 3px 0 0 #8c6f4d", viz.RANGE_HTML_TEMPLATE)
-        self.assertIn('范围汇总 · ${sessions.length} 个会话', viz.RANGE_HTML_TEMPLATE)
-        self.assertIn('view:sessions[0]?.metadata.threadId||"total"', viz.RANGE_HTML_TEMPLATE)
-        self.assertIn('tab:sessions.length?"context":"composition"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('日期范围汇总 · ${sessions.length} 个会话', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('view:"total",tab:"context"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model-token-pie', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model-weighted-pie', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('donutSlicePath', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model-plan-note', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-button.model-watermark', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-watermark', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('rotate(-18deg)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('right:6px;bottom:16px', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('max-width:72%', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-effort', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-plan-status', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('analysis-tab-plan-status', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function isSparkOnlySession', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('sessionPlanStatus(s)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('MODEL_THEME_OVERRIDES={Spark:["#c23b75","rgba(194,59,117,.12)"]}', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('Spark', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('analysis-tab-model-label', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model=isTotal()?"多模型":sessionModel(session)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model-filter-list', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('model-filter-toggle', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('modelFilters:null', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function renderModelFilter', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('state.modelFilters.has(sessionModel(s))', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('selectedSessionIds', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function selectRingSession', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('role:"button"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('go-total-session', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function goToTotal', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('padding-left:150px', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('font-size:14px;font-weight:950', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('id="analysis-controls"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('controls.hidden=isTotal()', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('sidebar-rail-toggle', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('setSessionNav(true,true)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('setSessionNav(false,true)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function modelSliceLayout', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('usage.length!==1||usage[0].model!==model', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('modelSlice.span*entry.value/modelSlice.value', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('visual=modelVisual(model)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('hoverSessionId:null', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function setSessionHover', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function showSessionTooltip', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('returnToTotalSessionId:null', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function enterSessionFromRing', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('path.addEventListener("dblclick"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('id="return-total-from-ring"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('position:fixed', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('left:50%', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('transform:translateX(-50%)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function syncRingReturnButton', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('function pieDisplayValue', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('Math.round(Number(value)||0)', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-hovered', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('path.addEventListener("pointerenter"', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-donut-sector', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('renderSessionRing(byId("model-token-pie")', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-time', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('session-token-count', viz.RANGE_HTML_TEMPLATE)
+        self.assertNotIn('class="session-model-name"', viz.RANGE_HTML_TEMPLATE)
+        self.assertNotIn('收起会话列表', viz.RANGE_HTML_TEMPLATE)
+        self.assertNotIn('双环形图共用模型配色', viz.RANGE_HTML_TEMPLATE)
+
+    def test_report_copy_removes_chart_explanations_and_uses_natural_labels(self) -> None:
+        for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
+            self.assertNotIn("各色段互不重叠", template)
+            self.assertNotIn("按任务轮次展示线性累计 Token 使用量", template)
+            self.assertNotIn("单个双环按累计 Token 进度顺时针展开", template)
+            self.assertNotIn("数值列使用按列计算的条件格式", template)
+            self.assertNotIn("点击会话切换到统一逐轮时间线", template)
+            self.assertIn("Codex Token 使用报告", template)
+            self.assertIn("概览", template)
+            self.assertIn("清除筛选", template)
+        self.assertIn("模型消耗概览", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("按模型查看消耗", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("按费率折算的模型消耗", viz.RANGE_HTML_TEMPLATE)
+        self.assertIn("Spark 未纳入模型对比", viz.RANGE_HTML_TEMPLATE)
 
     def test_subagents_render_as_outer_satellites_in_both_ring_templates(self) -> None:
         for template in (viz.HTML_TEMPLATE, viz.RANGE_HTML_TEMPLATE):
@@ -917,7 +1131,7 @@ class VisualizerTests(unittest.TestCase):
         for element_id in (
             "report-shell",
             "session-drawer",
-            "session-drawer-toggle",
+            "sidebar-rail-toggle",
             "session-drawer-close",
             "session-drawer-backdrop",
         ):
@@ -925,6 +1139,7 @@ class VisualizerTests(unittest.TestCase):
         self.assertIn("setSessionNav", template)
         self.assertIn("session-nav-closed", template)
         self.assertIn("session-nav-modal-open", template)
+        self.assertNotIn('id="session-drawer-toggle"', template)
         self.assertNotIn("localStorage", template)
 
     def test_range_message_exclusion_also_removes_prompt_derived_titles(self) -> None:

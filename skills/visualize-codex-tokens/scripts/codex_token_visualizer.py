@@ -23,7 +23,29 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "2.8.0"
+VERSION = "2.18.0"
+
+# The range report uses the official Codex token-based rate card.  Keep the
+# effective date and the last verification timestamp next to the table so a
+# future rate-card refresh has an explicit audit point in generated reports.
+RATE_CARD_SOURCE = "https://help.openai.com/en/articles/20001106-codex-rate-card"
+RATE_CARD_EFFECTIVE_DATE = "2026-07-30"
+RATE_CARD_CHECKED_AT = "2026-08-19T02:11:22Z"
+SOL_RATE_CARD = {"input": 125.0, "cached": 12.5, "output": 750.0}
+CODEX_RATE_CARD = {
+    "gpt-5.6-sol": {"label": "GPT-5.6 Sol", **SOL_RATE_CARD},
+    "gpt-5.6-terra": {"label": "GPT-5.6 Terra", "input": 50.0, "cached": 5.0, "output": 300.0},
+    "gpt-5.6-luna": {"label": "GPT-5.6 Luna", "input": 5.0, "cached": 0.5, "output": 30.0},
+    "gpt-5.5": {"label": "GPT-5.5", **SOL_RATE_CARD},
+    "gpt-5.5-cyber": {"label": "GPT-5.5 Cyber", "input": 312.5, "cached": 31.25, "output": 1875.0},
+    "gpt-5.4": {"label": "GPT-5.4", "input": 62.5, "cached": 6.25, "output": 375.0},
+    "gpt-5.4-mini": {"label": "GPT-5.4 mini", "input": 18.75, "cached": 1.875, "output": 113.0},
+    "gpt-5.3-codex": {"label": "GPT-5.3 Codex", "input": 43.75, "cached": 4.375, "output": 350.0},
+    "gpt-5.2": {"label": "GPT-5.2", "input": 43.75, "cached": 4.375, "output": 350.0},
+    "gpt-image-2.0-image": {"label": "GPT-Image-2.0（图像）", "input": 200.0, "cached": 50.0, "output": 750.0},
+    "gpt-image-2.0-text": {"label": "GPT-Image-2.0（文本）", "input": 125.0, "cached": 31.25, "output": 250.0},
+}
+PLAN_EXCLUDED_MODEL_KEYS = frozenset({"gpt-5-3-codex-spark"})
 
 TOOL_SATELLITE_HIT_SCRIPT = """
 <style>
@@ -588,6 +610,186 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _normalized_model_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", _coerce_text(value).lower()).strip("-")
+
+
+def _is_plan_excluded_model(value: Any) -> bool:
+    return _normalized_model_name(value) in PLAN_EXCLUDED_MODEL_KEYS
+
+
+def _turn_model_names(turn: dict[str, Any]) -> list[str]:
+    names = []
+    for value in turn.get("models", []):
+        text_value = _coerce_text(value).strip()
+        if text_value and text_value not in names:
+            names.append(text_value)
+    return names
+
+
+def _model_rate_card(model: Any) -> tuple[str, dict[str, float], str]:
+    """Return a display label, rate card, and confidence for one model name."""
+
+    raw = _coerce_text(model).strip()
+    normalized = _normalized_model_name(raw)
+    aliases = {
+        "gpt-5-6": "gpt-5.6-sol",
+        "gpt-5-6-sol": "gpt-5.6-sol",
+        "gpt-5-6-terra": "gpt-5.6-terra",
+        "gpt-5-6-luna": "gpt-5.6-luna",
+        "gpt-5-5": "gpt-5.5",
+        "gpt-5-5-cyber": "gpt-5.5-cyber",
+        "gpt-5-4": "gpt-5.4",
+        "gpt-5-4-mini": "gpt-5.4-mini",
+        "gpt-5-3-codex": "gpt-5.3-codex",
+        "gpt-5-2": "gpt-5.2",
+        "gpt-image-2-0-image": "gpt-image-2.0-image",
+        "gpt-image-2-0-text": "gpt-image-2.0-text",
+    }
+    key = aliases.get(normalized)
+    if key is None:
+        key = next(
+            (candidate for candidate in CODEX_RATE_CARD if normalized == _normalized_model_name(candidate)),
+            None,
+        )
+    if key is None:
+        return raw or "未知模型", dict(SOL_RATE_CARD), "unconfigured"
+    card = CODEX_RATE_CARD[key]
+    return _coerce_text(card["label"]), card, "official"
+
+
+def _model_usage_buckets(turns: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate raw and Sol-equivalent Token usage by the model bucket.
+
+    The parser only knows the set of models observed in a turn, not a model
+    assignment for each token delta.  A turn with more than one model is kept
+    intact in the explicit 多模型 bucket rather than inventing a split.
+    """
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for turn in turns:
+        names = [name for name in _turn_model_names(turn) if not _is_plan_excluded_model(name)]
+        # Spark has a separate ChatGPT subscription quota.  A Spark-only turn
+        # remains in the report's overall totals, but is intentionally absent
+        # from plan-level model and rate-card comparisons.
+        if not names and _turn_model_names(turn):
+            continue
+        if len(names) > 1:
+            label = "多模型"
+            card = dict(SOL_RATE_CARD)
+            confidence = "fallback"
+        elif names:
+            label, card, confidence = _model_rate_card(names[0])
+        else:
+            label = "未知模型"
+            card = dict(SOL_RATE_CARD)
+            confidence = "unconfigured"
+
+        usage = Usage.from_dict(turn.get("usage"))
+        breakdown = turn.get("breakdown") or {}
+        cached = _as_nonnegative_int(breakdown.get("cachedInput", usage.cached))
+        cache_write = _as_nonnegative_int(breakdown.get("cacheWriteInput", usage.cache_write))
+        other_input = _as_nonnegative_int(
+            breakdown.get("otherNonCachedInput", max(0, usage.input - cached - cache_write))
+        )
+        ordinary_output = _as_nonnegative_int(
+            breakdown.get("ordinaryOutput", max(0, usage.output - usage.reasoning))
+        )
+        reasoning_output = _as_nonnegative_int(
+            breakdown.get("reasoningOutput", min(usage.reasoning, usage.output))
+        )
+        unclassified = _as_nonnegative_int(breakdown.get("unclassified", 0))
+        output = ordinary_output + reasoning_output + unclassified
+        credits = (
+            other_input * card["input"]
+            + cached * card["cached"]
+            + output * card["output"]
+        ) / 1_000_000
+        sol_equivalent_tokens = (
+            other_input * card["input"] / SOL_RATE_CARD["input"]
+            + cached * card["cached"] / SOL_RATE_CARD["cached"]
+            + output * card["output"] / SOL_RATE_CARD["output"]
+        )
+        bucket = buckets.setdefault(
+            label,
+            {
+                "model": label,
+                "rawTokens": 0,
+                "weightedTokens": 0.0,
+                "costCredits": 0.0,
+                "rateMultiplier": None,
+                "rateStatus": confidence,
+            },
+        )
+        bucket["rawTokens"] += usage.total
+        bucket["weightedTokens"] += sol_equivalent_tokens
+        bucket["costCredits"] += credits
+        if bucket["rateStatus"] == "official" and confidence != "official":
+            bucket["rateStatus"] = confidence
+
+    result = []
+    for bucket in buckets.values():
+        label = bucket["model"]
+        _, card, confidence = _model_rate_card(label)
+        if label in {"多模型", "未知模型"}:
+            card = dict(SOL_RATE_CARD)
+            confidence = "fallback" if label == "多模型" else "unconfigured"
+        ratios = [
+            card["input"] / SOL_RATE_CARD["input"],
+            card["cached"] / SOL_RATE_CARD["cached"],
+            card["output"] / SOL_RATE_CARD["output"],
+        ]
+        multiplier = ratios[0] if max(ratios) - min(ratios) < 1e-9 else None
+        bucket["rateMultiplier"] = round(multiplier, 6) if multiplier is not None else None
+        bucket["rateStatus"] = confidence if bucket["rateStatus"] == "official" else bucket["rateStatus"]
+        bucket["weightedTokens"] = round(bucket["weightedTokens"], 4)
+        bucket["costCredits"] = round(bucket["costCredits"], 6)
+        result.append(bucket)
+    return sorted(result, key=lambda item: (-item["weightedTokens"], item["model"]))
+
+
+def _plan_excluded_usage(turns: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize usage omitted from plan-level model comparisons."""
+
+    model_names: set[str] = set()
+    raw_tokens = 0
+    turn_count = 0
+    for turn in turns:
+        names = _turn_model_names(turn)
+        if not names or any(not _is_plan_excluded_model(name) for name in names):
+            continue
+        usage = Usage.from_dict(turn.get("usage"))
+        raw_tokens += usage.total
+        turn_count += 1
+        model_names.update(names)
+    return {
+        "models": sorted("Spark" if _is_plan_excluded_model(name) else name for name in model_names),
+        "rawTokens": raw_tokens,
+        "turnCount": turn_count,
+    }
+
+
+def _primary_model(
+    model_usage: list[dict[str, Any]], plan_excluded_usage: dict[str, Any] | None = None
+) -> str:
+    if model_usage:
+        return model_usage[0]["model"]
+    if plan_excluded_usage and plan_excluded_usage.get("rawTokens", 0):
+        return "Spark"
+    return "未知模型"
+
+
+def _efforts_from_turns(turns: Iterable[dict[str, Any]]) -> list[str]:
+    return sorted(
+        {
+            text_value
+            for turn in turns
+            for value in turn.get("efforts", [])
+            if (text_value := _coerce_text(value).strip())
+        }
+    )
 
 
 def _response_item_text(payload: dict[str, Any]) -> str:
@@ -1931,6 +2133,8 @@ def build_range_report(
         for turn in turns:
             status = _coerce_text(turn.get("status")) or "incomplete"
             status_counts[status] = status_counts.get(status, 0) + 1
+        model_usage = _model_usage_buckets(turns)
+        plan_excluded_usage = _plan_excluded_usage(turns)
         daily = _merge_daily_usage(active_members)
         first_activity = min(
             (
@@ -2005,6 +2209,8 @@ def build_range_report(
                 "toolUnknownCallCount": tool_stats["unknownCallCount"],
                 "toolUsage": tool_stats["usage"],
                 "toolCategories": tool_stats["categories"],
+                "modelUsage": model_usage,
+                "planExcludedUsage": plan_excluded_usage,
             },
             "warnings": member_warnings,
             "orphanMessages": [
@@ -2014,6 +2220,10 @@ def build_range_report(
             ],
             "turns": turns,
         }
+        session["metadata"]["primaryModel"] = _primary_model(model_usage, plan_excluded_usage)
+        session["metadata"]["efforts"] = _efforts_from_turns(turns)
+        session["metadata"]["modelUsage"] = model_usage
+        session["metadata"]["planExcludedUsage"] = plan_excluded_usage
         sessions.append(session)
 
     sessions.sort(
@@ -2035,6 +2245,9 @@ def build_range_report(
         total_usage, cache_write_available
     )
     daily_usage = _merge_daily_usage(sessions)
+    all_turns = [turn for session in sessions for turn in session.get("turns", [])]
+    model_usage = _model_usage_buckets(all_turns)
+    plan_excluded_usage = _plan_excluded_usage(all_turns)
     status_counts: dict[str, int] = {"complete": 0, "aborted": 0, "incomplete": 0}
     for session in sessions:
         for status, count in session.get("summary", {}).get("statusCounts", {}).items():
@@ -2055,6 +2268,11 @@ def build_range_report(
                 for session in sessions
             ),
             "hasToolEvents": total_tool_stats["callCount"] > 0,
+            "rateCard": {
+                "source": RATE_CARD_SOURCE,
+                "effectiveDate": RATE_CARD_EFFECTIVE_DATE,
+                "checkedAt": RATE_CARD_CHECKED_AT,
+            },
             "sourceRoots": [
                 str(path)
                 for path in (list(roots) if roots is not None else default_session_roots())
@@ -2082,6 +2300,8 @@ def build_range_report(
             "toolUnknownCallCount": total_tool_stats["unknownCallCount"],
             "toolUsage": total_tool_stats["usage"],
             "toolCategories": total_tool_stats["categories"],
+            "modelUsage": model_usage,
+            "planExcludedUsage": plan_excluded_usage,
         },
         "warnings": all_warnings,
         "sessions": sessions,
@@ -2145,6 +2365,12 @@ h1 { font-size: clamp(28px, 4vw, 48px); line-height:1.08; margin:7px 0 10px; let
 .brief-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:9px; color:var(--muted); font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
 .brief-head .sensitive { font-size:10px; letter-spacing:0; text-transform:none; padding:4px 8px; }
 .brief-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 16px; }
+.summary-token-unit { display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:10px; padding-top:10px; border-top:1px solid rgba(126,111,91,.18); }
+.summary-token-unit-label { color:var(--muted); font-size:10px; font-weight:800; white-space:nowrap; }
+.token-unit-slider { display:grid; grid-template-columns:minmax(140px,190px) auto; gap:1px 9px; align-items:center; }
+.token-unit-slider input[type="range"] { width:100%; margin:0; accent-color:var(--accent); cursor:pointer; }
+.token-unit-slider output { min-width:30px; color:var(--accent); font-size:11px; font-weight:850; text-align:right; }
+.token-unit-scale { grid-column:1 / -1; display:flex; justify-content:space-between; color:var(--muted); font-size:9px; line-height:1; }
 .brief-item { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:baseline; padding-bottom:6px; border-bottom:1px solid rgba(126,111,91,.16); }
 .brief-item .label { color:var(--muted); font-size:10px; }
 .brief-item .value { margin:0; font-size:16px; font-weight:760; font-variant-numeric:tabular-nums; text-align:right; }
@@ -2312,19 +2538,32 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
 <style>
 .hero-copy{min-width:0;flex:1}.summary-brief{width:min(560px,48%);padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:rgba(255,254,250,.86);box-shadow:var(--shadow)}.brief-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.brief-head .sensitive{font-size:10px;letter-spacing:0;text-transform:none;padding:4px 8px}.brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}.brief-item{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:baseline;padding-bottom:6px;border-bottom:1px solid rgba(126,111,91,.16)}.brief-item .label{color:var(--muted);font-size:10px}.brief-item .value{margin:0;font-size:16px;font-weight:760;font-variant-numeric:tabular-nums;text-align:right}.brief-item .note{grid-column:1 / -1;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.analysis-shell{margin-top:16px}.analysis-tabs{display:flex;gap:5px;padding:5px;border:1px solid var(--border);border-radius:13px 13px 0 0;background:var(--panel2);overflow-x:auto}.analysis-tab{flex:1 0 auto;border:1px solid transparent;border-radius:9px;padding:9px 13px;background:transparent;color:var(--muted);font-size:12px;font-weight:750;white-space:nowrap}.analysis-tab:hover,.analysis-tab.active{border-color:var(--accent);background:var(--panel);color:var(--accent)}.analysis-tab:disabled{cursor:not-allowed;opacity:.42}.analysis-controls{padding:14px 0 0}.analysis-controls .filters{padding-left:0;padding-right:0}.tab-panel{margin-top:12px}.tab-panel[hidden]{display:none}
 @media(max-width:650px){.summary-brief{width:100%}.brief-grid{gap:7px 12px}}
+.session-button.model-watermark{position:relative;isolation:isolate;overflow:hidden;background:var(--model-tint,transparent);border-color:color-mix(in srgb,var(--model-color,var(--border)) 24%,transparent)}.session-button.model-watermark::after{content:attr(data-model-watermark);position:absolute;z-index:0;right:-8px;bottom:-10px;color:var(--model-color,var(--muted));font-size:27px;font-weight:850;letter-spacing:-.07em;line-height:1;opacity:.14;pointer-events:none;white-space:nowrap;transform:rotate(-10deg);transform-origin:right bottom}.session-button.model-watermark>strong,.session-button.model-watermark>span{position:relative;z-index:1}.session-button.model-watermark:hover,.session-button.model-watermark.active{background:linear-gradient(135deg,var(--model-tint,transparent),var(--panel));border-color:var(--model-color,var(--accent))}.session-effort{display:inline-flex!important;width:max-content;max-width:100%;padding:2px 6px;border:1px solid color-mix(in srgb,var(--model-color,var(--muted)) 35%,var(--border));border-radius:999px;color:var(--model-color,var(--muted))!important;background:rgba(255,254,250,.62);font-size:10px!important;line-height:1.25}
+.session-button.model-watermark::after{display:none}.session-button.model-watermark>.session-watermark{position:absolute;right:6px;bottom:16px;z-index:0;display:block;max-width:72%;overflow:hidden;text-overflow:ellipsis;color:var(--model-color,var(--muted));opacity:.34;font-size:38px;font-weight:950;letter-spacing:-.055em;line-height:.9;text-align:right;white-space:nowrap;transform:rotate(-18deg);transform-origin:right bottom;pointer-events:none;filter:saturate(1.45);text-shadow:0 1px 0 rgba(255,254,250,.18)}.session-button.model-watermark>.session-watermark~strong,.session-button.model-watermark>.session-watermark~span{position:relative;z-index:1}
+</style>
+<style>
+.summary-token-unit{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(126,111,91,.18)}.summary-token-unit-label{color:var(--muted);font-size:10px;font-weight:800;white-space:nowrap}.token-unit-slider{display:grid;grid-template-columns:minmax(140px,190px) auto;gap:1px 9px;align-items:center}.token-unit-slider input[type="range"]{width:100%;margin:0;accent-color:var(--accent);cursor:pointer}.token-unit-slider output{min-width:30px;color:var(--accent);font-size:11px;font-weight:850;text-align:right}.token-unit-scale{grid-column:1 / -1;display:flex;justify-content:space-between;color:var(--muted);font-size:9px;line-height:1}
+h1{font-size:clamp(14px,1.5vw,20px)}
+.brief-item .label{font-size:12px}
+.brief-item .value.lcd-value{min-width:0;margin:0;padding:4px 8px;border:1px solid #3e7e6c;border-radius:7px;background:linear-gradient(180deg,#17372f,#102a25);color:#a6f3c9;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:18px;font-weight:800;letter-spacing:.035em;line-height:1.2;white-space:nowrap;text-shadow:0 0 5px rgba(166,243,201,.6);box-shadow:inset 0 2px 8px rgba(0,0,0,.28),0 2px 0 rgba(255,254,250,.4);font-variant-numeric:tabular-nums}
+@media(max-width:650px){.brief-item .value.lcd-value{font-size:16px;padding:3px 6px}}
+.hero-title-row{display:flex;align-items:center;min-width:0}.hero-title-row h1{min-width:0}.ring-return-button{position:fixed;z-index:120;top:14px;left:50%;transform:translateX(-50%);border:1px solid var(--accent);border-radius:999px;padding:8px 15px;background:rgba(255,254,250,.94);backdrop-filter:blur(12px);color:var(--accent);font-size:11px;font-weight:800;white-space:nowrap;box-shadow:0 8px 24px rgba(45,41,36,.18),0 0 0 3px rgba(59,139,120,.08)}.ring-return-button:hover,.ring-return-button:focus-visible{background:#fffefa;box-shadow:0 10px 28px rgba(45,41,36,.22),0 0 0 4px rgba(59,139,120,.14);outline:none}
+@media(max-width:650px){.ring-return-button{top:10px;padding:7px 13px}}
+.filter-row,.filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted)}.filter-row input[type="search"],.filters .content-search{min-width:min(100%,320px);flex:1}.filter-group{display:flex;align-items:center;gap:7px;margin:0;padding:0;border:0}.filter-group+ .filter-group{padding-left:12px;border-left:1px solid rgba(126,111,91,.3)}.filter-group legend{padding:0;color:var(--muted);font-size:10px;font-weight:800;white-space:nowrap}.filter-options{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.filter-option{display:inline-flex;align-items:center;gap:4px;padding:4px 7px;border:1px solid rgba(126,111,91,.24);border-radius:999px;background:rgba(255,254,250,.62);font-size:11px;line-height:1.2;white-space:nowrap}.filter-option:has(input:checked){border-color:var(--accent);color:var(--accent);background:rgba(59,139,120,.08)}.filter-option input{accent-color:var(--accent);margin:0}.filter-row>.check,.filters>.check{display:inline-flex;align-items:center;gap:4px}.filter-row>#visible-count,.filters>#visible-count{font-size:11px;white-space:nowrap}.token-unit-group .filter-option{min-width:28px;justify-content:center}.token-unit-group .filter-option:first-child{padding-left:8px;padding-right:8px}@media(max-width:720px){.filter-group+ .filter-group{padding-top:9px;padding-left:0;border-top:1px solid rgba(126,111,91,.3);border-left:0}.filter-row,.filters{align-items:stretch}.filter-group{width:100%}.filter-row input[type="search"],.filters .content-search{flex-basis:100%}}
 </style>
 </head>
 <body>
 <main>
   <section class="hero">
     <div class="hero-copy">
-      <div class="eyebrow">Codex Token 使用分析</div>
-      <h1>线程逐轮消耗</h1>
+      <div class="eyebrow">Codex Token 使用报告</div>
+      <h1>线程 Token 消耗</h1>
       <div class="subline" id="thread-meta"></div>
     </div>
-    <aside class="summary-brief" aria-label="报告摘要">
-      <div class="brief-head"><span>报告摘要</span><span class="sensitive" id="privacy-indicator"></span></div>
+    <aside class="summary-brief" aria-label="概览">
+      <div class="brief-head"><span>概览</span><span class="sensitive" id="privacy-indicator"></span></div>
       <div class="brief-grid" id="summary-cards"></div>
+      <div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="0" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">原始</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div>
     </aside>
   </section>
 
@@ -2334,11 +2573,11 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   </details>
 
   <section class="analysis-shell">
-    <nav class="analysis-tabs" role="tablist" aria-label="统计视图">
-      <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">Context 双环</button>
-      <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">每轮 Token 构成</button>
-      <button class="analysis-tab" id="tab-cumulative" data-tab-target="cumulative" role="tab" aria-selected="false" type="button">累计总消耗</button>
-      <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">轮次明细</button>
+    <nav class="analysis-tabs" role="tablist" aria-label="查看方式">
+      <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">Token 与 Context</button>
+      <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">单轮 Token 构成</button>
+      <button class="analysis-tab" id="tab-cumulative" data-tab-target="cumulative" role="tab" aria-selected="false" type="button">累计 Token</button>
+      <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">逐轮明细</button>
     </nav>
     <div class="analysis-controls">
       <div class="range-row">
@@ -2353,20 +2592,22 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
         </div>
       </div>
       <div class="filter-row">
-        <input id="search" type="search" placeholder="搜索完整用户消息、轮次 ID、模型……">
-        <fieldset class="tool-filter-group" id="tool-filter" aria-label="工具类型筛选"><legend>工具</legend><div class="tool-filter-list" id="tool-filter-list"></div></fieldset>
-        <label class="check"><input type="checkbox" data-status="complete" checked> 已完成</label>
-        <label class="check"><input type="checkbox" data-status="aborted" checked> 已中止</label>
-        <label class="check"><input type="checkbox" data-status="incomplete" checked> 未闭合</label>
+        <input id="search" type="search" placeholder="搜索用户消息、轮次 ID 或模型……">
+        <fieldset class="filter-group tool-filter-group" id="tool-filter" data-hide-on-cumulative aria-label="按工具类型筛选"><legend>工具</legend><div class="filter-options tool-filter-list" id="tool-filter-list"></div></fieldset>
+        <fieldset class="filter-group status-filter-group" data-hide-on-cumulative aria-label="按轮次状态筛选"><legend>轮次</legend><div class="filter-options status-filter-list">
+          <label class="filter-option"><input type="checkbox" data-status="complete" checked> 已完成</label>
+          <label class="filter-option"><input type="checkbox" data-status="aborted" checked> 已中止</label>
+          <label class="filter-option"><input type="checkbox" data-status="incomplete" checked> 未闭合</label>
+        </div></fieldset>
         <span id="visible-count"></span>
-        <button id="reset-button" type="button">重置筛选</button>
+        <button id="reset-button" type="button">清除筛选</button>
       </div>
     </div>
   </section>
 
   <section class="panel tab-panel" data-tab-panel="composition" role="tabpanel" hidden>
     <div class="panel-head">
-      <div><h2>每轮 Token 构成</h2><p>各色段互不重叠，柱形总高度等于该轮总消耗。</p></div>
+      <div><h2>单轮 Token 构成</h2></div>
       <div class="controls">
         <button id="linear-button" class="active" type="button">线性</button>
         <button id="log-button" type="button">对数</button>
@@ -2377,29 +2618,29 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   </section>
 
   <section class="panel tab-panel" data-tab-panel="cumulative" role="tabpanel" hidden>
-    <div class="panel-head"><div><h2>累计总消耗</h2><p>按任务轮次展示线性累计 Token 使用量。</p></div></div>
+    <div class="panel-head"><div><h2>累计 Token</h2></div></div>
     <div class="cumulative-wrap"><svg id="cumulative-chart" role="img" aria-label="累计 Token 使用图表"></svg></div>
   </section>
 
   <section class="panel tab-panel" data-tab-panel="context" role="tabpanel">
     <div class="panel-head">
-      <div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开：外环弧长表示 Token 消耗，内环按轮内快照位置阶梯展示 Context 占用率。</p></div>
+      <div><h2>Token 消耗与 Context 占用</h2></div>
     </div>
     <div class="context-source-legend" id="context-source-legend"></div>
     <div class="context-radial-wrap"><svg id="context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div>
   </section>
 
   <section class="panel tab-panel" data-tab-panel="table" role="tabpanel" hidden>
-    <div class="panel-head"><div><h2>轮次明细</h2><p>数值列使用按列计算的条件格式；点击行或柱形可查看完整用户消息。</p></div></div>
+    <div class="panel-head"><div><h2>逐轮明细</h2></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
           <th data-sort="index">轮次</th><th data-sort="status">状态</th><th data-sort="startedAt">开始时间</th>
-          <th data-sort="modelResponses">模型响应</th><th data-sort="cachedInput">缓存读取</th>
+          <th data-sort="modelResponses">模型响应</th><th data-sort="cachedInput">缓存输入</th>
           <th data-sort="cacheWriteInput">缓存写入</th><th data-sort="otherNonCachedInput">其他输入</th>
           <th data-sort="ordinaryOutput">普通输出</th><th data-sort="reasoningOutput">推理输出</th>
-          <th data-sort="total">总量</th><th data-sort="cacheRate">缓存率</th>
-          <th data-sort="contextTokens">上下文占用</th><th data-sort="contextRate">上下文率</th><th data-sort="prompt">用户消息</th>
+          <th data-sort="total">Token 总量</th><th data-sort="cacheRate">缓存命中率</th>
+          <th data-sort="contextTokens">Context 占用</th><th data-sort="contextRate">Context 占用率</th><th data-sort="prompt">用户输入</th>
         </tr></thead>
         <tbody id="turn-table-body"></tbody>
       </table>
@@ -2428,14 +2669,14 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     reasoningOutput: css("--reasoning"), unclassified: css("--unclassified")
   };
   const segmentLabels = {
-    cachedInput: "缓存读取", cacheWriteInput: "缓存写入",
+    cachedInput: "缓存输入", cacheWriteInput: "缓存写入",
     otherNonCachedInput: cacheWriteAvailable ? "其他非缓存输入" : "非缓存输入（日志未提供写入明细）",
     ordinaryOutput: "普通输出", reasoningOutput: "推理输出", unclassified: "未分类调整"
   };
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
   const DEFAULT_TOOL_CATEGORIES = ["computer-use", "chrome-use", "imagegen", "web-search"];
-  const state = { tab: "context", scale: "linear", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
+  const state = { tab: "context", scale: "linear", tokenUnit: "raw", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
   const tooltip = byId("turn-tooltip");
   const TOOLTIP_MESSAGE_LIMIT = 800;
   const toolLabels = {"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
@@ -2444,14 +2685,17 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   function byId(id) { return document.getElementById(id); }
   function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function esc(value) { return String(value ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[ch]); }
-  function formatTokens(value) { return Number(value || 0).toLocaleString(); }
-  function compact(value) {
-    const n = Number(value || 0), abs = Math.abs(n);
-    if (abs >= 1e9) return (n / 1e9).toFixed(abs >= 1e10 ? 1 : 2).replace(/\.0+$/, "") + "B";
-    if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 1 : 2).replace(/\.0+$/, "") + "M";
-    if (abs >= 1e3) return (n / 1e3).toFixed(abs >= 1e4 ? 1 : 2).replace(/\.0+$/, "") + "K";
-    return String(n);
-  }
+  function formatGroupedNumber(value) { const n = Number(value || 0); if (!Number.isFinite(n)) return "0"; const sign = n < 0 ? "-" : "", parts = String(Math.abs(n)).split("."), integer = parts[0].replace(/\B(?=(\d{4})+(?!\d))/g, "\u2009"); return sign + integer + (parts[1] ? "." + parts[1] : ""); }
+  const TOKEN_UNIT_CONFIG = { raw: { divisor: 1, suffix: "" }, K: { divisor: 1e3, suffix: "K" }, M: { divisor: 1e6, suffix: "M" }, B: { divisor: 1e9, suffix: "B" } };
+  const TOKEN_UNIT_ORDER = ["raw", "K", "M", "B"];
+  const TOKEN_UNIT_LABELS = { raw: "原始", K: "K", M: "M", B: "B" };
+  function formatTokenDisplay(value) { const n = Number(value || 0); if (!Number.isFinite(n)) return "0"; const config = TOKEN_UNIT_CONFIG[state.tokenUnit] || TOKEN_UNIT_CONFIG.raw; if (state.tokenUnit === "raw") return formatGroupedNumber(n); return (n / config.divisor).toFixed(1).replace(/\.0$/, "") + config.suffix; }
+  function formatTokens(value) { return formatTokenDisplay(value); }
+  function formatCount(value) { return formatGroupedNumber(value); }
+  function isLcdValue(value) { return /^[\d\u2009.\-]+[KMB]?$/.test(String(value)); }
+  function compact(value) { return formatTokenDisplay(value); }
+  function syncTokenUnitInputs() { const slider = byId("token-unit-slider"), output = byId("token-unit-output"), index = TOKEN_UNIT_ORDER.indexOf(state.tokenUnit); if (slider) slider.value = String(Math.max(0, index)); if (output) output.textContent = TOKEN_UNIT_LABELS[state.tokenUnit] || TOKEN_UNIT_LABELS.raw; }
+  function setTokenUnit(unit) { if (!TOKEN_UNIT_CONFIG[unit]) return; state.tokenUnit = unit; syncTokenUnitInputs(); renderHeader(); renderAll(); }
   function dateText(value) { if (!value) return "—"; const d = new Date(value); return Number.isNaN(d.valueOf()) ? value : d.toLocaleString("zh-CN"); }
   function durationText(ms) {
     if (ms == null) return "—"; const seconds = ms / 1000;
@@ -2469,23 +2713,23 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     const privacy = byId("privacy-indicator");
     privacy.textContent = messagesIncluded ? "包含完整用户消息" : "未包含用户消息";
     privacy.classList.toggle("safe", !messagesIncluded);
-    byId("search").placeholder = messagesIncluded ? "搜索完整用户消息、轮次 ID、模型……" : "搜索轮次 ID、模型……";
+    byId("search").placeholder = messagesIncluded ? "搜索用户消息、轮次 ID 或模型……" : "搜索轮次 ID 或模型……";
     const u = report.summary.finalUsage;
     const cards = [
-      ["累计总消耗", formatTokens(u.total), "全部模型响应的输入与输出之和"],
-      ["输入", formatTokens(u.input), `${compact(u.cached)} 来自缓存读取`],
-      ["非缓存输入", formatTokens(Math.max(0, u.input - u.cached)), `缓存命中率 ${(u.input ? 100*u.cached/u.input : 0).toFixed(2)}%`],
-      ["输出", formatTokens(u.output), `${compact(u.reasoning)} 为推理输出`],
-      ["轮次", formatTokens(report.summary.turnCount), `${report.summary.statusCounts.aborted || 0} 轮中止 · ${report.summary.zeroUsageTurns} 轮零消耗`],
-      ["对账", reconciliationOk() ? "完全一致" : "存在差异", reconciliationOk() ? "逐轮总和与最终计数闭合" : "请查看完整性警告"]
+      ["累计 Token", formatTokens(u.total), "全部模型响应的输入与输出总和"],
+      ["输入 Token", formatTokens(u.input), `${compact(u.cached)} 来自缓存`],
+      ["未命中缓存的输入 Token", formatTokens(Math.max(0, u.input - u.cached)), `缓存命中率 ${(u.input ? 100*u.cached/u.input : 0).toFixed(2)}%`],
+      ["输出 Token", formatTokens(u.output), `${compact(u.reasoning)} 为推理输出`],
+      ["轮次", formatCount(report.summary.turnCount), `${report.summary.statusCounts.aborted || 0} 轮中止 · ${report.summary.zeroUsageTurns} 轮零消耗`],
+      ["一致性", reconciliationOk() ? "完全一致" : "存在差异", reconciliationOk() ? "逐轮总和与最终计数一致" : "请查看数据完整性提醒"]
     ];
-    byId("summary-cards").innerHTML = cards.map(([label,value,note]) => `<article class="brief-item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join("");
+    byId("summary-cards").innerHTML = cards.map(([label,value,note]) => `<article class="brief-item"><div class="label">${esc(label)}</div><div class="value${isLcdValue(value) ? " lcd-value" : ""}">${esc(value)}</div><div class="note">${esc(note)}</div></article>`).join("");
     byId("footer").textContent = `生成时间：${dateText(report.metadata.generatedAt)} · 工具：${report.generator.name} ${report.generator.version} · 来源：${report.metadata.sourcePath}`;
   }
 
   function renderWarnings() {
     const list = byId("warning-list"), box = byId("warning-box");
-    byId("warning-summary").textContent = `${report.summary.integrityErrorCount} 个完整性错误 · 共 ${report.summary.warningCount} 条提示`;
+    byId("warning-summary").textContent = `${report.summary.integrityErrorCount} 个数据完整性问题 · 共 ${report.summary.warningCount} 条提醒`;
     if (!report.warnings.length) { box.hidden = true; return; }
     list.innerHTML = report.warnings.map(w => `<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.line ? ` · 第 ${w.line} 行` : ""}${w.turnId ? ` · ${esc(w.turnId)}` : ""}：${esc(w.message)}</li>`).join("");
     box.open = report.summary.integrityErrorCount > 0;
@@ -2506,6 +2750,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     byId("log-button").addEventListener("click", () => setScale("log"));
     byId("search").addEventListener("input", event => { state.search = event.target.value.trim().toLocaleLowerCase(); renderAll(); });
     populateToolFilter();
+    byId("token-unit-slider").addEventListener("input", event => setTokenUnit(TOKEN_UNIT_ORDER[Number(event.target.value)] || "raw"));
     document.querySelectorAll("[data-status]").forEach(input => input.addEventListener("change", () => {
       if (input.checked) state.statuses.add(input.dataset.status); else state.statuses.delete(input.dataset.status); renderAll();
     }));
@@ -2535,6 +2780,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     state.tab = tab;
     document.querySelectorAll("[data-tab-target]").forEach(button => { const active = button.dataset.tabTarget === tab; button.classList.toggle("active", active); button.setAttribute("aria-selected", String(active)); });
     document.querySelectorAll("[data-tab-panel]").forEach(panel => { panel.hidden = panel.dataset.tabPanel !== tab; });
+    document.querySelectorAll("[data-hide-on-cumulative]").forEach(control => { control.hidden = tab === "cumulative"; });
   }
   function setScale(scale) { state.scale = scale; syncScaleButtons(); renderTurnChart(filteredTurns()); }
   function syncScaleButtons() { byId("linear-button").classList.toggle("active", state.scale === "linear"); byId("log-button").classList.toggle("active", state.scale === "log"); }
@@ -2557,7 +2803,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   function filteredTurns() { return turns.filter(turnMatchesFilter); }
   function renderAll() {
     byId("range-start-value").textContent = state.start; byId("range-end-value").textContent = state.end; updateRangeFill();
-    const visible = filteredTurns(); byId("visible-count").textContent = `当前显示 ${visible.length} 轮`;
+    const visible = filteredTurns(); byId("visible-count").textContent = `显示 ${visible.length} 轮`;
     renderTurnChart(visible); renderTable(visible); renderCumulative(); renderContextRadial();
   }
 
@@ -2626,7 +2872,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
     const contextDelta = previousSnapshot?.occupancyRate == null || snapshot.occupancyRate == null ? "" : (() => { const delta=Number(snapshot.occupancyRate)-Number(previousSnapshot.occupancyRate); if (Math.abs(delta)<0.005) return "无变化"; return delta>0 ? `增加了 ${delta.toFixed(2)}%` : `减少了 ${Math.abs(delta).toFixed(2)}%`; })();
     tooltip.innerHTML = `<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div>`
       + `<div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div>`
-      + `<div class="tooltip-grid"><span>来源</span><b>${esc(sourceLabel(turn))}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${formatTokens(turn.compactions)}</b></div>`
+      + `<div class="tooltip-grid"><span>来源</span><b>${esc(sourceLabel(turn))}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${formatCount(turn.compactions)}</b></div>`
       + `<div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${formatTokens(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div>`
       + `<div class="tooltip-section"><div class="tooltip-section-label">${tooltipMessageLabel(turn)}</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;
     positionTooltip(event,target);
@@ -2672,7 +2918,7 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
   function toolCallColor(call){return toolColors[call.category]||toolColors.other}
   function toolField(call,key){return Array.isArray(call.usageKnown)&&call.usageKnown.includes(key)?formatTokens(call.usage?.[key]||0):"未知"}
   function toolUsage(call){return Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?Math.max(0,Number(call.usage?.total)||0):0}
-  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?`${formatTokens(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>语义工具</span><b>${esc(call.semanticTool||toolCallLabel(call))}</b><span>Provider</span><b>${esc(call.provider||"未知")}</b><span>识别方式</span><b>${esc(call.classificationSource||"raw")}</b><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${formatTokens(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
+  function toolTooltip(event,turn,call,target){const usage=toolUsage(call),status=Array.isArray(call.usageKnown)&&call.usageKnown.includes("total")?`${formatTokens(usage)} Token`:"Token 未知";tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(toolCallLabel(call))}</strong><span class="tooltip-badge">第 ${turn.index} 轮</span></div><div class="tooltip-grid"><span>语义工具</span><b>${esc(call.semanticTool||toolCallLabel(call))}</b><span>Provider</span><b>${esc(call.provider||"未知")}</b><span>识别方式</span><b>${esc(call.classificationSource||"raw")}</b><span>原始工具名</span><b>${esc(call.rawName||call.name||"未知")}</b><span>调用序号</span><b>#${formatCount(call.sequence||0)}</b><span>时间</span><b>${esc(dateText(call.timestamp))}</b><span>状态</span><b>${esc(call.status||"未知")}</b><span>Token</span><b>${esc(status)}</b></div>`;positionTooltip(event,target)}
   function openToolDrawer(turn,call){if(!turn||!call)return;state.selected=turn.turnId;byId("drawer-title").textContent=`${toolCallLabel(call)} · 第 ${turn.index} 轮`;const usage=call.usage||{},details=[["工具分类",toolCallLabel(call)],["语义工具",call.semanticTool||"未知"],["Provider",call.provider||"未知"],["识别方式",call.classificationSource||"raw"],["原始工具名",call.rawName||call.name||"未知"],["传输包装",call.transportWrapper?"是":"否"],["调用序号",`#${call.sequence||"—"}`],["调用时间",dateText(call.timestamp)],["结束时间",dateText(call.endedAt)],["状态",call.status||"未知"],["Token 归因",call.usageReported?"精确":"未知"],["总 Token",toolField(call,"total")],["输入",toolField(call,"input")],["缓存输入",toolField(call,"cached")],["输出",toolField(call,"output")],["推理输出",toolField(call,"reasoning")]];byId("drawer-body").innerHTML=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div><div class="message"><div class="message-head">父 turn</div><pre>第 ${turn.index} 轮 · ${esc(turn.turnId)} · ${formatTokens(turn.usage.total)} Token</pre></div>`;byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContextRadial();}
   function toolSatelliteGeometry(cx,cy,outerOuter,index){const inner=outerOuter+76+(index%3)*14;return{inner,outer:inner+9}}
   function renderToolLayer(svg,entries,cx,cy,outerOuter,denominator){entries.forEach(entry=>{const calls=(entry.turn.toolCalls||[]).filter(call=>state.toolCategories.has(call.category));if(!calls.length)return;const parentSpan=Math.max(0,entry.end-entry.start),envelopeStart=parentSpan?entry.start:Math.max(0,entry.start-.006),envelopeEnd=parentSpan?entry.end:Math.min(1,entry.start+.012),envelopePath=arcBandPath(cx,cy,outerOuter+54,outerOuter+60,envelopeStart,envelopeEnd);if(envelopePath)svg.appendChild(svgEl("path",{d:envelopePath,class:"tool-envelope"}));const exact=calls.reduce((sum,call)=>sum+toolUsage(call),0),unknown=calls.filter(call=>!call.usageReported).length;const envelopeTitle=svgEl("title");envelopeTitle.textContent=`第 ${entry.turn.index} 轮工具包络 · ${calls.length} 次调用 · ${formatTokens(exact)} Token · ${unknown} 次 Token 未知`;const envelopeNode=svg.lastChild;if(envelopeNode)envelopeNode.appendChild(envelopeTitle);calls.forEach((call,index)=>{const fraction=parentSpan?entry.start+parentSpan*(index+.5)/calls.length:entry.start,geometry=toolSatelliteGeometry(cx,cy,outerOuter,index),usage=toolUsage(call),width=usage>0?Math.min(Math.max(parentSpan*.22,.002),usage/denominator):0,start=usage>0?Math.max(entry.start,fraction-width/2):fraction,end=usage>0?Math.min(entry.end,start+width):fraction,group=svgEl("g",{class:`tool-satellite${state.selected===entry.turn.turnId?" selected":""}`,tabindex:"0",role:"button","data-tool-target":"true","aria-label":`${toolCallLabel(call)}，${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`}),parentPoint=radialPoint(cx,cy,outerOuter+7,fraction),satellitePoint=radialPoint(cx,cy,geometry.inner-1,fraction);group.appendChild(svgEl("line",{x1:satellitePoint.x,y1:satellitePoint.y,x2:parentPoint.x,y2:parentPoint.y,class:"tool-satellite-connector"}));if(usage>0){group.appendChild(svgEl("path",{d:arcBandPath(cx,cy,geometry.inner,geometry.outer,start,end),fill:toolCallColor(call),class:"token-sector"}));}else{const a=radialPoint(cx,cy,geometry.inner-3,fraction),b=radialPoint(cx,cy,geometry.outer+5,fraction);group.appendChild(svgEl("line",{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:"tool-satellite-unknown"}))}const title=svgEl("title");title.textContent=`${toolCallLabel(call)} · ${call.usageReported?formatTokens(usage)+" Token":"Token 未知"}`;group.appendChild(title);group.addEventListener("pointerenter",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("pointermove",event=>moveTurnTooltip(event,group));group.addEventListener("pointerleave",hideTooltip);group.addEventListener("focus",event=>toolTooltip(event,entry.turn,call,group));group.addEventListener("blur",hideTooltip);group.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openToolDrawer(entry.turn,call)}});group.addEventListener("click",()=>{hideTooltip();openToolDrawer(entry.turn,call)});svg.appendChild(group)})})}
@@ -2768,13 +3014,13 @@ tbody tr:hover td.heat-cell { filter:saturate(1.12) brightness(.985); }
       total:numericMax(visible,t=>t.usage.total), contextTokens:numericMax(visible,t=>contextSnapshot(t).tokens)
     };
     byId("table-empty").hidden=sorted.length>0;
-    byId("turn-table-body").innerHTML=sorted.map(turn=>{const b=turn.breakdown,prompt=firstPrompt(turn).replace(/\s+/g," ").trim(),rate=cacheRate(turn),snapshot=contextSnapshot(turn),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return `<tr data-turn-id="${esc(turn.turnId)}" data-turn-target="true" class="${state.selected===turn.turnId?"selected":""}"><td>${turn.index}</td><td><span class="status ${esc(turn.status)}">${esc(statusText(turn.status))}</span></td><td>${esc(dateText(turn.startedAt))}</td><td class="heat-cell" style="${heatStyle(turn.modelResponses,maxima.modelResponses)}">${formatTokens(turn.modelResponses)}</td><td class="heat-cell" style="${heatStyle(b.cachedInput,maxima.cachedInput)}">${formatTokens(b.cachedInput)}</td><td${cacheWriteAvailable?` class="heat-cell" style="${heatStyle(b.cacheWriteInput,maxima.cacheWriteInput)}"`:""}>${cacheWriteAvailable?formatTokens(b.cacheWriteInput):"不适用"}</td><td class="heat-cell" style="${heatStyle(b.otherNonCachedInput,maxima.otherNonCachedInput)}">${formatTokens(b.otherNonCachedInput)}</td><td class="heat-cell" style="${heatStyle(b.ordinaryOutput,maxima.ordinaryOutput)}">${formatTokens(b.ordinaryOutput)}</td><td class="heat-cell" style="${heatStyle(b.reasoningOutput,maxima.reasoningOutput)}">${formatTokens(b.reasoningOutput)}</td><td class="heat-cell" style="${heatStyle(turn.usage.total,maxima.total)}"><b>${formatTokens(turn.usage.total)}</b></td><td class="heat-cell" style="${heatStyle(rate,100,true)}">${rate.toFixed(2)}%</td><td class="heat-cell" title="${esc(contextTitle)}" style="${snapshot.tokens==null?"":heatStyle(snapshot.tokens,maxima.contextTokens)}">${snapshot.tokens==null?"—":formatTokens(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="prompt-cell" title="${esc(prompt)}">${esc(prompt||"—")}</td></tr>`;}).join("");
+    byId("turn-table-body").innerHTML=sorted.map(turn=>{const b=turn.breakdown,prompt=firstPrompt(turn).replace(/\s+/g," ").trim(),rate=cacheRate(turn),snapshot=contextSnapshot(turn),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return `<tr data-turn-id="${esc(turn.turnId)}" data-turn-target="true" class="${state.selected===turn.turnId?"selected":""}"><td>${turn.index}</td><td><span class="status ${esc(statusText(turn.status))}">${esc(statusText(turn.status))}</span></td><td>${esc(dateText(turn.startedAt))}</td><td class="heat-cell" style="${heatStyle(turn.modelResponses,maxima.modelResponses)}">${formatCount(turn.modelResponses)}</td><td class="heat-cell" style="${heatStyle(b.cachedInput,maxima.cachedInput)}">${formatTokens(b.cachedInput)}</td><td${cacheWriteAvailable?` class="heat-cell" style="${heatStyle(b.cacheWriteInput,maxima.cacheWriteInput)}"`:""}>${cacheWriteAvailable?formatTokens(b.cacheWriteInput):"不适用"}</td><td class="heat-cell" style="${heatStyle(b.otherNonCachedInput,maxima.otherNonCachedInput)}">${formatTokens(b.otherNonCachedInput)}</td><td class="heat-cell" style="${heatStyle(b.ordinaryOutput,maxima.ordinaryOutput)}">${formatTokens(b.ordinaryOutput)}</td><td class="heat-cell" style="${heatStyle(b.reasoningOutput,maxima.reasoningOutput)}">${formatTokens(b.reasoningOutput)}</td><td class="heat-cell" style="${heatStyle(turn.usage.total,maxima.total)}"><b>${formatTokens(turn.usage.total)}</b></td><td class="heat-cell" style="${heatStyle(rate,100,true)}">${rate.toFixed(2)}%</td><td class="heat-cell" title="${esc(contextTitle)}" style="${snapshot.tokens==null?"":heatStyle(snapshot.tokens,maxima.contextTokens)}">${snapshot.tokens==null?"—":formatTokens(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="prompt-cell" title="${esc(prompt)}">${esc(prompt||"—")}</td></tr>`;}).join("");
     byId("turn-table-body").querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer(turns.find(t=>t.turnId===row.dataset.turnId))));
   }
 
   function openDrawer(turn) {
     if (!turn) return; state.selected=turn.turnId; byId("drawer-title").textContent=`第 ${turn.index} 轮`; const b=turn.breakdown,snapshot=contextSnapshot(turn);
-    const details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["开始时间",dateText(turn.startedAt)],["持续时间",durationText(turn.durationMs)],["模型",turn.models.join(", ")||"—"],["推理强度",turn.efforts.join(", ")||"—"],["模型响应",formatTokens(turn.modelResponses)],["Token 快照",formatTokens(turn.tokenSnapshots)],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":formatTokens(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":formatTokens(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",formatTokens(turn.compactions)],["总 Token",formatTokens(turn.usage.total)],["输入",formatTokens(turn.usage.input)],["输出",formatTokens(turn.usage.output)]];
+    const details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["开始时间",dateText(turn.startedAt)],["持续时间",durationText(turn.durationMs)],["模型",turn.models.join(", ")||"—"],["推理强度",turn.efforts.join(", ")||"—"],["模型响应",formatCount(turn.modelResponses)],["Token 快照",formatCount(turn.tokenSnapshots)],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":formatTokens(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":formatTokens(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",formatCount(turn.compactions)],["总 Token",formatTokens(turn.usage.total)],["输入",formatTokens(turn.usage.input)],["输出",formatTokens(turn.usage.output)]];
     let body=`<div class="detail-grid">${details.map(([k,v])=>`<div class="detail-item"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
     body+=`<div class="message"><div class="message-head">Token 构成</div><pre>${segmentKeys.map(key=>`${segmentLabels[key]}：${formatTokens(b[key]||0)}`).join("\n")}</pre></div>`;
     if((turn.contextCompactions||[]).length){const compactionLines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${formatTokens(value.tokens)} / ${value.windowTokens==null?"—":formatTokens(value.windowTokens)} · ${contextRateText(value)}`:"未知";return `#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":formatTokens(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});body+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(compactionLines.join("\n\n"))}</pre></div>`;}
@@ -2815,29 +3061,56 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
 <style>
 .hero-copy{min-width:0;flex:1}.summary-brief{width:min(560px,48%);padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:rgba(255,254,250,.86);box-shadow:var(--shadow)}.brief-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.brief-head .sensitive{font-size:10px;letter-spacing:0;text-transform:none;padding:4px 8px}.brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px}.brief-item{min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:baseline;padding-bottom:6px;border-bottom:1px solid rgba(126,111,91,.16)}.brief-item .label{color:var(--muted);font-size:10px}.brief-item .value{margin:0;font-size:16px;font-weight:760;font-variant-numeric:tabular-nums;text-align:right}.brief-item .note{grid-column:1 / -1;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.analysis-shell{margin-top:15px}.analysis-tabs{display:flex;gap:5px;padding:5px;border:1px solid var(--border);border-radius:13px 13px 0 0;background:var(--panel2);overflow-x:auto}.analysis-tab{flex:1 0 auto;border:1px solid transparent;border-radius:9px;padding:9px 13px;background:transparent;color:var(--muted);font-size:12px;font-weight:750;white-space:nowrap}.analysis-tab:hover,.analysis-tab.active{border-color:var(--accent);background:var(--panel);color:var(--accent)}.analysis-tab:disabled{cursor:not-allowed;opacity:.42}.analysis-controls{padding:14px 0 0}.analysis-controls .filters{padding-left:0;padding-right:0}.tab-panel{margin-top:12px}.tab-panel[hidden]{display:none}.session-total-button{margin:0 0 8px;padding:9px 11px;border-color:rgba(126,111,91,.28);border-radius:9px;background:rgba(240,233,221,.62)}.session-total-button:hover{border-color:var(--border);background:var(--panel2);color:var(--text);box-shadow:none}.session-total-button.active{border-color:rgba(126,111,91,.5);background:#e7ddcf;color:var(--text);box-shadow:inset 3px 0 0 #8c6f4d,0 4px 12px rgba(92,75,54,.08)}.session-total-button strong{font-size:12px}.session-total-button span{color:var(--muted);font-size:10px}
 @media(max-width:650px){.summary-brief{width:100%}.brief-grid{gap:7px 12px}}
+.session-button.model-watermark{position:relative;isolation:isolate;overflow:hidden;background:var(--model-tint,transparent);border-color:color-mix(in srgb,var(--model-color,var(--border)) 24%,transparent)}.session-button.model-watermark::after{content:attr(data-model-watermark);position:absolute;z-index:0;right:-8px;bottom:-10px;color:var(--model-color,var(--muted));font-size:27px;font-weight:850;letter-spacing:-.07em;line-height:1;opacity:.14;pointer-events:none;white-space:nowrap;transform:rotate(-10deg);transform-origin:right bottom}.session-button.model-watermark>strong,.session-button.model-watermark>span{position:relative;z-index:1}.session-button.model-watermark:hover,.session-button.model-watermark.active{background:linear-gradient(135deg,var(--model-tint,transparent),var(--panel));border-color:var(--model-color,var(--accent))}.session-effort{display:inline-flex!important;width:max-content;max-width:100%;padding:2px 6px;border:1px solid color-mix(in srgb,var(--model-color,var(--muted)) 35%,var(--border));border-radius:999px;color:var(--model-color,var(--muted))!important;background:rgba(255,254,250,.62);font-size:10px!important;line-height:1.25}
+.session-button.model-watermark::after{display:none}.session-button.model-watermark>.session-watermark{position:absolute;right:6px;bottom:16px;z-index:0;display:block;max-width:72%;overflow:hidden;text-overflow:ellipsis;color:var(--model-color,var(--muted));opacity:.34;font-size:38px;font-weight:950;letter-spacing:-.055em;line-height:.9;text-align:right;white-space:nowrap;transform:rotate(-18deg);transform-origin:right bottom;pointer-events:none;filter:saturate(1.45);text-shadow:0 1px 0 rgba(255,254,250,.18)}.session-button.model-watermark>.session-watermark~strong,.session-button.model-watermark>.session-watermark~span{position:relative;z-index:1}
+</style>
+<style>
+.analysis-tabs{position:relative;padding-left:150px}.analysis-tab-model-label{position:absolute;left:8px;top:5px;z-index:3;display:block;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:7px 11px;border:1px solid color-mix(in srgb,var(--model-color,var(--accent)) 58%,#fffefa);border-radius:8px;background:var(--model-color,var(--accent));color:#fffefa;font-size:14px;font-weight:950;letter-spacing:.06em;line-height:.95;transform:rotate(-12deg);transform-origin:left top;box-shadow:0 5px 13px color-mix(in srgb,var(--model-color,var(--accent)) 30%,transparent);pointer-events:none}.shell.session-nav-closed{grid-template-columns:52px minmax(0,1fr)}.shell.session-nav-closed .sidebar{width:52px;transform:none;opacity:1;visibility:visible;pointer-events:none;overflow:hidden;padding:14px 8px}.sidebar-rail-toggle{display:none;position:fixed;z-index:70;left:8px;top:14px;width:36px;height:36px;align-items:center;justify-content:center;padding:0;border:1px solid var(--border);border-radius:10px;background:var(--panel);color:var(--accent);font-size:28px;line-height:1;box-shadow:0 6px 18px rgba(92,75,54,.12)}.shell.session-nav-closed .sidebar-rail-toggle{display:inline-flex}#session-drawer-close{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;font-size:22px;line-height:1}.session-time{font-variant-numeric:tabular-nums}.session-token-count{font-variant-numeric:tabular-nums;font-weight:750}
+.analysis-tab-model-label{display:inline-flex;align-items:center;gap:7px}.analysis-tab-model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.analysis-tab-plan-status:not([hidden]){display:inline-flex;flex:none;padding:3px 6px;border:1px solid rgba(255,254,250,.48);border-radius:999px;background:rgba(45,41,36,.22);color:#fffefa;font-size:9px;font-weight:850;letter-spacing:0;line-height:1}
+@media(max-width:900px){.shell.session-nav-closed{display:block}.shell.session-nav-closed .sidebar{width:min(320px,88vw);transform:translateX(-104%);opacity:0;visibility:hidden;pointer-events:none;padding:22px 16px}.sidebar-rail-toggle{top:12px;left:8px}}
+@media(max-width:650px){.analysis-tabs{padding-left:120px}.analysis-tab-model-label{max-width:110px;font-size:12px}}
+.session-donut-sector{cursor:pointer;transition:opacity .14s ease,filter .14s ease}.session-donut-sector:hover,.session-donut-sector:focus{opacity:1;filter:brightness(1.08) saturate(1.12);outline:none}.session-button.model-watermark.session-hovered{background:linear-gradient(135deg,var(--model-tint,transparent),var(--panel));border-color:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 24%,transparent),0 8px 20px color-mix(in srgb,var(--model-color,var(--accent)) 16%,transparent)}
+.model-pie-view{padding:2px 0 20px}.model-rate-meta{margin:0 19px 8px;color:var(--muted);font-size:11px;line-height:1.45}.model-plan-note{display:flex;align-items:flex-start;gap:7px;margin:0 19px 14px;padding:9px 11px;border:1px solid rgba(183,122,38,.24);border-radius:10px;background:rgba(255,248,225,.72);color:#8a6526;font-size:11px}.model-plan-note strong{color:#78531a}.pie-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:0 18px}.pie-card{min-width:0;padding:16px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,rgba(255,254,250,.95),rgba(250,246,238,.88));box-shadow:0 8px 22px rgba(92,75,54,.06)}.pie-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.pie-card h3{margin:0;font-size:15px;letter-spacing:-.01em}.pie-card p{margin:4px 0 0;color:var(--muted);font-size:11px;line-height:1.4}.pie-card-kicker{flex:none;padding:4px 7px;border:1px solid rgba(59,139,120,.2);border-radius:999px;background:rgba(59,139,120,.07);color:var(--accent);font-size:10px;font-weight:800;white-space:nowrap}.pie-chart-wrap{display:flex;align-items:center;justify-content:center;min-height:280px;padding:4px 0 0}.pie-chart-wrap svg{width:min(100%,390px);height:auto}.model-pie-legend{display:grid;gap:7px;margin-top:2px;padding-top:10px;border-top:1px solid rgba(126,111,91,.15)}.model-pie-legend .pie-legend-row{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:8px;align-items:center;font-size:11px}.pie-legend-row .swatch{width:10px;height:10px;border-radius:50%;background:var(--swatch);box-shadow:0 0 0 2px color-mix(in srgb,var(--swatch) 16%,transparent)}.pie-legend-row .name{display:grid;min-width:0;gap:1px;overflow:hidden}.pie-legend-row .name strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.pie-legend-row .name small,.pie-legend-row .value small{color:var(--muted);font-size:10px}.pie-legend-row .value{display:grid;justify-items:end;gap:1px;margin:0;font-size:11px;font-weight:750;white-space:nowrap}.pie-empty{fill:var(--muted);font-size:12px}.model-watermark{--model-color:var(--accent);--model-tint:rgba(59,139,120,.06)}
+@media(max-width:720px){.pie-grid{grid-template-columns:1fr}}
+.session-effort{position:absolute!important;right:8px;bottom:7px;width:max-content;max-width:calc(100% - 16px);margin:0!important}
+.session-plan-status{position:absolute!important;right:8px;top:7px;width:max-content!important;max-width:calc(100% - 16px);margin:0!important;padding:2px 6px!important;border:1px solid color-mix(in srgb,var(--model-color,var(--muted)) 48%,var(--border));border-radius:999px;background:color-mix(in srgb,var(--model-color,var(--panel)) 16%,#fffefa);color:var(--model-color,var(--muted))!important;font-size:9px!important;font-weight:850;line-height:1.2!important}
+.tooltip-badges{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:5px}.tooltip-badge-secondary{background:rgba(183,122,38,.14);color:#8a6526}
+</style>
+<style>
+.model-filter{margin:10px 0 2px;padding:0 2px}.model-filter-title{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.model-filter-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.model-filter-toggle{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:5px 8px;border:1px solid color-mix(in srgb,var(--model-color,var(--border)) 48%,var(--border));border-radius:999px;background:color-mix(in srgb,var(--model-color,var(--panel)) 13%,var(--panel));color:var(--model-color,var(--muted));font-size:10px;font-weight:800;line-height:1.2;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease,opacity .14s ease}.model-filter-toggle:hover,.model-filter-toggle:focus-visible{border-color:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 16%,transparent);outline:none}.model-filter-toggle[aria-pressed="false"]{border-color:var(--border);background:transparent;color:var(--muted);opacity:.68}.model-filter-toggle[aria-pressed="false"] .model-filter-swatch{background:transparent;border:2px solid var(--model-color,var(--muted));opacity:.72}.model-filter-swatch{width:8px;height:8px;flex:none;border-radius:50%;background:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 15%,transparent)}.model-filter-count{color:inherit;font-size:9px;font-variant-numeric:tabular-nums;opacity:.76}.session-button.session-selected{box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 28%,transparent),0 7px 18px color-mix(in srgb,var(--model-color,var(--accent)) 13%,transparent)}.session-button.session-selected:not(.active){background:color-mix(in srgb,var(--model-tint,var(--panel)) 66%,var(--panel));border-color:color-mix(in srgb,var(--model-color,var(--accent)) 66%,var(--border))}.session-donut-sector.selected{filter:brightness(1.12) saturate(1.18);stroke:#2d2924;stroke-width:3}.session-total-jump{border:1px solid var(--border);border-radius:9px;padding:7px 10px;background:var(--panel);color:var(--accent);font-size:11px;font-weight:800;white-space:nowrap}.session-total-jump:hover,.session-total-jump:focus-visible{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,139,120,.12);outline:none}
+</style>
+<style>
+h1{font-size:clamp(14px,1.5vw,20px)}
+.brief-item .label{font-size:12px}
+.brief-item .value.lcd-value{min-width:0;margin:0;padding:4px 8px;border:1px solid #3e7e6c;border-radius:7px;background:linear-gradient(180deg,#17372f,#102a25);color:#a6f3c9;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:18px;font-weight:800;letter-spacing:.035em;line-height:1.2;white-space:nowrap;text-shadow:0 0 5px rgba(166,243,201,.6);box-shadow:inset 0 2px 8px rgba(0,0,0,.28),0 2px 0 rgba(255,254,250,.4);font-variant-numeric:tabular-nums}
+@media(max-width:650px){.brief-item .value.lcd-value{font-size:16px;padding:3px 6px}}
+.hero-title-row{display:flex;align-items:center;min-width:0}.hero-title-row h1{min-width:0}.ring-return-button{position:fixed;z-index:120;top:14px;left:50%;transform:translateX(-50%);border:1px solid var(--accent);border-radius:999px;padding:8px 15px;background:rgba(255,254,250,.94);backdrop-filter:blur(12px);color:var(--accent);font-size:11px;font-weight:800;white-space:nowrap;box-shadow:0 8px 24px rgba(45,41,36,.18),0 0 0 3px rgba(59,139,120,.08)}.ring-return-button:hover,.ring-return-button:focus-visible{background:#fffefa;box-shadow:0 10px 28px rgba(45,41,36,.22),0 0 0 4px rgba(59,139,120,.14);outline:none}
+@media(max-width:650px){.ring-return-button{top:10px;padding:7px 13px}}
+.filter-row,.filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--muted)}.filter-row input[type="search"],.filters .content-search{min-width:min(100%,320px);flex:1}.filter-group{display:flex;align-items:center;gap:7px;margin:0;padding:0;border:0}.filter-group+ .filter-group{padding-left:12px;border-left:1px solid rgba(126,111,91,.3)}.filter-group legend{padding:0;color:var(--muted);font-size:10px;font-weight:800;white-space:nowrap}.filter-options{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.filter-option{display:inline-flex;align-items:center;gap:4px;padding:4px 7px;border:1px solid rgba(126,111,91,.24);border-radius:999px;background:rgba(255,254,250,.62);font-size:11px;line-height:1.2;white-space:nowrap}.filter-option:has(input:checked){border-color:var(--accent);color:var(--accent);background:rgba(59,139,120,.08)}.filter-option input{accent-color:var(--accent);margin:0}.filter-row>.check,.filters>.check{display:inline-flex;align-items:center;gap:4px}.filter-row>#visible-count,.filters>#visible-count{font-size:11px;white-space:nowrap}.token-unit-group .filter-option{min-width:28px;justify-content:center}.token-unit-group .filter-option:first-child{padding-left:8px;padding-right:8px}@media(max-width:720px){.filter-group+ .filter-group{padding-top:9px;padding-left:0;border-top:1px solid rgba(126,111,91,.3);border-left:0}.filter-row,.filters{align-items:stretch}.filter-group{width:100%}.filter-row input[type="search"],.filters .content-search{flex-basis:100%}}
 </style>
 </head>
 <body>
 <div class="shell" id="report-shell">
+  <button class="sidebar-rail-toggle" id="sidebar-rail-toggle" type="button" aria-controls="session-drawer" aria-label="打开会话列表"><span aria-hidden="true">›</span></button>
   <aside class="sidebar" id="session-drawer" aria-label="会话列表">
-    <div class="sidebar-head"><div class="brand"><div class="eyebrow">Codex Token 使用分析</div><h2>会话列表</h2><div class="muted" id="range-label"></div></div><button id="session-drawer-close" type="button" aria-label="收起会话列表">收起</button></div>
-    <input class="nav-search" id="nav-search" type="search" placeholder="筛选会话……">
+    <div class="sidebar-head"><div class="brand"><div class="eyebrow">Codex Token 使用报告</div><h2>会话列表</h2><div class="muted" id="range-label"></div></div><button id="session-drawer-close" type="button" aria-label="关闭会话列表"><span aria-hidden="true">‹</span></button></div>
+    <input class="nav-search" id="nav-search" type="search" placeholder="搜索会话……">
+    <div class="model-filter" id="model-filter" role="group" aria-label="按模型筛选"><div class="model-filter-title">模型筛选</div><div class="model-filter-list" id="model-filter-list"></div></div>
     <nav class="session-list" id="session-list" aria-label="报告视图"></nav>
   </aside>
   <button class="session-drawer-backdrop" id="session-drawer-backdrop" type="button" tabindex="-1" aria-label="关闭会话列表"></button>
   <main class="content">
-    <div class="content-topbar"><button class="session-drawer-toggle" id="session-drawer-toggle" type="button" aria-controls="session-drawer" aria-expanded="true"><span aria-hidden="true">☰</span><span id="session-drawer-toggle-label">收起会话</span></button></div>
-    <section class="hero"><div class="hero-copy"><div class="eyebrow" id="view-eyebrow"></div><h1 id="view-title"></h1><div class="subline" id="view-meta"></div></div><aside class="summary-brief" aria-label="报告摘要"><div class="brief-head"><span>报告摘要</span><span class="sensitive" id="privacy"></span></div><div class="brief-grid" id="cards"></div></aside></section>
+    <section class="hero"><div class="hero-copy"><div class="eyebrow" id="view-eyebrow"></div><div class="hero-title-row"><h1 id="view-title"></h1></div><div class="subline" id="view-meta"></div></div><aside class="summary-brief" aria-label="概览"><div class="brief-head"><span>概览</span><span class="sensitive" id="privacy"></span></div><div class="brief-grid" id="cards"></div><div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="0" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">原始</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div></aside></section>
     <details class="warning-box" id="warning-box"><summary id="warning-summary"></summary><ul class="warning-list" id="warning-list"></ul></details>
     <section class="analysis-shell">
-      <nav class="analysis-tabs" role="tablist" aria-label="统计视图">
-        <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">Context 双环</button>
-        <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">每轮 Token 构成</button>
-        <button class="analysis-tab" id="tab-trend" data-tab-target="trend" role="tab" aria-selected="false" type="button">累计总消耗</button>
-        <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">轮次明细</button>
+      <nav class="analysis-tabs" role="tablist" aria-label="查看方式"><span class="analysis-tab-model-label" id="analysis-tab-model-label" aria-label="使用模型"><span class="analysis-tab-model-name" id="analysis-tab-model-name"></span><span class="analysis-tab-plan-status" id="analysis-tab-plan-status" hidden>计划外</span></span>
+        <button class="analysis-tab active" id="tab-context" data-tab-target="context" role="tab" aria-selected="true" type="button">模型消耗概览</button>
+        <button class="analysis-tab" id="tab-composition" data-tab-target="composition" role="tab" aria-selected="false" type="button">单轮 Token 构成</button>
+        <button class="analysis-tab" id="tab-trend" data-tab-target="trend" role="tab" aria-selected="false" type="button">累计 Token</button>
+        <button class="analysis-tab" id="tab-table" data-tab-target="table" role="tab" aria-selected="false" type="button">逐轮明细</button>
       </nav>
-      <div class="analysis-controls">
-        <div class="filters"><input class="content-search" id="content-search" type="search"><fieldset class="tool-filter-group" id="tool-filter" aria-label="工具类型筛选"><legend>工具</legend><div class="tool-filter-list" id="tool-filter-list"></div></fieldset><label class="check turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="check turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="check turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label><span id="visible-count"></span><button id="reset-filters" type="button">重置筛选</button></div>
+      <div class="analysis-controls" id="analysis-controls">
+       <div class="filters"><input class="content-search" id="content-search" type="search"><fieldset class="filter-group tool-filter-group" id="tool-filter" data-hide-on-cumulative aria-label="按工具类型筛选"><legend>工具</legend><div class="filter-options tool-filter-list" id="tool-filter-list"></div></fieldset><fieldset class="filter-group status-filter-group" data-hide-on-cumulative aria-label="按轮次状态筛选"><legend>轮次</legend><div class="filter-options status-filter-list"><label class="filter-option turn-only"><input type="checkbox" data-status="complete" checked> 已完成</label><label class="filter-option turn-only"><input type="checkbox" data-status="aborted" checked> 已中止</label><label class="filter-option turn-only"><input type="checkbox" data-status="incomplete" checked> 未闭合</label></div></fieldset><span id="visible-count"></span><button id="reset-filters" type="button">清除筛选</button></div>
       </div>
     </section>
     <section class="panel tab-panel" data-tab-panel="composition" role="tabpanel" hidden>
@@ -2845,11 +3118,25 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
       <div class="legend" id="legend"></div><div class="chart-scroll"><div class="chart-wrap"><svg id="composition" viewBox="0 0 1200 410" role="img"></svg></div></div>
     </section>
     <section class="panel tab-panel" data-tab-panel="trend" role="tabpanel" hidden><div class="panel-head"><div><h2 id="trend-title"></h2><p id="trend-note"></p></div></div><div class="trend-wrap"><svg id="trend" viewBox="0 0 1200 270" role="img"></svg></div></section>
-    <section class="panel tab-panel" data-tab-panel="context" role="tabpanel" id="range-context-panel"><div class="panel-head"><div><h2>Token 消耗与 Context 占用</h2><p>单个双环按累计 Token 进度顺时针展开；外环按来源着色，内环按轮内快照位置阶梯展示 Context 占用率。</p></div></div><div class="source-legend" id="context-source-legend"></div><div class="context-radial-wrap"><svg id="range-context-radial-chart" role="img" aria-label="累计 Token 进度与 Context 占用率双环图"></svg></div></section>
+    <section class="panel tab-panel" data-tab-panel="context" role="tabpanel" id="range-context-panel">
+      <div id="range-model-pie-view" class="model-pie-view">
+        <div class="panel-head"><div><h2>模型消耗概览</h2></div></div>
+        <div class="model-rate-meta" id="model-rate-meta"></div>
+        <div class="model-plan-note" id="model-plan-note" hidden></div>
+        <div class="pie-grid">
+          <article class="pie-card"><div class="pie-card-head"><div><h3>按模型查看消耗</h3><p>实际 Token 总量 · 外圈细分单模型会话</p></div><span class="pie-card-kicker">原始 Token</span></div><div class="pie-chart-wrap"><svg id="model-token-pie" role="img" aria-label="按模型划分的 Token 消耗图"></svg></div><div class="model-pie-legend" id="model-token-legend"></div></article>
+          <article class="pie-card"><div class="pie-card-head"><div><h3>按费率折算的模型消耗</h3><p>按官方费率折算 · 外圈细分单模型会话</p></div><span class="pie-card-kicker">Sol 等价</span></div><div class="pie-chart-wrap"><svg id="model-weighted-pie" role="img" aria-label="按费率折算的模型消耗图"></svg></div><div class="model-pie-legend" id="model-weighted-legend"></div></article>
+        </div>
+      </div>
+      <div id="range-session-context-view" hidden>
+        <div class="panel-head"><div><h2>Token 消耗与 Context 占用</h2></div><button id="go-total-session" class="session-total-jump" type="button">定位到总统计</button></div><div class="source-legend" id="context-source-legend"></div><div class="context-radial-wrap"><svg id="range-context-radial-chart" role="img" aria-label="Token 累计进度与 Context 占用率"></svg></div>
+      </div>
+    </section>
     <section class="panel tab-panel" data-tab-panel="table" role="tabpanel" hidden><div class="panel-head"><div><h2 id="table-title"></h2><p id="table-note"></p></div></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table><div class="empty" id="table-empty" hidden></div></div></section>
     <div class="footer" id="footer"></div>
   </main>
 </div>
+<button id="return-total-from-ring" class="ring-return-button" type="button" hidden>返回总统计</button>
 <aside class="drawer" id="drawer" aria-hidden="true"><div class="drawer-head"><div><div class="eyebrow">轮次详情</div><h2 id="drawer-title"></h2></div><button id="drawer-close" type="button">关闭</button></div><div class="drawer-body" id="drawer-body"></div></aside>
 <div class="tooltip" id="turn-tooltip" role="tooltip"></div>
 <script id="report-data" type="application/json">__REPORT_JSON__</script>
@@ -2878,6 +3165,8 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     data.summary.finalBreakdownMismatch = safeObject(data.summary.finalBreakdownMismatch);
     data.summary.dailyUsage = Array.isArray(data.summary.dailyUsage) ? data.summary.dailyUsage : [];
     data.summary.toolCategories = safeObject(data.summary.toolCategories);
+    data.summary.modelUsage = Array.isArray(data.summary.modelUsage) ? data.summary.modelUsage : [];
+    data.summary.planExcludedUsage = safeObject(data.summary.planExcludedUsage);
     data.warnings = Array.isArray(data.warnings) ? data.warnings : [];
     const sessions = Array.isArray(data.sessions) ? data.sessions : [];
     for (const session of sessions) {
@@ -2890,6 +3179,9 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
       session.summary.finalBreakdown = safeObject(session.summary.finalBreakdown);
       session.summary.finalBreakdownMismatch = safeObject(session.summary.finalBreakdownMismatch);
       session.summary.statusCounts = safeObject(session.summary.statusCounts);
+      session.summary.modelUsage = Array.isArray(session.summary.modelUsage) ? session.summary.modelUsage : [];
+      session.summary.planExcludedUsage = safeObject(session.summary.planExcludedUsage);
+      session.metadata.efforts = Array.isArray(session.metadata.efforts) ? session.metadata.efforts : [];
       for (const turn of session.turns) {
         turn.usage = safeObject(turn.usage); turn.breakdown = safeObject(turn.breakdown);
         turn.contextSnapshot = safeObject(turn.contextSnapshot); turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
@@ -2900,45 +3192,78 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     data.sessions = sessions;
     const messagesIncluded=data.metadata.messagesIncluded!==false;
     const colors={cachedInput:css("--cached"),cacheWriteInput:css("--cache-write"),otherNonCachedInput:css("--uncached"),ordinaryOutput:css("--output"),reasoningOutput:css("--reasoning"),unclassified:css("--unclassified")};
-    const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
+    const labels={cachedInput:"缓存输入",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
     const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
     const sessionNavMedia=window.matchMedia("(max-width:900px)");
     const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
-    const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
+    const state={view:"total",tab:"context",scale:"linear",tokenUnit:"raw",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
   const toolColors={"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
   function byId(id){return document.getElementById(id)} function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
   function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])}
-  function fmt(v){return Number(v||0).toLocaleString()} function compact(v){const n=Number(v||0),a=Math.abs(n);if(a>=1e9)return(n/1e9).toFixed(1)+"B";if(a>=1e6)return(n/1e6).toFixed(1)+"M";if(a>=1e3)return(n/1e3).toFixed(1)+"K";return String(n)}
+  function formatGroupedNumber(v){const n=Number(v||0);if(!Number.isFinite(n))return"0";const sign=n<0?"-":"",parts=String(Math.abs(n)).split("."),integer=parts[0].replace(/\B(?=(\d{4})+(?!\d))/g,"\u2009");return sign+integer+(parts[1]?"."+parts[1]:"")}
+  const TOKEN_UNIT_CONFIG={raw:{divisor:1,suffix:""},K:{divisor:1e3,suffix:"K"},M:{divisor:1e6,suffix:"M"},B:{divisor:1e9,suffix:"B"}};
+  const TOKEN_UNIT_ORDER=["raw","K","M","B"],TOKEN_UNIT_LABELS={raw:"原始",K:"K",M:"M",B:"B"};
+  function formatTokenDisplay(v){const n=Number(v||0);if(!Number.isFinite(n))return"0";const config=TOKEN_UNIT_CONFIG[state.tokenUnit]||TOKEN_UNIT_CONFIG.raw;if(state.tokenUnit==="raw")return formatGroupedNumber(n);return(n/config.divisor).toFixed(1).replace(/\.0$/,"")+config.suffix}
+  function fmt(v){return formatTokenDisplay(v)} function compact(v){return formatTokenDisplay(v)} function formatCount(v){return formatGroupedNumber(v)} function isLcdValue(v){return /^[\d\u2009.\-]+[KMB]?$/.test(String(v))}
+  function syncTokenUnitInputs(){const slider=byId("token-unit-slider"),output=byId("token-unit-output"),index=TOKEN_UNIT_ORDER.indexOf(state.tokenUnit);if(slider)slider.value=String(Math.max(0,index));if(output)output.textContent=TOKEN_UNIT_LABELS[state.tokenUnit]||TOKEN_UNIT_LABELS.raw}
+  function setTokenUnit(unit){if(!TOKEN_UNIT_CONFIG[unit])return;state.tokenUnit=unit;syncTokenUnitInputs();render()}
   function dateText(v){if(!v)return"—";const d=new Date(v);return Number.isNaN(d.valueOf())?v:d.toLocaleString("zh-CN")}
   function activeSession(){return sessions.find(s=>s.metadata.threadId===state.view)||null} function isTotal(){return state.view==="total"}
   function statusText(v){return({complete:"已完成",aborted:"已中止",incomplete:"未闭合"})[v]||v||"未知"}
   function cacheRate(u){return u.input?100*u.cached/u.input:0} function firstPrompt(t){return(t.messages||[]).map(m=>m.text).filter(Boolean).join("\n\n↳ 追加用户消息\n")}
   function sourceText(s){const kinds=s.metadata.sourceKinds||[];return kinds.map(k=>k==="main"?"顶层":k==="subagent"?"子代理":k==="automation"?"自动化":k).join(" + ")||"顶层"}
+  const MODEL_PALETTE=[["#3b8b78","rgba(59,139,120,.08)"],["#4f78a8","rgba(79,120,168,.08)"],["#bd7556","rgba(189,117,86,.08)"],["#8c78bd","rgba(140,120,189,.08)"],["#6d8c45","rgba(109,140,69,.08)"],["#a56c3f","rgba(165,108,63,.08)"]];
+  const MODEL_THEME_OVERRIDES={Spark:["#c23b75","rgba(194,59,117,.12)"]};
+  function modelVisual(model){const value=String(model||"未知模型"),override=MODEL_THEME_OVERRIDES[value];if(override)return override;let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))|0;return MODEL_PALETTE[Math.abs(hash)%MODEL_PALETTE.length]}
+  function sessionModel(session){const usage=Array.isArray(session?.metadata?.modelUsage)?session.metadata.modelUsage:[],excluded=Number(session?.metadata?.planExcludedUsage?.rawTokens)||0;if(usage.some(entry=>entry?.model==="多模型")||usage.length>1||(usage.length&&excluded>0))return"多模型";return session?.metadata?.primaryModel||usage[0]?.model||"未知模型"}
+  function modelWatermarkLabel(model){const value=String(model||"未知模型"),labels={"GPT-5.6 Sol":"SOL","GPT-5.6 Terra":"TERRA","GPT-5.6 Luna":"LUNA","GPT-5.5":"5.5","GPT-5.5 Cyber":"CYBER","GPT-5.4":"5.4","GPT-5.4 mini":"5.4 MINI","GPT-5.3 Codex":"5.3 CODEX","GPT-5.2":"5.2","GPT-Image-2.0（图像）":"IMAGE","GPT-Image-2.0（文本）":"IMAGE TEXT","Spark":"Spark","多模型":"多模型","未知模型":"未知","计划外":"计划外"};return labels[value]||value.replace(/^GPT[- ]?/i,"").replace(/\s+/g," ").trim()}
+  function sessionEffort(session){const efforts=session?.metadata?.efforts||[];return efforts.length?efforts.join(" / "):"未记录 effort"}
+  function modelFilterModels(){return [...new Set(sessions.map(sessionModel))].sort((a,b)=>modelWatermarkLabel(a).localeCompare(modelWatermarkLabel(b),"zh-CN")||a.localeCompare(b))}
+  function ensureModelFilters(){if(state.modelFilters===null)state.modelFilters=new Set(modelFilterModels())}
+  function renderModelFilter(){const list=byId("model-filter-list");if(!list)return;ensureModelFilters();const counts=new Map(modelFilterModels().map(model=>[model,sessions.filter(session=>sessionModel(session)===model).length]));list.innerHTML=modelFilterModels().map(model=>{const visual=modelVisual(model),active=state.modelFilters.has(model);return`<button class="model-filter-toggle" type="button" data-model-filter="${esc(model)}" aria-pressed="${String(active)}" aria-label="${esc(modelWatermarkLabel(model))}，${active?"已开启":"已关闭"}" style="--model-color:${visual[0]};--model-tint:${visual[1]}"><span class="model-filter-swatch" aria-hidden="true"></span><span>${esc(modelWatermarkLabel(model))}</span><small class="model-filter-count">${counts.get(model)||0}</small></button>`}).join("");list.querySelectorAll("[data-model-filter]").forEach(button=>button.addEventListener("click",()=>{const model=button.dataset.modelFilter;state.modelFilters.has(model)?state.modelFilters.delete(model):state.modelFilters.add(model);renderModelFilter();renderNav()}))}
+  function setSessionSelection(ids){state.selectedSessionIds=new Set(ids.filter(id=>sessions.some(session=>session.metadata.threadId===id)))}
+  function selectRingSession(event,threadId){const additive=Boolean(event?.ctrlKey||event?.metaKey||event?.shiftKey);if(additive){if(state.selectedSessionIds.has(threadId))state.selectedSessionIds.delete(threadId);else state.selectedSessionIds.add(threadId)}else setSessionSelection([threadId]);hideTooltip();renderNav();renderContext()}
+  function ringSessionKeydown(event,threadId){if(event.key!=="Enter"&&event.key!==" ")return;event.preventDefault();selectRingSession(event,threadId)}
+  function isSparkOnlySession(session){return Boolean(session)&&sessionModel(session)==="Spark"}
+  function sessionPlanStatus(session){return isSparkOnlySession(session)?"计划外":""}
+  function renderTabModelLabel(){const label=byId("analysis-tab-model-label");if(!label)return;const session=activeSession(),model=isTotal()?"多模型":sessionModel(session),modelLabel=modelWatermarkLabel(model),sparkOnly=!isTotal()&&isSparkOnlySession(session),name=byId("analysis-tab-model-name"),status=byId("analysis-tab-plan-status"),visual=modelVisual(model);if(name)name.textContent=modelLabel;else label.textContent=modelLabel;if(status)status.hidden=!sparkOnly;label.title=sparkOnly?`${model} · 计划外`:model;label.style.setProperty("--model-color",visual[0]);label.style.setProperty("--model-tint",visual[1]);label.setAttribute("aria-label",sparkOnly?`使用模型：${modelLabel}，计划外`:`使用模型：${modelLabel}`)}
+  function syncAnalysisControls(){const controls=byId("analysis-controls");if(controls)controls.hidden=isTotal()}
+  function syncFilterVisibility(tab){document.querySelectorAll("[data-hide-on-cumulative]").forEach(control=>{control.hidden=tab==="trend"})}
   function totalRows(){return sessions.map((s,i)=>({index:i+1,turnId:s.metadata.threadId,title:s.metadata.title,sourceLabel:sourceText(s),startedAt:s.metadata.rangeLastActivityAt,status:"complete",models:[],efforts:[],messages:[],modelResponses:s.summary.turnCount,usage:s.summary.finalUsage,breakdown:s.summary.finalBreakdown,session:s}))}
   function rowMatches(row){if(!isTotal()&&!state.statuses.has(row.status))return false;if(!state.query)return true;const rendered=[row.turnId,row.title,row.sourceLabel,row.status,(row.models||[]).join(" "),firstPrompt(row)].join(" ").toLocaleLowerCase();return rendered.includes(state.query)}
   function rows(){const base=isTotal()?totalRows():(activeSession()?.turns||[]);return base.filter(rowMatches)}
   function syncToolFilterInputs(){byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input=>{input.checked=state.toolCategories.has(input.value)})}
   function populateToolFilter(){const categories=[...new Set(sessions.flatMap(session=>(session.turns||[]).flatMap(turn=>(turn.toolCalls||[]).map(call=>call.category))))].sort((a,b)=>(toolLabels[a]||a).localeCompare(toolLabels[b]||b));byId("tool-filter-list").innerHTML=categories.map(category=>`<label class="check"><input type="checkbox" data-tool-category="true" value="${esc(category)}"${state.toolCategories.has(category)?" checked":""}> ${esc(toolLabels[category]||category)}</label>`).join("");byId("tool-filter-list").querySelectorAll("input[data-tool-category]").forEach(input=>input.addEventListener("change",event=>{if(event.target.checked)state.toolCategories.add(event.target.value);else state.toolCategories.delete(event.target.value);render()}))}
   function setSessionNav(open,focusTarget=false){
-    state.sessionNavOpen=Boolean(open);const shell=byId("report-shell"),drawer=byId("session-drawer"),toggle=byId("session-drawer-toggle");
-    shell.classList.toggle("session-nav-open",state.sessionNavOpen);shell.classList.toggle("session-nav-closed",!state.sessionNavOpen);drawer.setAttribute("aria-hidden",String(!state.sessionNavOpen));drawer.inert=!state.sessionNavOpen;toggle.setAttribute("aria-expanded",String(state.sessionNavOpen));byId("session-drawer-toggle-label").textContent=state.sessionNavOpen?"收起会话":"会话";document.body.classList.toggle("session-nav-modal-open",state.sessionNavOpen&&sessionNavMedia.matches);
-    if(focusTarget)(state.sessionNavOpen?byId("nav-search"):toggle).focus();
+    state.sessionNavOpen=Boolean(open);const shell=byId("report-shell"),drawer=byId("session-drawer");
+    shell.classList.toggle("session-nav-open",state.sessionNavOpen);shell.classList.toggle("session-nav-closed",!state.sessionNavOpen);drawer.setAttribute("aria-hidden",String(!state.sessionNavOpen));drawer.inert=!state.sessionNavOpen;document.body.classList.toggle("session-nav-modal-open",state.sessionNavOpen&&sessionNavMedia.matches);
+    if(focusTarget)(state.sessionNavOpen?byId("nav-search"):byId("sidebar-rail-toggle")).focus();
   }
-  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>[s.metadata.title,s.metadata.threadId,s.metadata.cwd].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>范围汇总 · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>`<button class="session-button ${state.view===s.metadata.threadId?"active":""}" data-view="${esc(s.metadata.threadId)}"><strong>${esc(s.metadata.title)}</strong><span>${fmt(s.summary.finalUsage.total)} Token · ${esc(dateText(s.metadata.rangeLastActivityAt))}</span></button>`).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
-  function selectView(view){const previousView=state.view;state.view=view;state.tab=view==="total"?"composition":previousView==="total"?"context":state.tab;state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
-  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总统计":"会话区间统计";byId("view-title").textContent=isTotal()?"全部会话消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截至 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话",fmt(summary.sessionCount),`${summary.zeroUsageSessions} 个零消耗会话`]:["轮次",fmt(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮零消耗`];const cards=[["区间总消耗",fmt(u.total),"按 token_count 快照时间归属"],["输入",fmt(u.input),`${compact(u.cached)} 来自缓存读取`],["非缓存输入",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["完整性",summary.integrityErrorCount?"存在错误":"通过",`${summary.warningCount} 条提示`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("")}
-  function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个完整性错误 · 共 ${summary.warningCount} 条提示`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
+  function setSessionHover(threadId){if(state.hoverSessionId===threadId)return;state.hoverSessionId=threadId;document.querySelectorAll(".session-button.model-watermark").forEach(button=>button.classList.toggle("session-hovered",button.dataset.view===threadId))}
+  function clearSessionHover(threadId){if(threadId&&state.hoverSessionId!==threadId)return;state.hoverSessionId=null;document.querySelectorAll(".session-button.model-watermark.session-hovered").forEach(button=>button.classList.remove("session-hovered"))}
+  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>state.modelFilters.has(sessionModel(s))&&[s.metadata.title,s.metadata.threadId,s.metadata.cwd,sessionModel(s),modelWatermarkLabel(sessionModel(s)),sessionPlanStatus(s),sessionEffort(s)].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>日期范围汇总 · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>{const model=sessionModel(s),modelLabel=modelWatermarkLabel(model),planStatus=sessionPlanStatus(s),planTag=planStatus?`<span class="session-plan-status" aria-label="${esc(planStatus)}">${esc(planStatus)}</span>`:"",effort=sessionEffort(s),visual=modelVisual(model),watermark=esc(modelLabel),active=state.view===s.metadata.threadId,selected=state.selectedSessionIds.has(s.metadata.threadId),hovered=state.hoverSessionId===s.metadata.threadId;return`<button class="session-button model-watermark ${active?"active ":""}${selected?"session-selected ":""}${hovered?"session-hovered":""}" aria-pressed="${String(selected)}" style="--model-color:${visual[0]};--model-tint:${visual[1]}" data-model-watermark="${esc(modelLabel)}" data-view="${esc(s.metadata.threadId)}"><span class="session-watermark" aria-hidden="true">${watermark}</span>${planTag}<strong>${esc(s.metadata.title)}</strong><span class="session-time">${esc(dateText(s.metadata.rangeLastActivityAt))}</span><span class="session-token-count">${fmt(s.summary.finalUsage.total)} Token</span><span class="session-effort">${esc(effort)}</span></button>`}).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
+  function applyView(view,fromRing=false){const valid=view==="total"||sessions.some(session=>session.metadata.threadId===view),nextView=valid?view:"total";state.returnToTotalSessionId=fromRing&&nextView!=="total"?nextView:null;state.view=nextView;state.hoverSessionId=null;if(nextView!=="total")setSessionSelection([nextView]);state.tab="context";state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
+  function navigateView(view,fromRing=false){const nextReturn=fromRing&&view!=="total"?view:null;if(state.view===view&&state.returnToTotalSessionId===nextReturn){applyView(view,fromRing);return}history.pushState({...(history.state||{}),codexTokenReport:true,view,returnToTotalSessionId:nextReturn},"","");applyView(view,fromRing)}
+  function selectView(view,fromRing=false){navigateView(view,fromRing)}
+  function enterSessionFromRing(threadId){selectView(threadId,true)}
+  function goToTotal(){const session=activeSession();if(session)setSessionSelection([session.metadata.threadId]);navigateView("total")}
+  function syncRingReturnButton(){const button=byId("return-total-from-ring");if(!button)return;const visible=!isTotal()&&state.returnToTotalSessionId!=null;button.hidden=!visible;button.setAttribute("aria-hidden",String(!visible))}
+  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总览":"会话总览";byId("view-title").textContent=isTotal()?"全部会话 · Token 消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截止 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话数",formatCount(summary.sessionCount),`${summary.zeroUsageSessions} 个会话没有 Token 消耗`]:["轮次数",formatCount(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮无 Token 消耗`];const cards=[["区间总 Token",fmt(u.total),"按 token_count 快照时间计入"],["输入 Token",fmt(u.input),`${compact(u.cached)} 来自缓存`],["未命中缓存的输入 Token",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出 Token",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["数据完整性",summary.integrityErrorCount?"发现问题":"正常",`${summary.warningCount} 条提醒`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value${isLcdValue(c[1])?" lcd-value":""}">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("");syncRingReturnButton()}
+  function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个数据完整性问题 · 共 ${summary.warningCount} 条提醒`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
   function niceTicks(max,count=5){if(max<=0)return[0];const rough=max/count,p=10**Math.floor(Math.log10(rough)),f=rough/p,n=(f<=1?1:f<=2?2:f<=5?5:10)*p,out=[];for(let x=0;x<=max+n*.25;x+=n)out.push(x);return out}
   function svgEl(name,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",name);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el} function text(svg,x,y,value,anchor="end"){const t=svgEl("text",{x,y,"text-anchor":anchor,fill:css("--muted"),"font-size":"11"});t.textContent=value;svg.appendChild(t)}
   function positionTooltip(event,target){const targetRect=target?.getBoundingClientRect?.(),pointerX=Number.isFinite(event?.clientX)?event.clientX:targetRect?targetRect.left+targetRect.width/2:innerWidth/2,pointerY=Number.isFinite(event?.clientY)?event.clientY:targetRect?targetRect.top+targetRect.height/2:innerHeight/2;tooltip.style.display="block";tooltip.style.visibility="hidden";const gap=14,edge=8,width=tooltip.offsetWidth,height=tooltip.offsetHeight;let x=pointerX+gap,y=pointerY+gap;if(x+width>innerWidth-edge)x=pointerX-width-gap;if(y+height>innerHeight-edge)y=pointerY-height-gap;tooltip.style.left=`${Math.max(edge,Math.min(x,innerWidth-width-edge))}px`;tooltip.style.top=`${Math.max(edge,Math.min(y,innerHeight-height-edge))}px`;tooltip.style.visibility="visible"}
+  function pieDisplayValue(value,valueKey){return valueKey==="weightedTokens"?Math.round(Number(value)||0):value}
+  function showSessionTooltip(event,session,target,model,valueKey,value,modelTotal){if(event?.pointerType==="touch"){hideTooltip();return}const usage=session.summary?.finalUsage||{},metric=valueKey==="weightedTokens"?"Sol 等价 Token":"Token",share=modelTotal>0?`${(100*value/modelTotal).toFixed(1)}%` : "—",title=session.metadata?.title||"未命名会话",planStatus=sessionPlanStatus(session),modelBadges=`<span class="tooltip-badges"><span class="tooltip-badge">${esc(modelWatermarkLabel(model))}</span>${planStatus?`<span class="tooltip-badge tooltip-badge-secondary">${esc(planStatus)}</span>`:""}</span>`;tooltip.innerHTML=`<div class="tooltip-title"><strong>${esc(title)}</strong>${modelBadges}</div><div class="tooltip-metrics"><div class="tooltip-metric token"><span>当前会话消耗</span><strong>${fmt(pieDisplayValue(value,valueKey))}</strong><small>${metric} · 占该模型 ${share}</small></div><div class="tooltip-metric context"><span>会话总量</span><strong>${fmt(usage.total)}</strong><small>${fmt(session.summary?.turnCount||0)} 轮 · ${esc(sessionEffort(session))}</small></div></div><div class="tooltip-grid"><span>使用模型</span><b>${esc(model)}</b><span>最近活动</span><b>${esc(dateText(session.metadata?.rangeLastActivityAt))}</b><span>会话 ID</span><b>${esc(session.metadata?.threadId||"—")}</b></div>`;positionTooltip(event,target)}
+  function moveSessionTooltip(event,target){if(event.pointerType!=="touch"&&tooltip.style.display==="block")positionTooltip(event,target)}
   function initialMessagePreview(turn){const message=(turn.messages||[])[0];if(!message)return{text:messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。",truncated:false};const full=String(message.text||"");if(!full){const attachments=[message.imageCount?`${message.imageCount} 张图片`:"",message.audioCount?`${message.audioCount} 条音频`:""].filter(Boolean).join(" · ");return{text:attachments?`初始消息包含 ${attachments}，无文本。`:"初始用户消息没有文本。",truncated:false}}return{text:full.slice(0,TOOLTIP_MESSAGE_LIMIT),truncated:full.length>TOOLTIP_MESSAGE_LIMIT}}
   function outputPreview(turn){const outputs=(turn.outputs||[]).filter(output=>String(output.text||"").trim()),finalOutputs=outputs.filter(output=>String(output.phase||"").toLowerCase()==="final_answer"),selected=(finalOutputs.length?finalOutputs:outputs).at(-1);if(!selected)return{text:"该轮没有可读代理输出。",truncated:false};const full=String(selected.text||""),characters=Array.from(full);return characters.length>TOOLTIP_MESSAGE_LIMIT?{text:characters.slice(0,TOOLTIP_MESSAGE_LIMIT-3).join("")+"...",truncated:true}:{text:full,truncated:false}}
   function tooltipMessage(turn){return isSatelliteTurn(turn)?outputPreview(turn):initialMessagePreview(turn)} function tooltipMessageLabel(turn){return isSatelliteTurn(turn)?"代理输出":"初始用户消息"}
   function drawerOutputSection(turn){if(!isSatelliteTurn(turn))return"";const outputs=(turn.outputs||[]).filter(output=>String(output.text||"").trim()),text=outputs.length?outputs.map(output=>String(output.text||"")).join("\n\n"):"该轮没有可读代理输出。";return `<div class="message"><div class="message-head">代理输出${outputs.length?` · ${outputs.length} 条`:""}</div><pre>${esc(text)}</pre></div>`}
   function previousTurnForTooltip(turn){const sequence=[...(activeSession()?.turns||[])].sort((a,b)=>Number(a.index)-Number(b.index)),index=sequence.findIndex(candidate=>candidate.turnId===turn.turnId);return index>0?sequence[index-1]:null}
-  function showTurnTooltip(event,turn,target,conversationTotal){if(event?.pointerType==="touch"){hideTooltip();return}const b=turn.breakdown||{},snapshot=contextSnapshot(turn),previous=previousTurnForTooltip(turn),previousSnapshot=previous?contextSnapshot(previous):null,message=tooltipMessage(turn),tokenRows=segmentKeys.map(key=>`<span>${esc(labels[key])}</span><b>${fmt(b[key]||0)}</b>`).join(""),contextPortion=snapshot.occupancyRate==null?"—":`${Number(snapshot.occupancyRate).toFixed(2)}%`,contextAbsolute=snapshot.occupancyRate==null?"未记录 Context 快照":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`,tokenPortion=conversationTotal>0?`${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%`:"—",tokenAbsolute=`${fmt(turn.usage.total)} / ${fmt(conversationTotal)} Token`,contextDelta=previousSnapshot?.occupancyRate==null||snapshot.occupancyRate==null?"":(()=>{const delta=Number(snapshot.occupancyRate)-Number(previousSnapshot.occupancyRate);if(Math.abs(delta)<0.005)return"无变化";return delta>0?`增加了 ${delta.toFixed(2)}%`:`减少了 ${Math.abs(delta).toFixed(2)}%`})();tooltip.innerHTML=`<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div><div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change" style="font-size:11px;font-weight:550;color:var(--muted);white-space:nowrap">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div><div class="tooltip-grid"><span>来源</span><b>${esc(turn.sourceLabel||"主会话")}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${fmt(turn.compactions)}</b></div><div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${fmt(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div><div class="tooltip-section"><div class="tooltip-section-label">${tooltipMessageLabel(turn)}</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;positionTooltip(event,target)}
+  function showTurnTooltip(event,turn,target,conversationTotal){if(event?.pointerType==="touch"){hideTooltip();return}const b=turn.breakdown||{},snapshot=contextSnapshot(turn),previous=previousTurnForTooltip(turn),previousSnapshot=previous?contextSnapshot(previous):null,message=tooltipMessage(turn),tokenRows=segmentKeys.map(key=>`<span>${esc(labels[key])}</span><b>${fmt(b[key]||0)}</b>`).join(""),contextPortion=snapshot.occupancyRate==null?"—":`${Number(snapshot.occupancyRate).toFixed(2)}%`,contextAbsolute=snapshot.occupancyRate==null?"未记录 Context 快照":`${fmt(snapshot.tokens)} / ${snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)} Token`,tokenPortion=conversationTotal>0?`${(100*Math.max(0,Number(turn.usage.total)||0)/conversationTotal).toFixed(2)}%`:"—",tokenAbsolute=`${fmt(turn.usage.total)} / ${fmt(conversationTotal)} Token`,contextDelta=previousSnapshot?.occupancyRate==null||snapshot.occupancyRate==null?"":(()=>{const delta=Number(snapshot.occupancyRate)-Number(previousSnapshot.occupancyRate);if(Math.abs(delta)<0.005)return"无变化";return delta>0?`增加了 ${delta.toFixed(2)}%`:`减少了 ${Math.abs(delta).toFixed(2)}%`})();tooltip.innerHTML=`<div class="tooltip-title"><strong>第 ${turn.index} 轮</strong><span class="tooltip-badge">${esc(statusText(turn.status))}</span></div><div class="tooltip-metrics"><div class="tooltip-metric context"><span>Context 占用</span><strong>${esc(contextPortion)}${contextDelta?`<span class="tooltip-change" style="font-size:11px;font-weight:550;color:var(--muted);white-space:nowrap">（${esc(contextDelta)}）</span>`:""}</strong><small>${esc(contextAbsolute)}</small></div><div class="tooltip-metric token"><span>本轮 Token 占比</span><strong>${esc(tokenPortion)}</strong><small>${esc(tokenAbsolute)}</small></div></div><div class="tooltip-grid"><span>来源</span><b>${esc(turn.sourceLabel||"主会话")}</b><span>模型</span><b>${esc((turn.models||[]).join(", ")||"—")}</b><span>开始／结束</span><b>${esc(dateText(turn.startedAt))} — ${esc(dateText(turn.endedAt))}</b><span>快照</span><b>${esc(contextTypeText(snapshot.snapshotType))} · ${esc(dateText(snapshot.timestamp))}</b><span>Compaction</span><b>${formatCount(turn.compactions)}</b></div><div class="tooltip-section"><div class="tooltip-section-label">Token 构成 · 总量 ${fmt(turn.usage.total)}</div><div class="tooltip-grid">${tokenRows}</div></div><div class="tooltip-section"><div class="tooltip-section-label">${tooltipMessageLabel(turn)}</div><div class="tooltip-message">${esc(message.text)}</div>${message.truncated?'<div class="tooltip-truncated">已截断；全文见轮次详情</div>':""}</div>`;positionTooltip(event,target)}
   function moveTurnTooltip(event,target){if(event.pointerType!=="touch"&&tooltip.style.display==="block")positionTooltip(event,target)}
   function focusTurnTooltip(event,turn,target,conversationTotal){if(target.matches(":focus-visible"))showTurnTooltip(event,turn,target,conversationTotal)}
   function turnTargetKeydown(event,turn){if(event.key==="Enter"||event.key===" "){event.preventDefault();hideTooltip();openDrawer(turn)}}
@@ -2989,38 +3314,48 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
     const compactionMarkers=[...svg.querySelectorAll(".context-compaction")];let compactionIndex=0;entries.forEach(entry=>{const count=(entry.turn.contextCompactions||[]).length;if(entry.satellite){const geometry=satelliteGeometry(cx,cy,outerOuter,entry);for(let index=0;index<count;index+=1){const event=entry.turn.contextCompactions[index],offset=Math.max(0,Math.min(entry.tokens,Number(event.turnTokenOffset)||0)),fraction=(entry.tokenStart+offset)/denominator,from=radialPoint(cx,cy,outerOuter+12,fraction),to=radialPoint(cx,cy,geometry.outer+8,fraction),marker=compactionMarkers[compactionIndex+index];if(marker){marker.classList.add("satellite-compaction");marker.setAttribute("transform",`translate(${(to.x-from.x).toFixed(2)} ${(to.y-from.y).toFixed(2)})`)}}}compactionIndex+=count});
     const startPoint=radialPoint(cx,cy,outerOuter+18,0),endPoint=radialPoint(cx,cy,outerOuter+18,1);[[startPoint,"Token 0%","start"],[endPoint,"Token 100%","end"]].forEach(([point,label,anchor])=>{const node=svgEl("text",{x:point.x,y:point.y+4,"text-anchor":anchor,fill:css("--muted"),"font-size":"11","font-weight":"700"});node.textContent=label;svg.appendChild(node)});const outerLabel=svgEl("text",{x:24,y:33,fill:css("--muted"),"font-size":"12","font-weight":"700"});outerLabel.textContent="主圈 · Token 消耗（累计 Token 进度）";svg.appendChild(outerLabel);const satelliteLabel=svgEl("text",{x:24,y:53,fill:css("--muted"),"font-size":"12"});satelliteLabel.textContent="卫星层 · 子 agent Token（连接至主 turn）";svg.appendChild(satelliteLabel);const innerLabel=svgEl("text",{x:24,y:73,fill:css("--muted"),"font-size":"12"});innerLabel.textContent="内环 · Context 快照（按 Token 位置阶梯变化）";svg.appendChild(innerLabel)
   }
+  function donutSlicePath(cx,cy,outer,inner,start,end){const x1=cx+outer*Math.cos(start),y1=cy+outer*Math.sin(start),x2=cx+outer*Math.cos(end),y2=cy+outer*Math.sin(end),ix1=cx+inner*Math.cos(start),iy1=cy+inner*Math.sin(start),ix2=cx+inner*Math.cos(end),iy2=cy+inner*Math.sin(end),large=end-start>Math.PI?1:0;return`M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${outer} ${outer} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} L ${ix2.toFixed(2)} ${iy2.toFixed(2)} A ${inner} ${inner} 0 ${large} 0 ${ix1.toFixed(2)} ${iy1.toFixed(2)} Z`}
+  function modelSliceLayout(entries,valueKey){const values=entries.map(entry=>Math.max(0,Number(entry[valueKey])||0)),total=values.reduce((sum,value)=>sum+value,0),visibleEntries=entries.filter((entry,index)=>values[index]>0),slices=[];let angle=-Math.PI/2;entries.forEach((entry,index)=>{const value=values[index];if(value<=0)return;const span=2*Math.PI*value/total,gap=visibleEntries.length>1?Math.min(.026,span/4):.004;slices.push({entry,value,span,gap,start:angle,end:angle+span});angle+=span});return{values,total,visibleEntries,slices}}
+  function renderSessionRing(svg,entries,valueKey,unit){const layout=modelSliceLayout(entries,valueKey);if(!layout.total)return;layout.slices.forEach(modelSlice=>{const model=modelSlice.entry.model;if(model==="多模型")return;const sessionEntries=sessions.flatMap((session,index)=>{const usage=Array.isArray(session?.summary?.modelUsage)?session.summary.modelUsage:[];if(usage.length!==1||usage[0].model!==model)return[];const value=Math.max(0,Number(usage[0][valueKey])||0);return value?[{session,value,index}]:[]});if(!sessionEntries.length)return;let angle=modelSlice.start;sessionEntries.forEach((entry,index)=>{const span=modelSlice.span*entry.value/modelSlice.value,gap=sessionEntries.length>1?Math.min(.02,span/4):.003,start=angle+gap/2,end=angle+span-gap/2,sessionId=entry.session.metadata.threadId||String(entry.index),sessionTitle=entry.session.metadata.title||sessionId,visual=modelVisual(model),selected=state.selectedSessionIds.has(sessionId),path=svgEl("path",{d:donutSlicePath(220,145,126,111,start,end),fill:visual[0],opacity:".82",stroke:"#fffefa","stroke-width":"2","stroke-linejoin":"round",class:`session-donut-sector${selected?" selected":""}`,tabindex:"0",role:"button","aria-pressed":String(selected),"data-session-id":sessionId,"aria-label":`${model} · ${sessionTitle} · ${fmt(pieDisplayValue(entry.value,valueKey))} ${unit}`}),title=svgEl("title",{});title.textContent=`${model} · 会话 · ${sessionTitle} · ${fmt(pieDisplayValue(entry.value,valueKey))} ${unit} · ${(100*entry.value/modelSlice.value).toFixed(1)}%`;path.appendChild(title);path.addEventListener("pointerenter",event=>{setSessionHover(sessionId);showSessionTooltip(event,entry.session,path,model,valueKey,entry.value,modelSlice.value)});path.addEventListener("pointermove",event=>moveSessionTooltip(event,path));path.addEventListener("pointerleave",()=>{clearSessionHover(sessionId);hideTooltip()});path.addEventListener("focus",event=>{setSessionHover(sessionId);showSessionTooltip(event,entry.session,path,model,valueKey,entry.value,modelSlice.value)});path.addEventListener("blur",()=>{clearSessionHover(sessionId);hideTooltip()});path.addEventListener("keydown",event=>ringSessionKeydown(event,sessionId));let clickTimer;path.addEventListener("click",event=>{event.preventDefault();clearTimeout(clickTimer);clickTimer=setTimeout(()=>selectRingSession(event,sessionId),220)});path.addEventListener("dblclick",event=>{event.preventDefault();clearTimeout(clickTimer);event.stopPropagation();enterSessionFromRing(sessionId)});svg.appendChild(path);angle+=span})})}
+  function renderModelPie(svgId,legendId,entries,valueKey,unit){const svg=byId(svgId),legend=byId(legendId),layout=modelSliceLayout(entries,valueKey);svg.replaceChildren();legend.replaceChildren();svg.setAttribute("viewBox","0 0 440 315");if(!layout.total){const empty=svgEl("text",{x:220,y:156,"text-anchor":"middle",class:"pie-empty"});empty.textContent="暂无计划内模型 Token 数据";svg.appendChild(empty);return}const {total,visibleEntries,slices}=layout,cx=220,cy=145,outer=104,inner=68;slices.forEach(slice=>{const {entry,value,start:angle,span,gap}=slice,start=angle+gap/2,end=angle+span-gap/2,visual=modelVisual(entry.model),path=svgEl("path",{d:donutSlicePath(cx,cy,outer,inner,start,end),fill:visual[0],stroke:"#fffefa","stroke-width":"3","stroke-linejoin":"round"});const title=svgEl("title");title.textContent=`${entry.model} · ${fmt(pieDisplayValue(value,valueKey))} ${unit} · ${(100*value/total).toFixed(2)}%`;path.appendChild(title);svg.appendChild(path)});const centerLabel=svgEl("text",{x:cx,y:cy-10,"text-anchor":"middle",fill:css("--muted"),"font-size":"12","font-weight":"750"}),centerValue=svgEl("text",{x:cx,y:cy+17,"text-anchor":"middle",fill:css("--text"),"font-size":"22","font-weight":"850"}),centerUnit=svgEl("text",{x:cx,y:cy+39,"text-anchor":"middle",fill:css("--muted"),"font-size":"11"});centerLabel.textContent="计划内模型";centerValue.textContent=fmt(pieDisplayValue(total,valueKey));centerUnit.textContent=unit;svg.append(centerLabel,centerValue,centerUnit);legend.innerHTML=visibleEntries.map(entry=>{const value=Number(entry[valueKey])||0,visual=modelVisual(entry.model),rate=entry.rateMultiplier==null?"按分类费率":`${Number(entry.rateMultiplier).toFixed(2)}×`;return`<div class="pie-legend-row"><span class="swatch" style="--swatch:${visual[0]}"></span><span class="name" title="${esc(entry.model)}"><strong>${esc(entry.model)}</strong><small>费率 ${esc(rate)}</small></span><span class="value"><b>${fmt(pieDisplayValue(value,valueKey))} ${esc(unit)}</b><small>${(100*value/total).toFixed(1)}%</small></span></div>`}).join("")}
+  function renderModelPies(){const entries=Array.isArray(data.summary.modelUsage)?data.summary.modelUsage:[],rate=data.metadata.rateCard||{},excluded=data.summary.planExcludedUsage||{},excludedTokens=Math.max(0,Number(excluded.rawTokens)||0),note=byId("model-plan-note");byId("range-model-pie-view").hidden=false;byId("range-session-context-view").hidden=true;byId("model-rate-meta").textContent=`费率表生效：${rate.effectiveDate||"—"} · 最近核验：${dateText(rate.checkedAt)} · 来源：${rate.source||"—"}`;note.hidden=excludedTokens<=0;if(excludedTokens>0){note.innerHTML=`<span>ⓘ</span><span><strong>Spark 未纳入模型对比：</strong>共计 ${fmt(excludedTokens)} Token。总 Token 仍保留，但不参与模型图和费率比较。</span>`}else note.replaceChildren();renderModelPie("model-token-pie","model-token-legend",entries,"rawTokens","Token");renderSessionRing(byId("model-token-pie"),entries,"rawTokens","Token");renderModelPie("model-weighted-pie","model-weighted-legend",entries,"weightedTokens","Sol 等价 Token");renderSessionRing(byId("model-weighted-pie"),entries,"weightedTokens","Sol 等价 Token")}
   function renderToolsStandalone(){if(isTotal())return;const session=activeSession(),ordered=[...(session?.turns||[])].sort((a,b)=>contextOrderTime(a).localeCompare(contextOrderTime(b))||a.index-b.index),total=ordered.reduce((sum,turn)=>sum+Math.max(0,Number(turn.usage.total)||0),0),denominator=Math.max(total,1);renderToolLayer(byId("range-context-radial-chart"),radialEntries(ordered,denominator),380,300,234,denominator)}
-  function renderContext(){renderContextBase();renderToolsStandalone()}
-  function renderComposition(){const visible=rows(),svg=byId("composition");svg.replaceChildren();byId("visible-count").textContent=`当前显示 ${visible.length} ${isTotal()?"个会话":"轮"}`;byId("composition-title").textContent=isTotal()?"各会话 Token 构成":"每轮 Token 构成";byId("composition-note").textContent=isTotal()?"点击柱形进入对应会话。":"主会话与子代理按时间合并；点击柱形查看详情。";byId("content-search").placeholder=isTotal()?"搜索会话标题、ID、来源……":messagesIncluded?"搜索消息、轮次 ID、模型、来源……":"搜索轮次 ID、模型、来源……";document.querySelectorAll(".turn-only").forEach(x=>x.hidden=isTotal());byId("legend").innerHTML=segmentKeys.map(k=>`<span style="--swatch:${colors[k]}">${esc(labels[k])}</span>`).join("");const width=Math.max(1100,visible.length*30+110),height=410,m={t:16,r:20,b:48,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);svg.style.minWidth=`${width}px`;if(!visible.length){text(svg,width/2,height/2,"没有符合条件的数据","middle");return}const max=Math.max(...visible.map(r=>r.usage.total),1),scaled=v=>state.scale==="log"?Math.log10(1+v)/Math.log10(1+max):v/max;const ticks=state.scale==="log"?[0,...Array.from({length:Math.floor(Math.log10(max))+1},(_,i)=>10**i).filter(v=>v<=max)]:niceTicks(max);ticks.forEach(tick=>{const y=m.t+ih*(1-scaled(tick));svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const step=iw/visible.length,bw=Math.max(4,Math.min(20,step*.72));visible.forEach((row,pos)=>{const x=m.l+pos*step+(step-bw)/2,total=Math.max(0,row.usage.total),totalH=ih*scaled(total);let y=m.t+ih;const g=svgEl("g",{class:"bar",tabindex:"0",role:"button","data-turn-target":"true"});segmentKeys.forEach(k=>{const value=Math.max(0,row.breakdown[k]||0);if(!value||!total)return;const h=totalH*value/Math.max(total,1);y-=h;g.appendChild(svgEl("rect",{x,y,width:bw,height:Math.max(.5,h),fill:colors[k],rx:"1"}))});const title=svgEl("title");title.textContent=`${isTotal()?row.title:`第 ${row.index} 轮`} · ${fmt(total)} Token`;g.appendChild(title);g.addEventListener("click",()=>isTotal()?selectView(row.turnId):openDrawer(row));svg.appendChild(g);if(visible.length<=35||pos%Math.ceil(visible.length/28)===0)text(svg,x+bw/2,height-22,String(row.index),"middle")});text(svg,m.l+iw/2,height-4,isTotal()?"会话序号":"轮次序号","middle")}
-  function renderTrend(){const svg=byId("trend");svg.replaceChildren();let pointsData;if(isTotal()){pointsData=data.summary.dailyUsage||[];byId("trend-title").textContent="每日 Token 消耗";byId("trend-note").textContent="按 token_count 快照发生的本地日期归属。"}else{let cumulative=0;pointsData=(activeSession()?.turns||[]).map(t=>({date:`第 ${t.index} 轮`,usage:{total:(cumulative+=Number(t.usage.total||0))}}));byId("trend-title").textContent="会话累计消耗";byId("trend-note").textContent="按统一时间线中的轮次线性累计。"}const width=1200,height=270,m={t:18,r:24,b:42,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);if(!pointsData.length){text(svg,width/2,height/2,"没有趋势数据","middle");return}const max=Math.max(...pointsData.map(p=>Number(p.usage.total||0)),1);niceTicks(max,4).forEach(tick=>{const y=m.t+ih*(1-tick/max);svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const pts=pointsData.map((p,i)=>({x:m.l+(pointsData.length===1?iw/2:i*iw/(pointsData.length-1)),y:m.t+ih*(1-Number(p.usage.total||0)/max),label:p.date,value:Number(p.usage.total||0)}));if(pts.length>1)svg.appendChild(svgEl("path",{d:pts.map((p,i)=>`${i?"L":"M"}${p.x},${p.y}`).join(" "),fill:"none",stroke:css("--accent"),"stroke-width":"2.5"}));pts.forEach((p,i)=>{const c=svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:css("--accent")});const title=svgEl("title");title.textContent=`${p.label} · ${fmt(p.value)} Token`;c.appendChild(title);svg.appendChild(c);if(pts.length<=12||i%Math.ceil(pts.length/10)===0)text(svg,p.x,height-16,p.label,"middle")})}
+  function renderContext(){if(isTotal()){renderModelPies();return}byId("range-model-pie-view").hidden=true;byId("range-session-context-view").hidden=false;renderContextBase();renderToolsStandalone()}
+  function renderComposition(){const visible=rows(),svg=byId("composition");svg.replaceChildren();byId("visible-count").textContent=`显示 ${visible.length} ${isTotal()?"个会话":"轮"}`;byId("composition-title").textContent=isTotal()?"会话 Token 构成":"单轮 Token 构成";byId("composition-note").textContent="";byId("composition-note").hidden=true;byId("content-search").placeholder=isTotal()?"搜索会话标题、ID 或来源……":messagesIncluded?"搜索消息、轮次 ID、模型或来源……":"搜索轮次 ID、模型或来源……";document.querySelectorAll(".turn-only").forEach(x=>x.hidden=isTotal());byId("legend").innerHTML=segmentKeys.map(k=>`<span style="--swatch:${colors[k]}">${esc(labels[k])}</span>`).join("");const width=Math.max(1100,visible.length*30+110),height=410,m={t:16,r:20,b:48,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);svg.style.minWidth=`${width}px`;if(!visible.length){text(svg,width/2,height/2,"没有符合条件的数据","middle");return}const max=Math.max(...visible.map(r=>r.usage.total),1),scaled=v=>state.scale==="log"?Math.log10(1+v)/Math.log10(1+max):v/max;const ticks=state.scale==="log"?[0,...Array.from({length:Math.floor(Math.log10(max))+1},(_,i)=>10**i).filter(v=>v<=max)]:niceTicks(max);ticks.forEach(tick=>{const y=m.t+ih*(1-scaled(tick));svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const step=iw/visible.length,bw=Math.max(4,Math.min(20,step*.72));visible.forEach((row,pos)=>{const x=m.l+pos*step+(step-bw)/2,total=Math.max(0,row.usage.total),totalH=ih*scaled(total);let y=m.t+ih;const g=svgEl("g",{class:"bar",tabindex:"0",role:"button","data-turn-target":"true"});segmentKeys.forEach(k=>{const value=Math.max(0,row.breakdown[k]||0);if(!value||!total)return;const h=totalH*value/Math.max(total,1);y-=h;g.appendChild(svgEl("rect",{x,y,width:bw,height:Math.max(.5,h),fill:colors[k],rx:"1"}))});const title=svgEl("title");title.textContent=`${isTotal()?row.title:`第 ${row.index} 轮`} · ${fmt(total)} Token`;g.appendChild(title);g.addEventListener("click",()=>isTotal()?selectView(row.turnId):openDrawer(row));svg.appendChild(g);if(visible.length<=35||pos%Math.ceil(visible.length/28)===0)text(svg,x+bw/2,height-22,String(row.index),"middle")});text(svg,m.l+iw/2,height-4,isTotal()?"会话序号":"轮次序号","middle")}
+  function renderTrend(){const svg=byId("trend");svg.replaceChildren();let pointsData;if(isTotal()){pointsData=data.summary.dailyUsage||[];byId("trend-title").textContent="每日 Token 消耗"}else{let cumulative=0;pointsData=(activeSession()?.turns||[]).map(t=>({date:`第 ${t.index} 轮`,usage:{total:(cumulative+=Number(t.usage.total||0))}}));byId("trend-title").textContent="会话累计消耗"}byId("trend-note").textContent="";byId("trend-note").hidden=true;const width=1200,height=270,m={t:18,r:24,b:42,l:76},iw=width-m.l-m.r,ih=height-m.t-m.b;svg.setAttribute("viewBox",`0 0 ${width} ${height}`);if(!pointsData.length){text(svg,width/2,height/2,"没有趋势数据","middle");return}const max=Math.max(...pointsData.map(p=>Number(p.usage.total||0)),1);niceTicks(max,4).forEach(tick=>{const y=m.t+ih*(1-tick/max);svg.appendChild(svgEl("line",{x1:m.l,x2:width-m.r,y1:y,y2:y,class:"grid"}));text(svg,m.l-9,y+4,compact(tick))});const pts=pointsData.map((p,i)=>({x:m.l+(pointsData.length===1?iw/2:i*iw/(pointsData.length-1)),y:m.t+ih*(1-Number(p.usage.total||0)/max),label:p.date,value:Number(p.usage.total||0)}));if(pts.length>1)svg.appendChild(svgEl("path",{d:pts.map((p,i)=>`${i?"L":"M"}${p.x},${p.y}`).join(" "),fill:"none",stroke:css("--accent"),"stroke-width":"2.5"}));pts.forEach((p,i)=>{const c=svgEl("circle",{cx:p.x,cy:p.y,r:4,fill:css("--accent")});const title=svgEl("title");title.textContent=`${p.label} · ${fmt(p.value)} Token`;c.appendChild(title);svg.appendChild(c);if(pts.length<=12||i%Math.ceil(pts.length/10)===0)text(svg,p.x,height-16,p.label,"middle")})}
   function renderTable(){
-    const visible=rows(),head=byId("table-head"),body=byId("table-body"),empty=byId("table-empty");byId("table-title").textContent=isTotal()?"会话汇总":"轮次明细";byId("table-note").textContent=isTotal()?"点击会话切换到统一逐轮时间线。":"点击轮次查看完整消息、上下文快照和裁剪信息。";
+    const visible=rows(),head=byId("table-head"),body=byId("table-body"),empty=byId("table-empty");byId("table-title").textContent=isTotal()?"会话总览":"逐轮明细";byId("table-note").textContent="";byId("table-note").hidden=true;
     if(isTotal()){
-      head.innerHTML="<tr><th>#</th><th>会话</th><th>来源</th><th>最后活动</th><th>轮次</th><th>缓存读取</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>总量</th><th>缓存率</th></tr>";
-      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage;return`<tr data-id="${esc(r.turnId)}"><td>${r.index}</td><td class="title-cell" title="${esc(r.title)}">${esc(r.title)}</td><td>${esc(r.sourceLabel)}</td><td>${esc(dateText(r.startedAt))}</td><td>${fmt(r.session.summary.turnCount)}</td><td>${fmt(b.cachedInput)}</td><td>${data.metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>selectView(row.dataset.id)));
+      head.innerHTML="<tr><th>#</th><th>会话</th><th>来源</th><th>最近活动</th><th>轮次</th><th>缓存输入</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>Token 总量</th><th>缓存命中率</th></tr>";
+      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage;return`<tr data-id="${esc(r.turnId)}"><td>${r.index}</td><td class="title-cell" title="${esc(r.title)}">${esc(r.title)}</td><td>${esc(r.sourceLabel)}</td><td>${esc(dateText(r.startedAt))}</td><td>${formatCount(r.session.summary.turnCount)}</td><td>${fmt(b.cachedInput)}</td><td>${data.metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>selectView(row.dataset.id)));
     }else{
-      head.innerHTML="<tr><th>轮次</th><th>来源</th><th>状态</th><th>开始时间</th><th>模型响应</th><th>缓存读取</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>总量</th><th>缓存率</th><th>上下文占用</th><th>上下文率</th><th>用户消息</th></tr>";
-      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage,p=firstPrompt(r).replace(/\s+/g," ").trim(),snapshot=contextSnapshot(r),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return`<tr data-id="${esc(r.turnId)}" data-turn-target="true"><td>${r.index}${r.rangeClipped?' <span class="provisional" title="已按日期范围裁剪">◐</span>':""}</td><td>${esc(r.sourceLabel||"主会话")}</td><td>${esc(statusText(r.status))}</td><td>${esc(dateText(r.startedAt))}</td><td>${fmt(r.modelResponses)}</td><td>${fmt(b.cachedInput)}</td><td>${activeSession().metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td><td title="${esc(contextTitle)}">${snapshot.tokens==null?"—":fmt(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="title-cell" title="${esc(p)}">${esc(p||"—")}</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer((activeSession()?.turns||[]).find(t=>t.turnId===row.dataset.id))));
+      head.innerHTML="<tr><th>轮次</th><th>来源</th><th>状态</th><th>开始时间</th><th>模型响应</th><th>缓存输入</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>Token 总量</th><th>缓存命中率</th><th>Context 占用</th><th>Context 占用率</th><th>用户输入</th></tr>";
+      body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage,p=firstPrompt(r).replace(/\s+/g," ").trim(),snapshot=contextSnapshot(r),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return`<tr data-id="${esc(r.turnId)}" data-turn-target="true"><td>${r.index}${r.rangeClipped?' <span class="provisional" title="已按日期范围裁剪">◐</span>':""}</td><td>${esc(r.sourceLabel||"主会话")}</td><td>${esc(statusText(r.status))}</td><td>${esc(dateText(r.startedAt))}</td><td>${formatCount(r.modelResponses)}</td><td>${fmt(b.cachedInput)}</td><td>${activeSession().metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td><td title="${esc(contextTitle)}">${snapshot.tokens==null?"—":fmt(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="title-cell" title="${esc(p)}">${esc(p||"—")}</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer((activeSession()?.turns||[]).find(t=>t.turnId===row.dataset.id))));
     }
     empty.hidden=visible.length>0;empty.textContent=isTotal()?"指定日期范围内没有会话活动。":"没有符合当前筛选条件的轮次。";
   }
   function openDrawer(turn){
-    if(!turn)return;state.selected=turn.turnId;byId("drawer-title").textContent=`第 ${turn.index} 轮 · ${turn.sourceLabel||"主会话"}`;const snapshot=contextSnapshot(turn),details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["来源",turn.sourceLabel||"主会话"],["开始时间",dateText(turn.startedAt)],["结束时间",dateText(turn.endedAt)],["范围活动",`${dateText(turn.rangeFirstActivityAt)} — ${dateText(turn.rangeLastActivityAt)}`],["日期裁剪",turn.rangeClipped?"是":"否"],["模型",(turn.models||[]).join(", ")||"—"],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":fmt(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",fmt(turn.compactions)],["总 Token",fmt(turn.usage.total)],["输入",fmt(turn.usage.input)],["输出",fmt(turn.usage.output)],["推理输出",fmt(turn.usage.reasoning)]];
+    if(!turn)return;state.selected=turn.turnId;byId("drawer-title").textContent=`第 ${turn.index} 轮 · ${turn.sourceLabel||"主会话"}`;const snapshot=contextSnapshot(turn),details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["来源",turn.sourceLabel||"主会话"],["开始时间",dateText(turn.startedAt)],["结束时间",dateText(turn.endedAt)],["范围活动",`${dateText(turn.rangeFirstActivityAt)} — ${dateText(turn.rangeLastActivityAt)}`],["日期裁剪",turn.rangeClipped?"是":"否"],["模型",(turn.models||[]).join(", ")||"—"],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":fmt(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",formatCount(turn.compactions)],["总 Token",fmt(turn.usage.total)],["输入",fmt(turn.usage.input)],["输出",fmt(turn.usage.output)],["推理输出",fmt(turn.usage.reasoning)]];
     let html=`<div class="detail-grid">${details.map(d=>`<div class="detail"><span>${esc(d[0])}</span><b>${esc(d[1])}</b></div>`).join("")}</div>`;
     if((turn.contextCompactions||[]).length){const lines=turn.contextCompactions.map((event,index)=>{const side=value=>value?`${fmt(value.tokens)} / ${value.windowTokens==null?"—":fmt(value.windowTokens)} · ${contextRateText(value)}`:"未知";return`#${index+1} · ${dateText(event.timestamp)}\n  turn 内 Token 位置：${event.turnTokenOffset==null?"未知":fmt(event.turnTokenOffset)}\n  压缩前：${side(event.before)}\n  压缩后：${side(event.after)}`});html+=`<div class="message"><div class="message-head">Compaction 前后上下文</div><pre>${esc(lines.join("\n\n"))}</pre></div>`}
     if(isSatelliteTurn(turn))html+=drawerOutputSection(turn);else html+=(turn.messages||[]).length?turn.messages.map((m,i)=>`<section class="message"><div class="message-head">${i?"追加用户消息":"初始用户消息"} · ${esc(dateText(m.timestamp))}</div><pre></pre></section>`).join(""):`<div class="message"><div class="message-head">用户消息</div><pre>${messagesIncluded?"该轮未记录范围内用户消息。":"生成报告时已排除用户消息。"}</pre></div>`;byId("drawer-body").innerHTML=html;byId("drawer-body").querySelectorAll("section.message pre").forEach((pre,i)=>pre.textContent=turn.messages[i].text);byId("drawer").classList.add("open");byId("drawer").setAttribute("aria-hidden","false");renderContext();renderTable();
   }
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
-  function setTab(tab){const contextButton=byId("tab-context"),contextDisabled=isTotal();contextButton.disabled=contextDisabled;if(contextDisabled&&tab==="context")tab="composition";if(!["composition","trend","context","table"].includes(tab))tab="composition";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab})}
-  function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition();renderContext();renderTable()}
-  function render(){renderHeader();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
+  function setTab(tab){const contextButton=byId("tab-context");contextButton.disabled=false;contextButton.textContent=isTotal()?"模型消耗概览":"Token 与 Context";if(!["composition","trend","context","table"].includes(tab))tab="context";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab});syncFilterVisibility(tab)}
+  function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.modelFilters=new Set(modelFilterModels());state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";syncToolFilterInputs();renderModelFilter();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderNav();renderComposition();renderContext();renderTable()}
+  function render(){renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
+  history.replaceState({...(history.state||{}),codexTokenReport:true,view:"total",returnToTotalSessionId:null},"","");
+  window.addEventListener("popstate",event=>{const entry=event.state;applyView(entry?.codexTokenReport?entry.view:"total",Boolean(entry?.codexTokenReport&&entry.returnToTotalSessionId))});
   byId("range-label").textContent=`${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate} · ${data.metadata.dateWindow.timezone}`;
   byId("nav-search").addEventListener("input",renderNav);
-  byId("session-drawer-toggle").addEventListener("click",()=>setSessionNav(!state.sessionNavOpen,true));
+  byId("return-total-from-ring").addEventListener("click",goToTotal);
+  byId("go-total-session").addEventListener("click",goToTotal);
+  byId("sidebar-rail-toggle").addEventListener("click",()=>setSessionNav(true,true));
   byId("session-drawer-close").addEventListener("click",()=>setSessionNav(false,true));
   byId("session-drawer-backdrop").addEventListener("click",()=>setSessionNav(false,true));
   document.querySelectorAll("[data-tab-target]").forEach(button=>button.addEventListener("click",()=>setTab(button.dataset.tabTarget)));
   byId("content-search").addEventListener("input",e=>{state.query=e.target.value.trim().toLocaleLowerCase();renderComposition();renderContext();renderTable()});
+   byId("token-unit-slider").addEventListener("input",event=>setTokenUnit(TOKEN_UNIT_ORDER[Number(event.target.value)]||"raw"));
   document.querySelectorAll("[data-status]").forEach(input=>input.addEventListener("change",()=>{input.checked?state.statuses.add(input.dataset.status):state.statuses.delete(input.dataset.status);renderComposition();renderContext();renderTable()}));
   byId("reset-filters").addEventListener("click",resetFilters);
   byId("linear").addEventListener("click",()=>{state.scale="linear";byId("linear").classList.add("active");byId("log").classList.remove("active");renderComposition()});
@@ -3028,7 +3363,7 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   byId("drawer-close").addEventListener("click",closeDrawer);
   document.addEventListener("click",event=>{const drawer=byId("drawer");if(event.button!==0||!drawer.classList.contains("open"))return;const target=event.target instanceof Element?event.target:null;if(!target||drawer.contains(target)||target.closest("[data-turn-target=true]"))return;closeDrawer()});
   document.addEventListener("keydown",event=>{if(event.key!=="Escape")return;if(byId("drawer").classList.contains("open"))closeDrawer();else if(state.sessionNavOpen)setSessionNav(false,true)});
-  try{populateToolFilter();setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
+  try{populateToolFilter();renderModelFilter();setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
   } catch (error) {
     console.error("报告初始化失败：", error);
     document.body.innerHTML = "";
