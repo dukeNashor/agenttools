@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tempfile
+import time as monotonic_time
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
@@ -3559,6 +3560,7 @@ def configure_console_encoding() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     configure_console_encoding()
+    started_at = monotonic_time.perf_counter()
     args = build_parser().parse_args(argv)
     roots = [path.expanduser().resolve() for path in args.sessions_root] if args.sessions_root else None
     try:
@@ -3607,15 +3609,18 @@ def main(argv: list[str] | None = None) -> int:
             f"日期：{date_window['startDate']} — {date_window['endDate']}"
             f"（{date_window['timezone']}）"
         )
-        print(f"会话：{summary['sessionCount']:,}")
+        session_count = summary["sessionCount"]
     else:
         print(f"线程：{thread_id}")
+        session_count = 1
+    print(f"会话：{session_count:,}")
     print(f"轮次：{summary['turnCount']:,}")
     print(f"总 Token：{usage['total']:,}")
     print(f"输入：{usage['input']:,}（缓存读取：{usage['cached']:,}）")
     print(f"输出：{usage['output']:,}（推理输出：{usage['reasoning']:,}）")
     print(f"完整性错误：{summary['integrityErrorCount']:,}")
     print(f"用户消息：{'已嵌入' if report['metadata']['messagesIncluded'] else '已排除'}")
+    print(f"耗时：{monotonic_time.perf_counter() - started_at:.2f} 秒")
     print(f"报告：{output}")
     if args.open:
         webbrowser.open(output.as_uri())

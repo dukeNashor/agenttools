@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import date, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -757,21 +758,27 @@ class VisualizerTests(unittest.TestCase):
                 ],
             )
             output = Path(temp) / "range.html"
-            rc = viz.main(
-                [
-                    "--from",
-                    "2026-01-02",
-                    "--to",
-                    "2026-01-02",
-                    "--sessions-root",
-                    str(sessions),
-                    "--strict",
-                    "--output",
-                    str(output),
-                ]
-            )
+            stdout = io.StringIO()
+            with patch.object(viz.webbrowser, "open") as open_report, redirect_stdout(stdout):
+                rc = viz.main(
+                    [
+                        "--from",
+                        "2026-01-02",
+                        "--to",
+                        "2026-01-02",
+                        "--sessions-root",
+                        str(sessions),
+                        "--strict",
+                        "--output",
+                        str(output),
+                    ]
+                )
             rendered = output.read_text(encoding="utf-8")
         self.assertEqual(rc, 0)
+        open_report.assert_not_called()
+        self.assertIn("会话：1", stdout.getvalue())
+        self.assertRegex(stdout.getvalue(), r"耗时：\d+\.\d{2} 秒")
+        self.assertIn(f"报告：{output.resolve()}", stdout.getvalue())
         self.assertIn('"mode":"range"', rendered)
         self.assertIn("会话列表", rendered)
         self.assertIn("总统计", rendered)

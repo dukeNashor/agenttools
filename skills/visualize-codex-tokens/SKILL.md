@@ -23,8 +23,8 @@ Generate the report with `scripts/codex_token_visualizer.py`.
 
 4. Pass `--output <path>` when the user chooses a destination. Otherwise let the script write a stable file under the system temporary `agenttools` directory, named with the thread ID or date range.
 5. Pass `--exclude-messages` only when the user asks to omit user messages. Reports include complete user messages by default.
-6. Pass `--open` only when the user explicitly asks to open the report.
-7. Return the report path, total Token count, turn count, session count for date reports, and integrity-error count.
+6. Do not pass `--open` during a normal skill invocation, and do not call a browser/open tool after the script finishes. Pass `--open` only when the user explicitly asks to open the report.
+7. After a successful run, return only a Markdown link to the local HTML file plus a short text brief. The brief must include elapsed wall-clock time, session count, turn count, total Token count, and integrity-error count. Use the script's reported elapsed time when available; for a single-thread report, report the session count as `1`, and for date reports use `summary.sessionCount`. Do not embed, preview, or automatically open the HTML.
 
 For date reports, group subagent rollouts under their top-level task and attribute cumulative-counter deltas to the local date of each `token_count` snapshot. The HTML opens on total statistics and lets the user switch to a top-level session's unified main/subagent turn timeline.
 
