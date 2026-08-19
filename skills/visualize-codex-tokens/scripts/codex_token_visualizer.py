@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Generate a self-contained interactive token report for a Codex rollout.
 
 The parser attributes cumulative token counter deltas to Codex task turns.  It
@@ -2854,14 +2855,56 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
 <script id="report-data" type="application/json">__REPORT_JSON__</script>
 <script>
 (() => {
-  "use strict";
-  const data=JSON.parse(document.getElementById("report-data").textContent),sessions=data.sessions||[],messagesIncluded=data.metadata.messagesIncluded!==false;
-  const colors={cachedInput:css("--cached"),cacheWriteInput:css("--cache-write"),otherNonCachedInput:css("--uncached"),ordinaryOutput:css("--output"),reasoningOutput:css("--reasoning"),unclassified:css("--unclassified")};
-  const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
-  const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
-  const sessionNavMedia=window.matchMedia("(max-width:900px)");
-  const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
-  const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
+  try {
+    "use strict";
+    const safeObject=(value)=> (value && typeof value==="object" && !Array.isArray(value)) ? value : {};
+    const data = (() => {
+      try {
+        return safeObject(JSON.parse(document.getElementById("report-data").textContent));
+      } catch (error) {
+        console.error("报告 JSON 解析失败：", error);
+        return {
+          generator: {name:"codex_token_visualizer", version:""},
+          metadata: {},
+          summary: {finalUsage:{}, finalBreakdown:{}, finalBreakdownMismatch:{}, reconciliationDifference:{}, statusCounts:{}, warningCount:0, integrityErrorCount:0},
+          sessions: [],
+          warnings: []
+        };
+      }
+    })();
+    data.metadata = safeObject(data.metadata); data.summary = safeObject(data.summary); data.summary.finalUsage = safeObject(data.summary.finalUsage);
+    data.summary.finalBreakdown = safeObject(data.summary.finalBreakdown); data.summary.reconciliationDifference = safeObject(data.summary.reconciliationDifference);
+    data.summary.statusCounts = safeObject(data.summary.statusCounts); data.summary.finalUsage = safeObject(data.summary.finalUsage);
+    data.summary.finalBreakdownMismatch = safeObject(data.summary.finalBreakdownMismatch);
+    data.summary.dailyUsage = Array.isArray(data.summary.dailyUsage) ? data.summary.dailyUsage : [];
+    data.summary.toolCategories = safeObject(data.summary.toolCategories);
+    data.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    for (const session of sessions) {
+      session.metadata = safeObject(session.metadata);
+      session.summary = safeObject(session.summary);
+      session.warnings = Array.isArray(session.warnings) ? session.warnings : [];
+      session.orphanMessages = Array.isArray(session.orphanMessages) ? session.orphanMessages : [];
+      session.turns = Array.isArray(session.turns) ? session.turns : [];
+      session.summary.finalUsage = safeObject(session.summary.finalUsage);
+      session.summary.finalBreakdown = safeObject(session.summary.finalBreakdown);
+      session.summary.finalBreakdownMismatch = safeObject(session.summary.finalBreakdownMismatch);
+      session.summary.statusCounts = safeObject(session.summary.statusCounts);
+      for (const turn of session.turns) {
+        turn.usage = safeObject(turn.usage); turn.breakdown = safeObject(turn.breakdown);
+        turn.contextSnapshot = safeObject(turn.contextSnapshot); turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
+        turn.contextCompactions = Array.isArray(turn.contextCompactions) ? turn.contextCompactions : [];
+        turn.messages = Array.isArray(turn.messages) ? turn.messages : [];
+      }
+    }
+    data.sessions = sessions;
+    const messagesIncluded=data.metadata.messagesIncluded!==false;
+    const colors={cachedInput:css("--cached"),cacheWriteInput:css("--cache-write"),otherNonCachedInput:css("--uncached"),ordinaryOutput:css("--output"),reasoningOutput:css("--reasoning"),unclassified:css("--unclassified")};
+    const labels={cachedInput:"缓存读取",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
+    const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
+    const sessionNavMedia=window.matchMedia("(max-width:900px)");
+    const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
+    const state={view:sessions[0]?.metadata.threadId||"total",tab:sessions.length?"context":"composition",scale:"linear",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),statuses:new Set(["complete","aborted","incomplete"]),selected:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
   const toolColors={"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
@@ -2986,6 +3029,14 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
   document.addEventListener("click",event=>{const drawer=byId("drawer");if(event.button!==0||!drawer.classList.contains("open"))return;const target=event.target instanceof Element?event.target:null;if(!target||drawer.contains(target)||target.closest("[data-turn-target=true]"))return;closeDrawer()});
   document.addEventListener("keydown",event=>{if(event.key!=="Escape")return;if(byId("drawer").classList.contains("open"))closeDrawer();else if(state.sessionNavOpen)setSessionNav(false,true)});
   try{populateToolFilter();setSessionNav(state.sessionNavOpen);renderNav();render();document.body.dataset.reportReady="true"}catch(error){document.body.dataset.reportReady="error";const pre=document.createElement("pre");pre.className="empty";pre.textContent=`报告渲染失败：${error.stack||error}`;document.body.prepend(pre);console.error(error)}
+  } catch (error) {
+    console.error("报告初始化失败：", error);
+    document.body.innerHTML = "";
+    const pre = document.createElement("pre");
+    pre.className = "empty";
+    pre.textContent = `报告初始化失败：${error.stack || error}`;
+    document.body.appendChild(pre);
+  }
 })();
 </script>
 </body>
@@ -3098,7 +3149,7 @@ def _date_window_from_args(args: argparse.Namespace) -> DateWindow | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="为一个 Codex 线程或本地日期范围生成自包含的交互式 Token 报告。"
+        description="为一个 Codex 线程或本地日期范围生成自包含的交互式 Token 报告。默认按尽力模式运行，发现完整性问题仅做记录；仅在加 `--strict` 时才因错误终止。"
     )
     parser.add_argument(
         "thread",
@@ -3143,7 +3194,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="发现完整性错误时失败，且不写入 HTML。",
+        help="启用严格模式：发现完整性错误时失败，并终止写入 HTML。",
     )
     parser.add_argument(
         "--open",
@@ -3208,7 +3259,7 @@ def main(argv: list[str] | None = None) -> int:
     output = output.expanduser().resolve()
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(render_html(report, args.title), encoding="utf-8", newline="\n")
+        output.write_text(render_html(report, args.title), encoding="utf-8")
     except OSError as exc:
         print(f"错误：无法写入 {output}：{exc}", file=sys.stderr)
         return 4

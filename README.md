@@ -41,16 +41,16 @@ Run the bundled script directly with Python 3.10 or newer:
 ```powershell
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   <thread-id> `
-  --strict
+  --open
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --today `
-  --strict
+  --open
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --from 2026-08-01 `
   --to 2026-08-16 `
-  --strict
+  --open
 ```
 
 Use `--date YYYY-MM-DD` for one historical local date. The scope selectors and the original thread/JSONL positional input are mutually exclusive. Without `--output`, the report is written under the stable system temporary `agenttools` directory with a thread- or date-based filename. Use `--open` to open it after generation.
@@ -116,16 +116,13 @@ $visualize-codex-tokens 生成 2026-08-01 到 2026-08-16 的报告
 ```powershell
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   <线程ID> `
-  --strict
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --today `
-  --strict
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --from 2026-08-01 `
   --to 2026-08-16 `
-  --strict
 ```
 
 单个历史日期可使用 `--date YYYY-MM-DD`。日期选择参数与原有线程／JSONL 位置参数互斥。未指定 `--output` 时，报告以线程或日期命名，写入系统临时目录下稳定的 `agenttools` 目录。需要生成后打开时使用 `--open`。
