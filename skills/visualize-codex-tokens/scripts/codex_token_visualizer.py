@@ -10,10 +10,12 @@ not sum last_token_usage snapshots, because rollbacks can repeat snapshots.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time as monotonic_time
@@ -24,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "2.18.0"
+VERSION = "2.19.0"
 
 # The range report uses the official Codex token-based rate card.  Keep the
 # effective date and the last verification timestamp next to the table so a
@@ -1119,6 +1121,87 @@ def default_session_roots() -> list[Path]:
     return [path for path in roots if path.exists()]
 
 
+@dataclass(frozen=True)
+class ProjectTarget:
+    requested_path: Path
+    match_root: Path
+    git_common_dir: Path | None
+    is_git_repository: bool
+
+
+def _normalise_path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve(strict=False)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.normpath(str(left))) == os.path.normcase(
+        os.path.normpath(str(right))
+    )
+
+
+def _path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath(
+            [os.path.normcase(str(candidate)), os.path.normcase(str(root))]
+        ) == os.path.normcase(os.path.normpath(str(root)))
+    except ValueError:
+        return False
+
+
+def _git_path(path: Path, argument: str) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", argument],
+            capture_output=True,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    if not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = path / candidate
+    return _normalise_path(candidate)
+
+
+def _resolve_project_target(value: str | Path, require_git: bool = False) -> ProjectTarget:
+    supplied = _normalise_path(value)
+    if not supplied.exists():
+        raise FileNotFoundError(f"项目路径不存在：{supplied}")
+    if not supplied.is_dir():
+        raise ValueError(f"项目路径不是目录：{supplied}")
+    git_root = _git_path(supplied, "--show-toplevel")
+    git_common_dir = _git_path(supplied, "--git-common-dir") if git_root else None
+    if require_git and git_root is None:
+        raise ValueError(f"当前会话项目不是可识别的 Git 仓库：{supplied}")
+    return ProjectTarget(
+        requested_path=supplied,
+        match_root=git_root or supplied,
+        git_common_dir=git_common_dir,
+        is_git_repository=git_root is not None,
+    )
+
+
+def _project_target_payload(target: ProjectTarget) -> dict[str, Any]:
+    label = target.match_root.name or str(target.match_root)
+    return {
+        "label": label,
+        "requestedPath": str(target.requested_path),
+        "matchRoot": str(target.match_root),
+        "gitCommonDirectory": str(target.git_common_dir)
+        if target.git_common_dir is not None
+        else None,
+        "isGitRepository": target.is_git_repository,
+    }
+
+
 def resolve_rollout(value: str, roots: Iterable[Path] | None = None) -> Path:
     supplied = Path(value).expanduser()
     if supplied.is_file():
@@ -1605,6 +1688,8 @@ def parse_rollout(
                         event_delta,
                     )
                     note_range_activity(timestamp)
+                elif window is None and event_delta.total > 0:
+                    _add_usage_bucket(daily_usage, _local_date_text(timestamp), event_delta)
                 continue
 
             if event_type in {"task_complete", "turn_aborted"}:
@@ -1940,6 +2025,141 @@ def discover_rollouts(
     return sorted(chosen.values(), key=lambda path: os.path.normcase(str(path)))
 
 
+def _project_match_for_report(
+    report: dict[str, Any],
+    targets: list[ProjectTarget],
+    git_common_cache: dict[str, Path | None],
+) -> ProjectTarget | None:
+    session_meta = report.get("metadata", {}).get("sessionMeta", {})
+    raw_cwd = _coerce_text(session_meta.get("cwd")).strip()
+    if not raw_cwd:
+        return None
+    cwd = _normalise_path(raw_cwd)
+    for target in targets:
+        if _path_is_within(cwd, target.match_root):
+            return target
+
+    if not cwd.exists():
+        return None
+    cache_key = os.path.normcase(os.path.normpath(str(cwd)))
+    if cache_key not in git_common_cache:
+        git_common_cache[cache_key] = _git_path(cwd, "--git-common-dir")
+    session_common_dir = git_common_cache[cache_key]
+    if session_common_dir is None:
+        return None
+    for target in targets:
+        if target.git_common_dir is not None and _same_path(
+            session_common_dir, target.git_common_dir
+        ):
+            return target
+    return None
+
+
+def _parent_rollout_id(report: dict[str, Any]) -> str | None:
+    session_meta = report.get("metadata", {}).get("sessionMeta", {})
+    parent = _coerce_text(
+        session_meta.get("parentThreadId") or session_meta.get("forkedFromId")
+    ).lower()
+    return parent or None
+
+
+def build_project_report(
+    projects: Iterable[str],
+    roots: Iterable[Path] | None = None,
+    current_project: bool = False,
+) -> dict[str, Any]:
+    """Build an un-clipped report for rollouts discovered from project paths."""
+    targets = [
+        _resolve_project_target(value, require_git=False) for value in projects
+    ]
+    if current_project:
+        targets.insert(0, _resolve_project_target(".", require_git=True))
+    deduped_targets: list[ProjectTarget] = []
+    seen_target_keys: set[str] = set()
+    for target in targets:
+        key = os.path.normcase(os.path.normpath(str(target.match_root)))
+        common_key = (
+            os.path.normcase(os.path.normpath(str(target.git_common_dir)))
+            if target.git_common_dir is not None
+            else ""
+        )
+        target_key = f"{key}\n{common_key}"
+        if target_key in seen_target_keys:
+            continue
+        seen_target_keys.add(target_key)
+        deduped_targets.append(target)
+    if not deduped_targets:
+        raise ValueError("项目范围至少需要一个有效的项目目录。")
+
+    candidate_paths = discover_rollouts(roots)
+    parsed_reports = [
+        parse_rollout(path, tolerate_live=True) for path in candidate_paths
+    ]
+    git_common_cache: dict[str, Path | None] = {}
+    direct_matches: dict[str, ProjectTarget] = {}
+    for report in parsed_reports:
+        report_id = _coerce_text(report.get("metadata", {}).get("threadId")).lower()
+        if not report_id:
+            continue
+        match = _project_match_for_report(report, deduped_targets, git_common_cache)
+        if match is not None:
+            direct_matches[report_id] = match
+
+    included_ids = set(direct_matches)
+    changed = True
+    while changed:
+        changed = False
+        for report in parsed_reports:
+            report_id = _coerce_text(report.get("metadata", {}).get("threadId")).lower()
+            if not report_id or report_id in included_ids:
+                continue
+            parent_id = _parent_rollout_id(report)
+            if parent_id in included_ids:
+                included_ids.add(report_id)
+                changed = True
+
+    selected_reports = [
+        report
+        for report in parsed_reports
+        if _coerce_text(report.get("metadata", {}).get("threadId")).lower()
+        in included_ids
+    ]
+    project_payload = [_project_target_payload(target) for target in deduped_targets]
+    project_label = "、".join(payload["label"] for payload in project_payload)
+    selected_ids = [
+        _coerce_text(report.get("metadata", {}).get("threadId")).lower()
+        for report in selected_reports
+        if _coerce_text(report.get("metadata", {}).get("threadId"))
+    ]
+    scope = {
+        "type": "projects",
+        "label": project_label,
+        "projects": project_payload,
+        "matchRule": (
+            "session_meta.cwd 位于项目根目录内，或与项目 Git common directory 相同；"
+            "再沿明确的 parent_thread_id/forked_from_id 纳入子 rollout。"
+        ),
+        "candidateRolloutCount": len(parsed_reports),
+        "directMatchRolloutCount": len(direct_matches),
+        "selectedRolloutCount": len(selected_reports),
+        "selectedRolloutIds": selected_ids,
+    }
+    report = _build_multi_session_report(
+        selected_reports,
+        roots=roots,
+        scope=scope,
+    )
+    report["metadata"]["projectDiscovery"] = {
+        "candidateRolloutCount": len(parsed_reports),
+        "directMatchRolloutCount": len(direct_matches),
+        "selectedRolloutCount": len(selected_reports),
+        "excludedRolloutCount": max(0, len(parsed_reports) - len(selected_reports)),
+        "directMatchRolloutIds": sorted(direct_matches),
+        "selectedRolloutIds": selected_ids,
+    }
+    return report
+
+
 def _source_kind(report: dict[str, Any]) -> str:
     meta = report.get("metadata", {}).get("sessionMeta", {})
     rendered = " ".join(
@@ -2046,15 +2266,30 @@ def _date_buckets(window: DateWindow, usage: dict[str, Usage]) -> list[dict[str,
     return result
 
 
-def build_range_report(
-    window: DateWindow,
-    roots: Iterable[Path] | None = None,
-) -> dict[str, Any]:
-    """Build a date-scoped report grouped by user-visible top-level task."""
-    parsed_reports: list[dict[str, Any]] = []
-    for path in discover_rollouts(roots, window=window):
-        parsed_reports.append(parse_rollout(path, window=window, tolerate_live=True))
+def _local_date_text(timestamp: str) -> str | None:
+    parsed = _parse_timestamp(timestamp)
+    return parsed.astimezone().date().isoformat() if parsed is not None else None
 
+
+def _usage_buckets(
+    usage: dict[str, Usage], window: DateWindow | None = None
+) -> list[dict[str, Any]]:
+    if window is not None:
+        return _date_buckets(window, usage)
+    return [
+        {"date": day, "usage": usage[day].to_dict()}
+        for day in sorted(usage)
+    ]
+
+
+def _build_multi_session_report(
+    parsed_reports: list[dict[str, Any]],
+    roots: Iterable[Path] | None = None,
+    window: DateWindow | None = None,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a multi-session report from already selected rollout reports."""
+    scope = scope or {"type": "date-range", "dateWindow": window.to_dict() if window else None}
     reports_by_id = {
         _coerce_text(report.get("metadata", {}).get("threadId")).lower(): report
         for report in parsed_reports
@@ -2204,7 +2439,7 @@ def build_range_report(
                     1 for warning in member_warnings if warning.get("severity") == "error"
                 ),
                 "warningCount": len(member_warnings),
-                "dailyUsage": _date_buckets(window, daily),
+                "dailyUsage": _usage_buckets(daily, window),
                 "toolCallCount": tool_stats["callCount"],
                 "toolReportedCallCount": tool_stats["reportedCallCount"],
                 "toolUnknownCallCount": tool_stats["unknownCallCount"],
@@ -2260,7 +2495,8 @@ def build_range_report(
         "generator": {"name": "codex_token_visualizer", "version": VERSION},
         "metadata": {
             "generatedAt": generated_at,
-            "dateWindow": window.to_dict(),
+            "dateWindow": window.to_dict() if window is not None else None,
+            "scope": scope,
             "containsFullUserMessages": True,
             "messagesIncluded": True,
             "cacheWriteFieldAvailable": cache_write_available,
@@ -2291,7 +2527,7 @@ def build_range_report(
             "finalUsage": total_usage.to_dict(),
             "finalBreakdown": final_breakdown,
             "finalBreakdownMismatch": final_breakdown_mismatch,
-            "dailyUsage": _date_buckets(window, daily_usage),
+            "dailyUsage": _usage_buckets(daily_usage, window),
             "integrityErrorCount": sum(
                 1 for warning in all_warnings if warning.get("severity") == "error"
             ),
@@ -2307,6 +2543,63 @@ def build_range_report(
         "warnings": all_warnings,
         "sessions": sessions,
     }
+
+
+def build_range_report(
+    window: DateWindow,
+    roots: Iterable[Path] | None = None,
+) -> dict[str, Any]:
+    """Build a date-scoped report grouped by user-visible top-level task."""
+    parsed_reports = [
+        parse_rollout(path, window=window, tolerate_live=True)
+        for path in discover_rollouts(roots, window=window)
+    ]
+    return _build_multi_session_report(
+        parsed_reports,
+        roots=roots,
+        window=window,
+        scope={"type": "date-range", "dateWindow": window.to_dict()},
+    )
+
+
+def build_ids_report(
+    ids: Iterable[str],
+    roots: Iterable[Path] | None = None,
+) -> dict[str, Any]:
+    """Build an un-clipped report for the explicitly selected rollout IDs."""
+    selected_reports: list[dict[str, Any]] = []
+    selected_ids: list[str] = []
+    seen_paths: set[str] = set()
+    seen_ids: set[str] = set()
+    for raw_id in ids:
+        value = _coerce_text(raw_id).strip()
+        if not value:
+            continue
+        path = resolve_rollout(value, roots)
+        path_key = os.path.normcase(str(path))
+        if path_key in seen_paths:
+            continue
+        report = parse_rollout(
+            path,
+            requested_thread_id=_extract_thread_id(value),
+            tolerate_live=True,
+        )
+        report_id = _coerce_text(report.get("metadata", {}).get("threadId")).lower()
+        if not report_id:
+            raise ValueError(f"rollout 缺少线程 ID：{value}")
+        if report_id in seen_ids:
+            continue
+        seen_paths.add(path_key)
+        seen_ids.add(report_id)
+        selected_ids.append(report_id)
+        selected_reports.append(report)
+    if not selected_reports:
+        raise ValueError("--ids 至少需要一个有效的线程 ID 或 rollout JSONL 路径。")
+    return _build_multi_session_report(
+        selected_reports,
+        roots=roots,
+        scope={"type": "ids", "ids": selected_ids},
+    )
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -2558,13 +2851,13 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   <section class="hero">
     <div class="hero-copy">
       <div class="eyebrow">Codex Token 使用报告</div>
-      <h1>线程 Token 消耗</h1>
+      <h1>__REPORT_TITLE__</h1>
       <div class="subline" id="thread-meta"></div>
     </div>
     <aside class="summary-brief" aria-label="概览">
       <div class="brief-head"><span>概览</span><span class="sensitive" id="privacy-indicator"></span></div>
       <div class="brief-grid" id="summary-cards"></div>
-      <div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="0" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">原始</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div>
+      <div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="2" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">M</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div>
     </aside>
   </section>
 
@@ -2677,7 +2970,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   const statusLabels = { complete: "已完成", aborted: "已中止", incomplete: "未闭合" };
   const segmentKeys = ["cachedInput", ...(cacheWriteAvailable ? ["cacheWriteInput"] : []), "otherNonCachedInput", "ordinaryOutput", "reasoningOutput", "unclassified"];
   const DEFAULT_TOOL_CATEGORIES = ["computer-use", "chrome-use", "imagegen", "web-search"];
-  const state = { tab: "context", scale: "linear", tokenUnit: "raw", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
+  const state = { tab: "context", scale: "linear", tokenUnit: "M", start: 1, end: Math.max(1, turns.length), search: "", toolCategories: new Set(DEFAULT_TOOL_CATEGORIES), statuses: new Set(["complete", "aborted", "incomplete"]), sort: "index", direction: 1, selected: null };
   const tooltip = byId("turn-tooltip");
   const TOOLTIP_MESSAGE_LIMIT = 800;
   const toolLabels = {"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
@@ -3101,7 +3394,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   </aside>
   <button class="session-drawer-backdrop" id="session-drawer-backdrop" type="button" tabindex="-1" aria-label="关闭会话列表"></button>
   <main class="content">
-    <section class="hero"><div class="hero-copy"><div class="eyebrow" id="view-eyebrow"></div><div class="hero-title-row"><h1 id="view-title"></h1></div><div class="subline" id="view-meta"></div></div><aside class="summary-brief" aria-label="概览"><div class="brief-head"><span>概览</span><span class="sensitive" id="privacy"></span></div><div class="brief-grid" id="cards"></div><div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="0" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">原始</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div></aside></section>
+    <section class="hero"><div class="hero-copy"><div class="eyebrow" id="view-eyebrow"></div><div class="hero-title-row"><h1 id="view-title"></h1></div><div class="subline" id="view-meta"></div></div><aside class="summary-brief" aria-label="概览"><div class="brief-head"><span>概览</span><span class="sensitive" id="privacy"></span></div><div class="brief-grid" id="cards"></div><div class="summary-token-unit"><label class="summary-token-unit-label" for="token-unit-slider">Token 单位</label><div class="token-unit-slider"><input id="token-unit-slider" type="range" min="0" max="3" step="1" value="2" data-token-unit-slider aria-label="Token 单位"><output id="token-unit-output" for="token-unit-slider">M</output><div class="token-unit-scale" aria-hidden="true"><span>原始</span><span>K</span><span>M</span><span>B</span></div></div></div></aside></section>
     <details class="warning-box" id="warning-box"><summary id="warning-summary"></summary><ul class="warning-list" id="warning-list"></ul></details>
     <section class="analysis-shell">
       <nav class="analysis-tabs" role="tablist" aria-label="查看方式"><span class="analysis-tab-model-label" id="analysis-tab-model-label" aria-label="使用模型"><span class="analysis-tab-model-name" id="analysis-tab-model-name"></span><span class="analysis-tab-plan-status" id="analysis-tab-plan-status" hidden>计划外</span></span>
@@ -3168,6 +3461,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
     data.summary.toolCategories = safeObject(data.summary.toolCategories);
     data.summary.modelUsage = Array.isArray(data.summary.modelUsage) ? data.summary.modelUsage : [];
     data.summary.planExcludedUsage = safeObject(data.summary.planExcludedUsage);
+    const reportTitle=String(data.metadata.reportTitle||"").trim();
     data.warnings = Array.isArray(data.warnings) ? data.warnings : [];
     const sessions = Array.isArray(data.sessions) ? data.sessions : [];
     for (const session of sessions) {
@@ -3197,7 +3491,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
     const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
     const sessionNavMedia=window.matchMedia("(max-width:900px)");
     const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
-    const state={view:"total",tab:"context",scale:"linear",tokenUnit:"raw",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches};
+    const state={view:"total",tab:"context",scale:"linear",tokenUnit:"M",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
   const toolColors={"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
@@ -3211,6 +3505,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   function syncTokenUnitInputs(){const slider=byId("token-unit-slider"),output=byId("token-unit-output"),index=TOKEN_UNIT_ORDER.indexOf(state.tokenUnit);if(slider)slider.value=String(Math.max(0,index));if(output)output.textContent=TOKEN_UNIT_LABELS[state.tokenUnit]||TOKEN_UNIT_LABELS.raw}
   function setTokenUnit(unit){if(!TOKEN_UNIT_CONFIG[unit])return;state.tokenUnit=unit;syncTokenUnitInputs();render()}
   function dateText(v){if(!v)return"—";const d=new Date(v);return Number.isNaN(d.valueOf())?v:d.toLocaleString("zh-CN")}
+  function aggregateScope(){const scope=data.metadata.scope||{},window=data.metadata.dateWindow||{};if(scope.type==="ids")return{eyebrow:"指定会话总览",label:`指定会话 · ${formatCount((scope.ids||[]).length)} 个 ID`,totalLabel:"所选会话总 Token",usageNote:"按显式 ID 汇总",empty:"指定 ID 对应的会话没有可用活动。"};return{eyebrow:"日期范围总览",label:`${window.startDate||"—"} — ${window.endDate||"—"} · ${window.timezone||""}`.replace(/ · $/,""),totalLabel:"区间总 Token",usageNote:"按 token_count 快照时间计入",empty:"指定日期范围内没有会话活动。"}}
   function activeSession(){return sessions.find(s=>s.metadata.threadId===state.view)||null} function isTotal(){return state.view==="total"}
   function statusText(v){return({complete:"已完成",aborted:"已中止",incomplete:"未闭合"})[v]||v||"未知"}
   function cacheRate(u){return u.input?100*u.cached/u.input:0} function firstPrompt(t){return(t.messages||[]).map(m=>m.text).filter(Boolean).join("\n\n↳ 追加用户消息\n")}
@@ -3244,14 +3539,14 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   }
   function setSessionHover(threadId){if(state.hoverSessionId===threadId)return;state.hoverSessionId=threadId;document.querySelectorAll(".session-button.model-watermark").forEach(button=>button.classList.toggle("session-hovered",button.dataset.view===threadId))}
   function clearSessionHover(threadId){if(threadId&&state.hoverSessionId!==threadId)return;state.hoverSessionId=null;document.querySelectorAll(".session-button.model-watermark.session-hovered").forEach(button=>button.classList.remove("session-hovered"))}
-  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>state.modelFilters.has(sessionModel(s))&&[s.metadata.title,s.metadata.threadId,s.metadata.cwd,sessionModel(s),modelWatermarkLabel(sessionModel(s)),sessionPlanStatus(s),sessionEffort(s)].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>日期范围汇总 · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>{const model=sessionModel(s),modelLabel=modelWatermarkLabel(model),planStatus=sessionPlanStatus(s),planTag=planStatus?`<span class="session-plan-status" aria-label="${esc(planStatus)}">${esc(planStatus)}</span>`:"",effort=sessionEffort(s),visual=modelVisual(model),watermark=esc(modelLabel),active=state.view===s.metadata.threadId,selected=state.selectedSessionIds.has(s.metadata.threadId),hovered=state.hoverSessionId===s.metadata.threadId;return`<button class="session-button model-watermark ${active?"active ":""}${selected?"session-selected ":""}${hovered?"session-hovered":""}" aria-pressed="${String(selected)}" style="--model-color:${visual[0]};--model-tint:${visual[1]}" data-model-watermark="${esc(modelLabel)}" data-view="${esc(s.metadata.threadId)}"><span class="session-watermark" aria-hidden="true">${watermark}</span>${planTag}<strong>${esc(s.metadata.title)}</strong><span class="session-time">${esc(dateText(s.metadata.rangeLastActivityAt))}</span><span class="session-token-count">${fmt(s.summary.finalUsage.total)} Token</span><span class="session-effort">${esc(effort)}</span></button>`}).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
+  function renderNav(){const q=byId("nav-search").value.trim().toLocaleLowerCase(),items=sessions.filter(s=>state.modelFilters.has(sessionModel(s))&&[s.metadata.title,s.metadata.threadId,s.metadata.cwd,sessionModel(s),modelWatermarkLabel(sessionModel(s)),sessionPlanStatus(s),sessionEffort(s)].join(" ").toLocaleLowerCase().includes(q));let html=`<button class="session-button session-total-button ${isTotal()?"active":""}" data-view="total"><strong>总统计</strong><span>${aggregateScope().label} · ${sessions.length} 个会话 · ${fmt(data.summary.finalUsage.total)} Token</span></button>`;html+=items.map(s=>{const model=sessionModel(s),modelLabel=modelWatermarkLabel(model),planStatus=sessionPlanStatus(s),planTag=planStatus?`<span class="session-plan-status" aria-label="${esc(planStatus)}">${esc(planStatus)}</span>`:"",effort=sessionEffort(s),visual=modelVisual(model),watermark=esc(modelLabel),active=state.view===s.metadata.threadId,selected=state.selectedSessionIds.has(s.metadata.threadId),hovered=state.hoverSessionId===s.metadata.threadId;return`<button class="session-button model-watermark ${active?"active ":""}${selected?"session-selected ":""}${hovered?"session-hovered":""}" aria-pressed="${String(selected)}" style="--model-color:${visual[0]};--model-tint:${visual[1]}" data-model-watermark="${esc(modelLabel)}" data-view="${esc(s.metadata.threadId)}"><span class="session-watermark" aria-hidden="true">${watermark}</span>${planTag}<strong>${esc(s.metadata.title)}</strong><span class="session-time">${esc(dateText(s.metadata.rangeLastActivityAt))}</span><span class="session-token-count">${fmt(s.summary.finalUsage.total)} Token</span><span class="session-effort">${esc(effort)}</span></button>`}).join("");byId("session-list").innerHTML=html;byId("session-list").querySelectorAll("button").forEach(button=>button.addEventListener("click",()=>selectView(button.dataset.view)))}
   function applyView(view,fromRing=false){const valid=view==="total"||sessions.some(session=>session.metadata.threadId===view),nextView=valid?view:"total";state.returnToTotalSessionId=fromRing&&nextView!=="total"?nextView:null;state.view=nextView;state.hoverSessionId=null;if(nextView!=="total")setSessionSelection([nextView]);state.tab="context";state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.statuses=new Set(["complete","aborted","incomplete"]);byId("content-search").value="";syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(x=>x.checked=true);closeDrawer();if(sessionNavMedia.matches)setSessionNav(false);renderNav();render()}
   function navigateView(view,fromRing=false){const nextReturn=fromRing&&view!=="total"?view:null;if(state.view===view&&state.returnToTotalSessionId===nextReturn){applyView(view,fromRing);return}history.pushState({...(history.state||{}),codexTokenReport:true,view,returnToTotalSessionId:nextReturn},"","");applyView(view,fromRing)}
   function selectView(view,fromRing=false){navigateView(view,fromRing)}
   function enterSessionFromRing(threadId){selectView(threadId,true)}
   function goToTotal(){const session=activeSession();if(session)setSessionSelection([session.metadata.threadId]);navigateView("total")}
   function syncRingReturnButton(){const button=byId("return-total-from-ring");if(!button)return;const visible=!isTotal()&&state.returnToTotalSessionId!=null;button.hidden=!visible;button.setAttribute("aria-hidden",String(!visible))}
-  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,window=data.metadata.dateWindow;byId("view-eyebrow").textContent=isTotal()?"日期范围总览":"会话总览";byId("view-title").textContent=isTotal()?"全部会话 · Token 消耗":session.metadata.title;byId("view-meta").textContent=isTotal()?`${window.startDate} — ${window.endDate} · ${window.timezone} · 数据截止 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话数",formatCount(summary.sessionCount),`${summary.zeroUsageSessions} 个会话没有 Token 消耗`]:["轮次数",formatCount(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮无 Token 消耗`];const cards=[["区间总 Token",fmt(u.total),"按 token_count 快照时间计入"],["输入 Token",fmt(u.input),`${compact(u.cached)} 来自缓存`],["未命中缓存的输入 Token",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出 Token",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["数据完整性",summary.integrityErrorCount?"发现问题":"正常",`${summary.warningCount} 条提醒`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value${isLcdValue(c[1])?" lcd-value":""}">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("");syncRingReturnButton()}
+  function renderHeader(){const session=activeSession(),summary=isTotal()?data.summary:session.summary,u=summary.finalUsage,scope=aggregateScope();byId("view-eyebrow").textContent=isTotal()?scope.eyebrow:"会话总览";byId("view-title").textContent=isTotal()?(reportTitle||"全部会话 · Token 消耗"):session.metadata.title;byId("view-meta").textContent=isTotal()?`${scope.label} · 数据截止 ${dateText(data.metadata.snapshotAt)}`:`${session.metadata.threadId} · ${summary.turnCount} 轮 · ${sourceText(session)}`;const privacy=byId("privacy");privacy.textContent=messagesIncluded?"包含范围内完整用户消息":"未包含用户消息";privacy.classList.toggle("safe",!messagesIncluded);const fifth=isTotal()?["会话数",formatCount(summary.sessionCount),`${summary.zeroUsageSessions} 个会话没有 Token 消耗`]:["轮次数",formatCount(summary.turnCount),`${summary.statusCounts.aborted||0} 轮中止 · ${summary.zeroUsageTurns} 轮无 Token 消耗`];const cards=[[scope.totalLabel,fmt(u.total),scope.usageNote],["输入 Token",fmt(u.input),`${compact(u.cached)} 来自缓存`],["未命中缓存的输入 Token",fmt(Math.max(0,u.input-u.cached)),`缓存命中率 ${cacheRate(u).toFixed(2)}%`],["输出 Token",fmt(u.output),`${compact(u.reasoning)} 为推理输出`],fifth,["数据完整性",summary.integrityErrorCount?"发现问题":"正常",`${summary.warningCount} 条提醒`]];byId("cards").innerHTML=cards.map(c=>`<article class="brief-item"><div class="label">${esc(c[0])}</div><div class="value${isLcdValue(c[1])?" lcd-value":""}">${esc(c[1])}</div><div class="note">${esc(c[2])}</div></article>`).join("");syncRingReturnButton()}
   function renderWarnings(){const session=activeSession(),warnings=isTotal()?data.warnings:session.warnings,summary=isTotal()?data.summary:session.summary,box=byId("warning-box");byId("warning-summary").textContent=`${summary.integrityErrorCount} 个数据完整性问题 · 共 ${summary.warningCount} 条提醒`;box.hidden=!warnings.length;byId("warning-list").innerHTML=warnings.map(w=>`<li class="${esc(w.severity)}"><b>${esc(w.code)}</b>${w.rolloutId?` · ${esc(w.rolloutId.slice(0,8))}`:""}${w.line?` · 第 ${w.line} 行`:""}：${esc(w.message)}</li>`).join("");box.open=summary.integrityErrorCount>0}
   function niceTicks(max,count=5){if(max<=0)return[0];const rough=max/count,p=10**Math.floor(Math.log10(rough)),f=rough/p,n=(f<=1?1:f<=2?2:f<=5?5:10)*p,out=[];for(let x=0;x<=max+n*.25;x+=n)out.push(x);return out}
   function svgEl(name,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",name);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el} function text(svg,x,y,value,anchor="end"){const t=svgEl("text",{x,y,"text-anchor":anchor,fill:css("--muted"),"font-size":"11"});t.textContent=value;svg.appendChild(t)}
@@ -3333,7 +3628,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
       head.innerHTML="<tr><th>轮次</th><th>来源</th><th>状态</th><th>开始时间</th><th>模型响应</th><th>缓存输入</th><th>缓存写入</th><th>其他输入</th><th>普通输出</th><th>推理输出</th><th>Token 总量</th><th>缓存命中率</th><th>Context 占用</th><th>Context 占用率</th><th>用户输入</th></tr>";
       body.innerHTML=visible.map(r=>{const b=r.breakdown,u=r.usage,p=firstPrompt(r).replace(/\s+/g," ").trim(),snapshot=contextSnapshot(r),contextTitle=`${contextTypeText(snapshot.snapshotType)} · ${dateText(snapshot.timestamp)}`;return`<tr data-id="${esc(r.turnId)}" data-turn-target="true"><td>${r.index}${r.rangeClipped?' <span class="provisional" title="已按日期范围裁剪">◐</span>':""}</td><td>${esc(r.sourceLabel||"主会话")}</td><td>${esc(statusText(r.status))}</td><td>${esc(dateText(r.startedAt))}</td><td>${formatCount(r.modelResponses)}</td><td>${fmt(b.cachedInput)}</td><td>${activeSession().metadata.cacheWriteFieldAvailable?fmt(b.cacheWriteInput):"不适用"}</td><td>${fmt(b.otherNonCachedInput)}</td><td>${fmt(b.ordinaryOutput)}</td><td>${fmt(b.reasoningOutput)}</td><td><b>${fmt(u.total)}</b></td><td>${cacheRate(u).toFixed(2)}%</td><td title="${esc(contextTitle)}">${snapshot.tokens==null?"—":fmt(snapshot.tokens)}</td><td title="${esc(contextTitle)}">${esc(contextRateText(snapshot))}</td><td class="title-cell" title="${esc(p)}">${esc(p||"—")}</td></tr>`}).join("");body.querySelectorAll("tr").forEach(row=>row.addEventListener("click",()=>openDrawer((activeSession()?.turns||[]).find(t=>t.turnId===row.dataset.id))));
     }
-    empty.hidden=visible.length>0;empty.textContent=isTotal()?"指定日期范围内没有会话活动。":"没有符合当前筛选条件的轮次。";
+    empty.hidden=visible.length>0;empty.textContent=isTotal()?aggregateScope().empty:"没有符合当前筛选条件的轮次。";
   }
   function openDrawer(turn){
     if(!turn)return;state.selected=turn.turnId;byId("drawer-title").textContent=`第 ${turn.index} 轮 · ${turn.sourceLabel||"主会话"}`;const snapshot=contextSnapshot(turn),details=[["状态",statusText(turn.status)],["轮次 ID",turn.turnId],["来源",turn.sourceLabel||"主会话"],["开始时间",dateText(turn.startedAt)],["结束时间",dateText(turn.endedAt)],["范围活动",`${dateText(turn.rangeFirstActivityAt)} — ${dateText(turn.rangeLastActivityAt)}`],["日期裁剪",turn.rangeClipped?"是":"否"],["模型",(turn.models||[]).join(", ")||"—"],["上下文快照类型",contextTypeText(snapshot.snapshotType)],["上下文占用",snapshot.tokens==null?"—":fmt(snapshot.tokens)],["上下文窗口",snapshot.windowTokens==null?"—":fmt(snapshot.windowTokens)],["上下文占用率",contextRateText(snapshot)],["上下文快照时间",dateText(snapshot.timestamp)],["上下文压缩",formatCount(turn.compactions)],["总 Token",fmt(turn.usage.total)],["输入",fmt(turn.usage.input)],["输出",fmt(turn.usage.output)],["推理输出",fmt(turn.usage.reasoning)]];
@@ -3344,10 +3639,10 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
   function setTab(tab){const contextButton=byId("tab-context");contextButton.disabled=false;contextButton.textContent=isTotal()?"模型消耗概览":"Token 与 Context";if(!["composition","trend","context","table"].includes(tab))tab="context";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab});syncFilterVisibility(tab)}
   function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.modelFilters=new Set(modelFilterModels());state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";syncToolFilterInputs();renderModelFilter();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderNav();renderComposition();renderContext();renderTable()}
-  function render(){renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · 本地日期 ${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate}`}
+  function render(){renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · ${aggregateScope().label}`}
   history.replaceState({...(history.state||{}),codexTokenReport:true,view:"total",returnToTotalSessionId:null},"","");
   window.addEventListener("popstate",event=>{const entry=event.state;applyView(entry?.codexTokenReport?entry.view:"total",Boolean(entry?.codexTokenReport&&entry.returnToTotalSessionId))});
-  byId("range-label").textContent=`${data.metadata.dateWindow.startDate} — ${data.metadata.dateWindow.endDate} · ${data.metadata.dateWindow.timezone}`;
+  byId("range-label").textContent=aggregateScope().label;
   byId("nav-search").addEventListener("input",renderNav);
   byId("return-total-from-ring").addEventListener("click",goToTotal);
   byId("go-total-session").addEventListener("click",goToTotal);
@@ -3381,19 +3676,41 @@ h1{font-size:clamp(14px,1.5vw,20px)}
 
 
 def render_html(report: dict[str, Any], title: str | None = None) -> str:
+    metadata = report.get("metadata", {})
+    requested_title = title if title is not None else metadata.get("reportTitle")
+    report_title = _coerce_text(requested_title).strip()
+    report_payload = report
+    if report_title and metadata.get("reportTitle") != report_title:
+        report_payload = {
+            **report,
+            "metadata": {**metadata, "reportTitle": report_title},
+        }
     if report.get("mode") == "range":
-        date_window = report.get("metadata", {}).get("dateWindow", {})
+        scope = metadata.get("scope", {})
+        date_window = metadata.get("dateWindow") or {}
         start_date = date_window.get("startDate", "unknown")
         end_date = date_window.get("endDate", start_date)
         date_label = start_date if start_date == end_date else f"{start_date} — {end_date}"
-        page_title = title or f"Codex Token 日期报告 · {date_label}"
+        if scope.get("type") == "ids":
+            default_page_title = f"Codex Token 指定会话报告 · {len(scope.get('ids', []))} 个 ID"
+            default_visible_title = "指定会话 · Token 消耗"
+        elif scope.get("type") == "projects":
+            project_label = scope.get("label") or "项目集合"
+            default_page_title = f"Codex Token 项目报告 · {project_label}"
+            default_visible_title = f"{project_label} · 全部会话"
+        else:
+            default_page_title = f"Codex Token 日期报告 · {date_label}"
+            default_visible_title = "全部会话 · Token 消耗"
+        page_title = report_title or default_page_title
+        visible_title = report_title or default_visible_title
         template = RANGE_HTML_TEMPLATE
     else:
-        thread_id = report.get("metadata", {}).get("threadId", "unknown")
-        page_title = title or f"Codex Token 报告 · {thread_id}"
+        thread_id = metadata.get("threadId", "unknown")
+        page_title = report_title or f"Codex Token 报告 · {thread_id}"
+        visible_title = report_title or "线程 Token 消耗"
         template = HTML_TEMPLATE
     report_json = json.dumps(
-        report, ensure_ascii=False, separators=(",", ":"), sort_keys=False
+        report_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=False
     )
     # Script-data escaping prevents a user message containing </script> from
     # terminating the JSON block. The JS renderer also uses textContent for full
@@ -3405,8 +3722,10 @@ def render_html(report: dict[str, Any], title: str | None = None) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
-    rendered = template.replace("__PAGE_TITLE__", html.escape(page_title)).replace(
-        "__REPORT_JSON__", report_json
+    rendered = (
+        template.replace("__PAGE_TITLE__", html.escape(page_title))
+        .replace("__REPORT_TITLE__", html.escape(visible_title))
+        .replace("__REPORT_JSON__", report_json)
     )
     return rendered.replace("</body>", TOOL_SATELLITE_HIT_SCRIPT + "\n</body>")
 
@@ -3448,6 +3767,32 @@ def default_range_output_path(window: DateWindow) -> Path:
     return Path(tempfile.gettempdir()) / "agenttools" / f"codex-token-{label}.html"
 
 
+def default_ids_output_path(ids: Iterable[str]) -> Path:
+    normalized = [str(value).strip().lower() for value in ids if str(value).strip()]
+    digest = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:12]
+    return (
+        Path(tempfile.gettempdir())
+        / "agenttools"
+        / f"codex-token-ids-{len(normalized)}-{digest}.html"
+    )
+
+
+def default_project_output_path(scope: dict[str, Any]) -> Path:
+    project_label = _coerce_text(scope.get("label")) or "projects"
+    normalized = [
+        _coerce_text(project.get("matchRoot"))
+        for project in scope.get("projects", [])
+        if _coerce_text(project.get("matchRoot"))
+    ]
+    digest = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:12]
+    safe_label = re.sub(r"[^0-9A-Za-z._-]+", "-", project_label).strip(".-") or "projects"
+    return (
+        Path(tempfile.gettempdir())
+        / "agenttools"
+        / f"codex-token-project-{safe_label}-{len(normalized)}-{digest}.html"
+    )
+
+
 def _iso_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -3458,17 +3803,25 @@ def _iso_date(value: str) -> date:
 
 
 def _date_window_from_args(args: argparse.Namespace) -> DateWindow | None:
+    ids = _flatten_id_args(args.ids)
+    has_project_scope = bool(args.project) or bool(args.current_project)
     selectors = bool(args.today) + bool(args.single_date) + bool(
         args.date_from or args.date_to
     )
-    if args.thread and selectors:
-        raise ValueError("线程输入不能与日期范围参数同时使用。")
+    if args.thread and (selectors or ids or has_project_scope):
+        raise ValueError("线程输入不能与日期范围、--ids 或项目范围同时使用。")
+    if ids and (selectors or has_project_scope):
+        raise ValueError("--ids 不能与日期范围或项目范围同时使用。")
+    if has_project_scope and selectors:
+        raise ValueError("项目范围不能与日期范围参数同时使用。")
     if selectors > 1:
         raise ValueError("--today、--date 与 --from/--to 只能选择一种。")
     if args.date_from is None and args.date_to is not None:
         raise ValueError("--to 必须与 --from 一起使用。")
     if args.date_from is not None and args.date_to is None:
         raise ValueError("--from 必须与 --to 一起使用。")
+    if ids:
+        return None
     if args.today:
         today = datetime.now().astimezone().date()
         return DateWindow.for_dates(today, today)
@@ -3476,16 +3829,20 @@ def _date_window_from_args(args: argparse.Namespace) -> DateWindow | None:
         return DateWindow.for_dates(args.single_date, args.single_date)
     if args.date_from is not None and args.date_to is not None:
         return DateWindow.for_dates(args.date_from, args.date_to)
-    if not args.thread:
+    if not args.thread and not has_project_scope:
         raise ValueError(
-            "请提供线程 ID/JSONL，或使用 --today、--date、--from/--to。"
+            "请提供线程 ID/JSONL、项目目录，或使用 --today、--date、--from/--to。"
         )
     return None
 
 
+def _flatten_id_args(groups: list[list[str]] | None) -> list[str]:
+    return [value for group in (groups or []) for value in group]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="为一个 Codex 线程或本地日期范围生成自包含的交互式 Token 报告。默认按尽力模式运行，发现完整性问题仅做记录；仅在加 `--strict` 时才因错误终止。"
+        description="为一个 Codex 线程、ID 列表、项目范围或本地日期范围生成自包含的交互式 Token 报告。默认按尽力模式运行，发现完整性问题仅做记录；仅在加 `--strict` 时才因错误终止。"
     )
     parser.add_argument(
         "thread",
@@ -3516,6 +3873,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="日期范围终点（YYYY-MM-DD，含当日；必须与 --from 同时使用）。",
     )
     parser.add_argument(
+        "--ids",
+        dest="ids",
+        action="append",
+        nargs="+",
+        metavar="ID",
+        help="统计指定的一个或多个线程 ID；可重复使用，不能与日期范围或位置线程参数同时使用。",
+    )
+    parser.add_argument(
+        "--project",
+        dest="project",
+        action="append",
+        metavar="PATH",
+        help="按项目目录自动发现会话；可重复指定，匹配目录内 cwd 或相同 Git common directory。",
+    )
+    parser.add_argument(
+        "--current-project",
+        "--current-repo",
+        dest="current_project",
+        action="store_true",
+        help="使用当前 ChatGPT Windows App 会话所在项目（当前工作目录）自动发现会话。",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -3542,7 +3921,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="不在 HTML 中嵌入用户消息。默认会嵌入完整用户消息。",
     )
-    parser.add_argument("--title", help="自定义 HTML 页面标题。")
+    parser.add_argument(
+        "--title",
+        "--report-title",
+        dest="title",
+        help="指定报告总标题；同时作为 HTML 页面标题。多会话报告切换单个会话时保留会话标题。",
+    )
     parser.add_argument("--version", action="version", version=VERSION)
     return parser
 
@@ -3564,8 +3948,17 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     roots = [path.expanduser().resolve() for path in args.sessions_root] if args.sessions_root else None
     try:
+        ids = _flatten_id_args(args.ids)
         window = _date_window_from_args(args)
-        if window is not None:
+        if ids:
+            report = build_ids_report(ids, roots=roots)
+        elif args.project or args.current_project:
+            report = build_project_report(
+                args.project or [],
+                roots=roots,
+                current_project=args.current_project,
+            )
+        elif window is not None:
             report = build_range_report(window, roots=roots)
         else:
             requested_id = _extract_thread_id(args.thread)
@@ -3589,7 +3982,13 @@ def main(argv: list[str] | None = None) -> int:
 
     set_message_policy(report, include_messages=not args.exclude_messages)
     if report.get("mode") == "range":
-        output = args.output or default_range_output_path(window)
+        scope = report.get("metadata", {}).get("scope", {})
+        if scope.get("type") == "ids":
+            output = args.output or default_ids_output_path(scope.get("ids", []))
+        elif scope.get("type") == "projects":
+            output = args.output or default_project_output_path(scope)
+        else:
+            output = args.output or default_range_output_path(window)
     else:
         thread_id = report["metadata"]["threadId"]
         output = args.output or default_output_path(thread_id)
@@ -3604,11 +4003,20 @@ def main(argv: list[str] | None = None) -> int:
     summary = report["summary"]
     usage = summary["finalUsage"]
     if report.get("mode") == "range":
-        date_window = report["metadata"]["dateWindow"]
-        print(
-            f"日期：{date_window['startDate']} — {date_window['endDate']}"
-            f"（{date_window['timezone']}）"
-        )
+        scope = report["metadata"].get("scope", {})
+        if scope.get("type") == "ids":
+            print(f"指定 ID：{len(scope.get('ids', [])):,}")
+        elif scope.get("type") == "projects":
+            print(f"项目：{scope.get('label') or '项目集合'}")
+            print(f"候选 rollout：{scope.get('candidateRolloutCount', 0):,}")
+            print(f"直接匹配 rollout：{scope.get('directMatchRolloutCount', 0):,}")
+            print(f"纳入 rollout：{scope.get('selectedRolloutCount', 0):,}")
+        else:
+            date_window = report["metadata"]["dateWindow"]
+            print(
+                f"日期：{date_window['startDate']} — {date_window['endDate']}"
+                f"（{date_window['timezone']}）"
+            )
         session_count = summary["sessionCount"]
     else:
         print(f"线程：{thread_id}")

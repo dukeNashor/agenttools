@@ -783,6 +783,106 @@ class VisualizerTests(unittest.TestCase):
         self.assertIn("会话列表", rendered)
         self.assertIn("总统计", rendered)
 
+    def test_ids_report_aggregates_selected_rollouts_without_date_clipping(self) -> None:
+        first_id = "00000000-0000-0000-0000-000000000014"
+        second_id = "00000000-0000-0000-0000-000000000015"
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions"
+            sessions.mkdir()
+            self.write_named_rollout(
+                sessions,
+                first_id,
+                [
+                    rec("2026-01-01T00:00:00Z", "session_meta", {"id": first_id, "session_id": first_id}),
+                    rec("2026-01-01T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "t1"}),
+                    rec("2026-01-01T00:00:02Z", "event_msg", {"type": "token_count", "info": {"total_token_usage": usage(10, 5, 2)}}),
+                    rec("2026-01-01T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": "t1"}),
+                ],
+            )
+            self.write_named_rollout(
+                sessions,
+                second_id,
+                [
+                    rec("2026-02-03T00:00:00Z", "session_meta", {"id": second_id, "session_id": second_id}),
+                    rec("2026-02-03T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": "t2"}),
+                    rec("2026-02-03T00:00:02Z", "event_msg", {"type": "token_count", "info": {"total_token_usage": usage(20, 10, 4)}}),
+                    rec("2026-02-03T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": "t2"}),
+                ],
+            )
+            report = viz.build_ids_report([first_id, second_id, first_id], roots=[sessions])
+
+        self.assertEqual(report["mode"], "range")
+        self.assertEqual(report["metadata"]["scope"], {"type": "ids", "ids": [first_id, second_id]})
+        self.assertIsNone(report["metadata"]["dateWindow"])
+        self.assertEqual(report["summary"]["sessionCount"], 2)
+        self.assertEqual(report["summary"]["turnCount"], 2)
+        self.assertEqual(report["summary"]["finalUsage"]["total"], 36)
+        self.assertEqual(
+            [bucket["date"] for bucket in report["summary"]["dailyUsage"]],
+            ["2026-01-01", "2026-02-03"],
+        )
+
+    def test_ids_cli_accepts_repeated_lists_and_renders_scope_brief(self) -> None:
+        first_id = "00000000-0000-0000-0000-000000000016"
+        second_id = "00000000-0000-0000-0000-000000000017"
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions"
+            sessions.mkdir()
+            for thread_id, turn_id in ((first_id, "t1"), (second_id, "t2")):
+                self.write_named_rollout(
+                    sessions,
+                    thread_id,
+                    [
+                        rec("2026-01-02T00:00:00Z", "session_meta", {"id": thread_id, "session_id": thread_id}),
+                        rec("2026-01-02T00:00:01Z", "event_msg", {"type": "task_started", "turn_id": turn_id}),
+                        rec("2026-01-02T00:00:02Z", "event_msg", {"type": "token_count", "info": {"total_token_usage": usage(10, 5, 2)}}),
+                        rec("2026-01-02T00:00:03Z", "event_msg", {"type": "task_complete", "turn_id": turn_id}),
+                    ],
+                )
+            output = Path(temp) / "ids.html"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = viz.main(
+                    [
+                        "--ids",
+                        first_id,
+                        second_id,
+                        "--ids",
+                        first_id,
+                        "--sessions-root",
+                        str(sessions),
+                        "--report-title",
+                        "ADTestFramework 项目总览",
+                        "--strict",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertEqual(rc, 0)
+        self.assertIn("指定 ID：2", stdout.getvalue())
+        self.assertIn('"scope":{"type":"ids","ids":["00000000-0000-0000-0000-000000000016","00000000-0000-0000-0000-000000000017"]}', rendered)
+        self.assertIn("指定会话总览", rendered)
+        self.assertIn("<title>ADTestFramework 项目总览</title>", rendered)
+        self.assertIn('"reportTitle":"ADTestFramework 项目总览"', rendered)
+        self.assertIn('reportTitle||"全部会话 · Token 消耗"', rendered)
+
+    def test_custom_report_title_renders_in_single_report(self) -> None:
+        title = "ADTestFramework 项目 Token 总览"
+        rendered = viz.render_html(viz.parse_rollout(FIXTURE), title)
+        self.assertIn(f"<title>{title}</title>", rendered)
+        self.assertIn(f"<h1>{title}</h1>", rendered)
+        self.assertIn(f'"reportTitle":"{title}"', rendered)
+
+    def test_ids_cli_rejects_missing_rollout(self) -> None:
+        missing_id = "00000000-0000-0000-0000-000000000018"
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertEqual(
+                viz.main(["--ids", missing_id, "--sessions-root", temp]),
+                2,
+            )
+
     def test_incomplete_date_range_is_rejected(self) -> None:
         self.assertEqual(viz.main(["--from", "2026-01-02"]), 2)
 
@@ -890,7 +990,9 @@ class VisualizerTests(unittest.TestCase):
             self.assertNotIn("data-token-unit value=", template)
             self.assertIn("filter-group+ .filter-group", template)
             self.assertIn("TOKEN_UNIT_CONFIG", template)
-            self.assertTrue('tokenUnit: "raw"' in template or 'tokenUnit:"raw"' in template)
+            self.assertTrue('tokenUnit: "M"' in template or 'tokenUnit:"M"' in template)
+            self.assertIn('value="2" data-token-unit-slider', template)
+            self.assertIn('id="token-unit-output" for="token-unit-slider">M</output>', template)
             self.assertIn("function setTokenUnit", template)
             self.assertIn("formatCount", template)
 
@@ -912,7 +1014,8 @@ class VisualizerTests(unittest.TestCase):
         self.assertIn("session-total-button", viz.RANGE_HTML_TEMPLATE)
         self.assertIn("session-total-button.active", viz.RANGE_HTML_TEMPLATE)
         self.assertIn("inset 3px 0 0 #8c6f4d", viz.RANGE_HTML_TEMPLATE)
-        self.assertIn('日期范围汇总 · ${sessions.length} 个会话', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('${aggregateScope().label} · ${sessions.length} 个会话', viz.RANGE_HTML_TEMPLATE)
+        self.assertIn('指定会话总览', viz.RANGE_HTML_TEMPLATE)
         self.assertIn('view:"total",tab:"context"', viz.RANGE_HTML_TEMPLATE)
         self.assertIn('model-token-pie', viz.RANGE_HTML_TEMPLATE)
         self.assertIn('model-weighted-pie', viz.RANGE_HTML_TEMPLATE)

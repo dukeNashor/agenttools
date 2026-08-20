@@ -4,7 +4,7 @@ Reusable Codex skills and scripts. This repository is packaged as a Codex plugin
 
 ## Visualize Codex Tokens
 
-Generate a self-contained Chinese interactive HTML report for one local Codex thread, one local date, or an inclusive local date range. The report includes:
+Generate a self-contained Chinese interactive HTML report for one local Codex thread, an explicit list of rollout IDs, one local date, or an inclusive local date range. The report includes:
 
 - per-turn mutually exclusive token composition;
 - total and cumulative token usage;
@@ -38,6 +38,7 @@ Invoke the skill explicitly:
 
 ```text
 $visualize-codex-tokens generate a report for <thread-id>
+$visualize-codex-tokens generate a report for --ids <id-1> <id-2> <id-3>
 $visualize-codex-tokens generate today's report
 $visualize-codex-tokens generate a report from 2026-08-01 through 2026-08-16
 ```
@@ -50,6 +51,9 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --open
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
+  --ids <id-1> <id-2> <id-3>
+
+py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --today `
   --open
 
@@ -59,7 +63,8 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --open
 ```
 
-Use `--date YYYY-MM-DD` for one historical local date. The scope selectors and the original thread/JSONL positional input are mutually exclusive. Without `--output`, the report is written under the stable system temporary `agenttools` directory with a thread- or date-based filename. Use `--open` to open it after generation.
+Use `--date YYYY-MM-DD` for one historical local date. Use `--ids ID1 ID2 ...` for an explicit list of rollout IDs; repeat `--ids` when needed. ID-list reports de-duplicate IDs, preserve full selected-session activity without date clipping, and group selected subagent rollouts under their detected root task. The scope selectors and the original thread/JSONL positional input are mutually exclusive. Without `--output`, the report is written under the stable system temporary `agenttools` directory with a thread-, ID-list-, or date-based filename. Use `--open` to open it after generation.
+Use `--title "Project Token Report"` (or `--report-title`) to set the visible total title and the HTML page title, so the report remains identifiable when opened from a generic temporary folder.
 
 ### Privacy
 
@@ -85,7 +90,7 @@ MIT
 
 ## Codex Token 可视化
 
-为一个本地 Codex 线程、一个本地日期或一个首尾均包含的本地日期范围生成自包含的中文交互式 HTML 报告，包括：
+为一个本地 Codex 线程、一组明确指定的 rollout ID、一个本地日期或一个首尾均包含的本地日期范围生成自包含的中文交互式 HTML 报告，包括：
 
 - 每轮互不重叠的 Token 构成；
 - 总消耗与累计消耗；
@@ -100,7 +105,7 @@ MIT
 - 费率折算图中的 Sol 等价 Token 展示值按原始值四舍五入，扇区比例仍基于未取整数据计算；
 - 总统计保持简洁概览，搜索、工具和状态筛选保留在单独会话中；
 - 两类报告的概览数字使用 LCD 计数器风格，Token 数值从右侧每四位以窄空格分组；
-- 独立会话报告统一工具与轮次状态筛选栏，并提供原始、K、M、B 四档 Token 单位显示切换，默认使用原始值；
+- 独立会话报告统一工具与轮次状态筛选栏，并提供原始、K、M、B 四档 Token 单位显示切换，默认使用 M；
 - Spark-only 会话使用独立洋红主题色，显示 `Spark` 并附加 `计划外` 二级标签；同时将 Spark 保留在总 Token 中但排除出计划级模型比较，并显示排除提示；
 - 日期趋势，以及主会话／子代理统一轮次时间线；
 - 按轮内累计 Token 位置记录的全部范围内 Context 快照；
@@ -124,6 +129,7 @@ MIT
 
 ```text
 $visualize-codex-tokens 为 <线程ID> 生成报告
+$visualize-codex-tokens 为 --ids <ID1> <ID2> <ID3> 生成报告
 $visualize-codex-tokens 生成今天的报告
 $visualize-codex-tokens 生成 2026-08-01 到 2026-08-16 的报告
 ```
@@ -135,6 +141,9 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   <线程ID> `
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
+  --ids <ID1> <ID2> <ID3>
+
+py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --today `
 
 py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
@@ -142,7 +151,8 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
   --to 2026-08-16 `
 ```
 
-单个历史日期可使用 `--date YYYY-MM-DD`。日期选择参数与原有线程／JSONL 位置参数互斥。未指定 `--output` 时，报告以线程或日期命名，写入系统临时目录下稳定的 `agenttools` 目录。需要生成后打开时使用 `--open`。
+单个历史日期可使用 `--date YYYY-MM-DD`。显式 ID 列表可使用 `--ids ID1 ID2 ...`，需要时可重复使用 `--ids`；ID 报告会去重、保留所选 rollout 的完整活动，不按日期裁剪，并将已选中的子代理 rollout 归并到检测到的根任务下。日期选择参数、ID 列表参数与原有线程／JSONL 位置参数互斥。未指定 `--output` 时，报告以线程、ID 列表摘要或日期范围命名，写入系统临时目录下稳定的 `agenttools` 目录。需要生成后打开时使用 `--open`。
+使用 `--title "项目 Token 报告"`（或 `--report-title`）可同时设置报告页面显示的总标题和 HTML 页签标题，避免打开临时目录中的文件时无法识别报告用途。
 
 ### 隐私
 
