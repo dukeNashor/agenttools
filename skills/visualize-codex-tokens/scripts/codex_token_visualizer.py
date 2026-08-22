@@ -23,10 +23,10 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 
-VERSION = "2.19.0"
+VERSION = "2.21.1"
 
 # The range report uses the official Codex token-based rate card.  Keep the
 # effective date and the last verification timestamp next to the table so a
@@ -281,14 +281,33 @@ class DateWindow:
         return self._local(parsed).date().isoformat() if parsed is not None else None
 
     def to_dict(self) -> dict[str, Any]:
+        timezone_offset_minutes = int(
+            (datetime.combine(self.start_date, time.min, tzinfo=self.local_tz)
+             if self.local_tz is not None
+             else datetime.combine(self.start_date, time.min).astimezone())
+            .utcoffset()
+            .total_seconds()
+            / 60
+        )
         return {
             "startDate": self.start_date.isoformat(),
             "endDate": self.end_date.isoformat(),
             "startUtc": self.start_utc.isoformat(),
             "endUtcExclusive": self.end_utc.isoformat(),
             "timezone": self.timezone_label,
+            "timezoneOffsetMinutes": timezone_offset_minutes,
             "attribution": "token_count_snapshot_time",
         }
+
+
+@dataclass(frozen=True)
+class ReportRenderPlan:
+    """Resolved renderer inputs shared by every report mode."""
+
+    template: str
+    page_title: str
+    visible_title: str
+    date_filter_enabled: bool = False
 
 
 @dataclass
@@ -307,6 +326,53 @@ class WarningRecord:
             "line": self.line,
             "turnId": self.turn_id,
         }
+
+
+@dataclass(frozen=True)
+class RolloutParseRequest:
+    """The complete input contract for one rollout parse."""
+
+    path: Path
+    requested_thread_id: str | None = None
+    window: DateWindow | None = None
+    tolerate_live: bool = False
+
+
+class RolloutLineSource(Protocol):
+    """Input seam consumed by the rollout parser implementation."""
+
+    def iter_lines(self, path: Path) -> Iterable[str]:
+        ...
+
+
+class FileRolloutLineSource:
+    """Production adapter that streams UTF-8 JSONL lines from disk."""
+
+    def iter_lines(self, path: Path) -> Iterable[str]:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+            yield from handle
+
+
+class InMemoryRolloutLineSource:
+    """Test adapter for exercising parser behaviour without filesystem I/O."""
+
+    def __init__(self, lines: Iterable[str]) -> None:
+        self._lines = tuple(lines)
+
+    def iter_lines(self, path: Path) -> Iterable[str]:
+        del path
+        yield from self._lines
+
+
+@dataclass(frozen=True)
+class RolloutEvent:
+    """A decoded rollout record crossing the parser/reducer seam."""
+
+    line_number: int
+    record_type: Any
+    payload: dict[str, Any]
+    timestamp: str
+    in_window: bool
 
 
 TOOL_EVENT_TYPES = {
@@ -392,6 +458,9 @@ class Turn:
     compactions: int = 0
     warning_codes: list[str] = field(default_factory=list)
     range_usage: Usage = field(default_factory=Usage)
+    daily_usage: dict[str, Usage] = field(default_factory=dict)
+    daily_model_responses: dict[str, int] = field(default_factory=dict)
+    daily_token_snapshots: dict[str, int] = field(default_factory=dict)
     range_relevant: bool = False
     range_first_activity_at: str | None = None
     range_last_activity_at: str | None = None
@@ -545,6 +614,12 @@ class Turn:
             "compactions": self.compactions,
             "warnings": self.warning_codes,
             "usage": usage.to_dict(),
+            "dailyUsage": [
+                {"date": day, "usage": value.to_dict()}
+                for day, value in sorted(self.daily_usage.items())
+            ],
+            "dailyModelResponses": dict(sorted(self.daily_model_responses.items())),
+            "dailyTokenSnapshots": dict(sorted(self.daily_token_snapshots.items())),
             "breakdown": breakdown,
             "breakdownMismatch": mismatch,
             "rangeClipped": range_clipped,
@@ -1231,76 +1306,82 @@ def resolve_rollout(value: str, roots: Iterable[Path] | None = None) -> Path:
     return max(choices, key=lambda path: path.stat().st_mtime).resolve()
 
 
-def parse_rollout(
-    path: Path,
-    requested_thread_id: str | None = None,
-    window: DateWindow | None = None,
-    tolerate_live: bool = False,
-) -> dict[str, Any]:
-    filename_thread_id = _extract_thread_id(path.name)
-    warnings: list[WarningRecord] = []
-    normalizer = UsageNormalizer(warnings)
-    latest_usage = Usage()
-    turns: list[Turn] = []
-    turns_by_id: dict[str, Turn] = {}
-    current: Turn | None = None
-    unattributed = Usage()
-    session_meta: list[dict[str, Any]] = []
-    orphan_messages: list[dict[str, Any]] = []
-    malformed_lines = 0
-    blank_lines = 0
-    token_events = 0
-    duplicate_snapshots = 0
-    rollback_count = 0
-    cache_write_field_present = False
-    reasoning_field_present = False
-    total_field_present = True
-    range_usage = Usage()
-    range_unattributed = Usage()
-    daily_usage: dict[str, Usage] = {}
-    range_activity = False
-    range_first_activity_at: str | None = None
-    range_last_activity_at: str | None = None
-    subagent_preamble = False
-    subagent_baseline_applied = False
-    latest_context_snapshot: ContextSnapshot | None = None
-    previous_context_snapshot: ContextSnapshot | None = None
-    pending_compaction: ContextCompaction | None = None
-    tool_calls_by_key: dict[tuple[str, str], ToolCall] = {}
-    tool_sequence = 0
+class RolloutEventReducer:
+    """Own the rollout event state machine behind one consume/finish seam."""
 
-    def compaction_offsets() -> tuple[int | None, int | None]:
-        if current is None:
+    def __init__(
+        self,
+        filename_thread_id: str | None,
+        window: DateWindow | None,
+        tolerate_live: bool,
+    ) -> None:
+        self.filename_thread_id = filename_thread_id
+        self.window = window
+        self.tolerate_live = tolerate_live
+        self.warnings: list[WarningRecord] = []
+        self.normalizer = UsageNormalizer(self.warnings)
+        self.latest_usage = Usage()
+        self.turns: list[Turn] = []
+        self.turns_by_id: dict[str, Turn] = {}
+        self.current: Turn | None = None
+        self.unattributed = Usage()
+        self.session_meta: list[dict[str, Any]] = []
+        self.orphan_messages: list[dict[str, Any]] = []
+        self.malformed_lines = 0
+        self.blank_lines = 0
+        self.token_events = 0
+        self.duplicate_snapshots = 0
+        self.rollback_count = 0
+        self.cache_write_field_present = False
+        self.reasoning_field_present = False
+        self.total_field_present = True
+        self.range_usage = Usage()
+        self.range_unattributed = Usage()
+        self.daily_usage: dict[str, Usage] = {}
+        self.range_activity = False
+        self.range_first_activity_at: str | None = None
+        self.range_last_activity_at: str | None = None
+        self.subagent_preamble = False
+        self.subagent_baseline_applied = False
+        self.latest_context_snapshot: ContextSnapshot | None = None
+        self.previous_context_snapshot: ContextSnapshot | None = None
+        self.pending_compaction: ContextCompaction | None = None
+        self.tool_calls_by_key: dict[tuple[str, str], ToolCall] = {}
+        self.tool_sequence = 0
+
+    def _compaction_offsets(self) -> tuple[int | None, int | None]:
+        if self.current is None:
             return None, None
-        turn_offset = (latest_usage - current.start_usage).clamp_nonnegative().total
-        return turn_offset, current.range_usage.total
+        turn_offset = (
+            self.latest_usage - self.current.start_usage
+        ).clamp_nonnegative().total
+        return turn_offset, self.current.range_usage.total
 
-    def note_range_activity(timestamp: str) -> None:
-        nonlocal range_activity, range_first_activity_at, range_last_activity_at
-        if window is None or not window.contains(timestamp):
+    def _note_range_activity(self, timestamp: str) -> None:
+        if self.window is None or not self.window.contains(timestamp):
             return
-        range_activity = True
+        self.range_activity = True
         if timestamp:
-            if range_first_activity_at is None:
-                range_first_activity_at = timestamp
-            range_last_activity_at = timestamp
+            if self.range_first_activity_at is None:
+                self.range_first_activity_at = timestamp
+            self.range_last_activity_at = timestamp
 
-    def record_tool_event(
+    def _record_tool_event(
+        self,
         record_type: Any,
         event_payload: dict[str, Any],
         event_timestamp: str,
     ) -> None:
-        nonlocal tool_sequence
         event = _extract_tool_event(record_type, event_payload)
         if (
             event is None
-            or current is None
-            or (window is not None and not window.contains(event_timestamp))
+            or self.current is None
+            or (self.window is not None and not self.window.contains(event_timestamp))
         ):
             return
         call_id = event["callId"]
-        lookup_key = (current.turn_id, call_id) if call_id else None
-        existing = tool_calls_by_key.get(lookup_key) if lookup_key is not None else None
+        lookup_key = (self.current.turn_id, call_id) if call_id else None
+        existing = self.tool_calls_by_key.get(lookup_key) if lookup_key is not None else None
         if existing is not None:
             existing.usage, existing.usage_known = _merge_tool_usage(
                 existing.usage,
@@ -1328,9 +1409,9 @@ def parse_rollout(
                 existing.ended_at = event_timestamp
                 existing.status = event["status"]
             return
-        tool_sequence += 1
+        self.tool_sequence += 1
         call = ToolCall(
-            sequence=tool_sequence,
+            sequence=self.tool_sequence,
             call_id=call_id,
             name=event["name"],
             raw_name=event["rawName"],
@@ -1346,462 +1427,539 @@ def parse_rollout(
             usage_reported=event["usageReported"],
             usage_known=set(event["usageKnown"]),
         )
-        current.tool_calls.append(call)
+        self.current.tool_calls.append(call)
         if lookup_key is not None:
-            tool_calls_by_key[lookup_key] = call
-        current.note_range_activity(event_timestamp)
-        note_range_activity(event_timestamp)
+            self.tool_calls_by_key[lookup_key] = call
+        self.current.note_range_activity(event_timestamp)
+        self._note_range_activity(event_timestamp)
 
-    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
-        for line_number, raw_line in enumerate(handle, 1):
-            stripped = raw_line.strip()
-            if not stripped:
-                blank_lines += 1
-                continue
-            try:
-                record = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                malformed_lines += 1
-                # A line returned without a newline terminator is necessarily
-                # the stream's current final line, including while a live
-                # rollout is still being appended.
-                trailing = not raw_line.endswith(("\n", "\r"))
-                warnings.append(
+    def _reset_subagent_baseline(self) -> None:
+        self.current = None
+        self.turns.clear()
+        self.turns_by_id.clear()
+        self.orphan_messages.clear()
+        self.warnings.clear()
+        self.unattributed = Usage()
+        self.range_unattributed = Usage()
+        self.range_usage = Usage()
+        self.daily_usage.clear()
+        self.malformed_lines = 0
+        self.blank_lines = 0
+        self.token_events = 0
+        self.duplicate_snapshots = 0
+        self.rollback_count = 0
+        self.normalizer.reset_count = 0
+        self.latest_context_snapshot = None
+        self.previous_context_snapshot = None
+        self.pending_compaction = None
+        self.tool_calls_by_key.clear()
+        self.subagent_baseline_applied = True
+
+    def consume(self, event: RolloutEvent) -> None:
+        record_type = event.record_type
+        payload = event.payload
+        timestamp = event.timestamp
+        in_window = event.in_window
+        line_number = event.line_number
+        event_type = payload.get("type")
+
+        if record_type == "session_meta":
+            self.session_meta.append(payload)
+            candidate_id = _coerce_text(payload.get("id")).lower()
+            source_text = " ".join(
+                _coerce_text(payload.get(key)) for key in ("thread_source", "source")
+            ).lower()
+            if (
+                self.filename_thread_id
+                and candidate_id == self.filename_thread_id
+                and "subagent" in source_text
+            ):
+                self.subagent_preamble = True
+            self._note_range_activity(timestamp)
+            return
+
+        if record_type == "turn_context":
+            turn_id = _coerce_text(payload.get("turn_id"))
+            turn = self.turns_by_id.get(turn_id)
+            if turn is None and self.current is not None and self.current.turn_id == turn_id:
+                turn = self.current
+            if turn is not None:
+                turn.add_unique("models", payload.get("model"))
+                effort = payload.get("effort")
+                if effort is None:
+                    mode = payload.get("collaboration_mode")
+                    if isinstance(mode, dict):
+                        settings = mode.get("settings")
+                        if isinstance(settings, dict):
+                            effort = settings.get("reasoning_effort")
+                turn.add_unique("efforts", effort)
+                context_window = payload.get("model_context_window")
+                if context_window is not None:
+                    turn.add_unique("context_windows", _as_nonnegative_int(context_window))
+            return
+
+        if record_type == "compacted":
+            if self.current is not None:
+                turn_offset, range_turn_offset = self._compaction_offsets()
+                self.pending_compaction = ContextCompaction(
+                    timestamp=timestamp,
+                    before=self.latest_context_snapshot,
+                    turn_token_offset=turn_offset,
+                    range_turn_token_offset=range_turn_offset,
+                )
+            return
+
+        if record_type != "event_msg":
+            if record_type in {"response_item", "tool_call", "tool_result", "tool_output"}:
+                if (
+                    record_type == "response_item"
+                    and self.current is not None
+                    and payload.get("type") == "message"
+                    and payload.get("role") == "assistant"
+                    and (self.window is None or in_window)
+                ):
+                    self.current.add_output(
+                        timestamp,
+                        _response_item_text(payload),
+                        payload.get("phase"),
+                    )
+                self._record_tool_event(record_type, payload, timestamp)
+            return
+
+        if _extract_tool_event(record_type, payload) is not None:
+            self._record_tool_event(event_type, payload, timestamp)
+            return
+
+        if (
+            event_type == "thread_settings_applied"
+            and self.subagent_preamble
+            and not self.subagent_baseline_applied
+            and self.current is not None
+        ):
+            self._reset_subagent_baseline()
+            return
+
+        if event_type == "task_started":
+            self.pending_compaction = None
+            if self.current is not None:
+                self.current.status = "incomplete"
+                self.current.ended_at = timestamp
+                self.current.warning_codes.append("nested_task_start")
+                self.warnings.append(
                     WarningRecord(
-                        "warning" if tolerate_live and trailing else "error",
-                        "trailing_partial_line" if trailing else "malformed_json",
-                        (
-                            "已忽略末尾疑似未写完的 JSON 行。"
-                            if trailing
-                            else f"已忽略格式错误的 JSON：{exc.msg}。"
-                        ),
+                        "error",
+                        "nested_task_start",
+                        "当前轮次尚未结束，又出现了新的 task_started 事件。",
+                        line=line_number,
+                        turn_id=self.current.turn_id,
+                    )
+                )
+                self.turns.append(self.current)
+            turn_id = _coerce_text(payload.get("turn_id")) or f"unknown-{len(self.turns) + 1}"
+            self.current = Turn(
+                index=len(self.turns) + 1,
+                turn_id=turn_id,
+                started_at=timestamp,
+                started_line=line_number,
+                start_usage=self.latest_usage,
+                end_usage=self.latest_usage,
+            )
+            context_window = payload.get("model_context_window")
+            if context_window is not None:
+                self.current.add_unique("context_windows", _as_nonnegative_int(context_window))
+            self.turns_by_id[turn_id] = self.current
+            if self.window is not None and in_window:
+                self.current.note_range_activity(timestamp)
+                self._note_range_activity(timestamp)
+            return
+
+        if event_type == "agent_message":
+            if self.current is not None and (self.window is None or in_window):
+                self.current.add_output(
+                    timestamp,
+                    _coerce_text(payload.get("message") or payload.get("text")),
+                    payload.get("phase"),
+                )
+                self.current.note_range_activity(timestamp)
+                self._note_range_activity(timestamp)
+            return
+
+        if event_type == "user_message":
+            message = {
+                "timestamp": timestamp,
+                "text": _coerce_text(payload.get("message")),
+                "clientId": _coerce_text(payload.get("client_id")) or None,
+                "imageCount": len(payload.get("images") or [])
+                + len(payload.get("local_images") or []),
+                "audioCount": len(payload.get("audio") or [])
+                + len(payload.get("local_audio") or []),
+            }
+            if self.current is not None:
+                self.current.message_events += 1
+            if self.window is not None and not in_window:
+                return
+            if self.current is None:
+                self.orphan_messages.append(message)
+                if self.window is not None:
+                    self._note_range_activity(timestamp)
+                self.warnings.append(
+                    WarningRecord(
+                        "warning",
+                        "orphan_user_message",
+                        "活动轮次之外出现了一条用户消息。",
                         line=line_number,
                     )
                 )
-                continue
+            else:
+                message["steering"] = self.current.message_events > 1
+                self.current.messages.append(message)
+                if self.window is not None:
+                    self.current.note_range_activity(timestamp)
+                    self._note_range_activity(timestamp)
+            return
 
-            record_type = record.get("type")
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                payload = {}
-            timestamp = _coerce_text(record.get("timestamp"))
-            in_window = window is None or window.contains(timestamp)
-
-            if record_type == "session_meta":
-                session_meta.append(payload)
-                candidate_id = _coerce_text(payload.get("id")).lower()
-                source_text = " ".join(
-                    _coerce_text(payload.get(key))
-                    for key in ("thread_source", "source")
-                ).lower()
-                if (
-                    filename_thread_id
-                    and candidate_id == filename_thread_id
-                    and "subagent" in source_text
-                ):
-                    subagent_preamble = True
-                note_range_activity(timestamp)
-                continue
-
-            if record_type == "turn_context":
-                turn_id = _coerce_text(payload.get("turn_id"))
-                turn = turns_by_id.get(turn_id)
-                if turn is None and current is not None and current.turn_id == turn_id:
-                    turn = current
-                if turn is not None:
-                    turn.add_unique("models", payload.get("model"))
-                    effort = payload.get("effort")
-                    if effort is None:
-                        mode = payload.get("collaboration_mode")
-                        if isinstance(mode, dict):
-                            settings = mode.get("settings")
-                            if isinstance(settings, dict):
-                                effort = settings.get("reasoning_effort")
-                    turn.add_unique("efforts", effort)
-                    context_window = payload.get("model_context_window")
-                    if context_window is not None:
-                        turn.add_unique(
-                            "context_windows", _as_nonnegative_int(context_window)
-                        )
-                continue
-
-            if record_type == "compacted":
-                # event_msg/context_compacted is the canonical count; this top-level
-                # companion event marks the exact pre-compaction context snapshot.
-                if current is not None:
-                    turn_offset, range_turn_offset = compaction_offsets()
-                    pending_compaction = ContextCompaction(
-                        timestamp=timestamp,
-                        before=latest_context_snapshot,
-                        turn_token_offset=turn_offset,
-                        range_turn_token_offset=range_turn_offset,
+        if event_type == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                self.warnings.append(
+                    WarningRecord(
+                        "error",
+                        "missing_token_info",
+                        "token_count 不包含 info 对象。",
+                        line=line_number,
+                        turn_id=self.current.turn_id if self.current else None,
                     )
-                continue
-
-            if record_type != "event_msg":
-                if record_type in {"response_item", "tool_call", "tool_result", "tool_output"}:
-                    if (
-                        record_type == "response_item"
-                        and current is not None
-                        and payload.get("type") == "message"
-                        and payload.get("role") == "assistant"
-                        and (window is None or in_window)
-                    ):
-                        current.add_output(
-                            timestamp,
-                            _response_item_text(payload),
-                            payload.get("phase"),
-                        )
-                    record_tool_event(record_type, payload, timestamp)
-                continue
-
-            event_type = payload.get("type")
-            if _extract_tool_event(record_type, payload) is not None:
-                record_tool_event(event_type, payload, timestamp)
-                continue
-            if (
-                event_type == "thread_settings_applied"
-                and subagent_preamble
-                and not subagent_baseline_applied
-                and current is not None
-            ):
-                # Subagent rollouts begin with a copied snapshot of the active
-                # parent turn. Keep its cumulative counter as the baseline for
-                # subsequent deltas, but never expose or count the copied turn.
-                current = None
-                turns.clear()
-                turns_by_id.clear()
-                orphan_messages.clear()
-                warnings.clear()
-                unattributed = Usage()
-                range_unattributed = Usage()
-                range_usage = Usage()
-                daily_usage.clear()
-                malformed_lines = 0
-                blank_lines = 0
-                token_events = 0
-                duplicate_snapshots = 0
-                rollback_count = 0
-                normalizer.reset_count = 0
-                subagent_baseline_applied = True
-                latest_context_snapshot = None
-                previous_context_snapshot = None
-                pending_compaction = None
-                tool_calls_by_key.clear()
-                continue
-
-            if event_type == "task_started":
-                pending_compaction = None
-                if current is not None:
-                    current.status = "incomplete"
-                    current.ended_at = timestamp
-                    current.warning_codes.append("nested_task_start")
-                    warnings.append(
-                        WarningRecord(
-                            "error",
-                            "nested_task_start",
-                            "当前轮次尚未结束，又出现了新的 task_started 事件。",
-                            line=line_number,
-                            turn_id=current.turn_id,
-                        )
-                    )
-                    turns.append(current)
-                turn_id = _coerce_text(payload.get("turn_id")) or f"unknown-{len(turns) + 1}"
-                current = Turn(
-                    index=len(turns) + 1,
-                    turn_id=turn_id,
-                    started_at=timestamp,
-                    started_line=line_number,
-                    start_usage=latest_usage,
-                    end_usage=latest_usage,
                 )
-                context_window = payload.get("model_context_window")
-                if context_window is not None:
-                    current.add_unique(
-                        "context_windows", _as_nonnegative_int(context_window)
+                return
+            total_payload = info.get("total_token_usage")
+            if not isinstance(total_payload, dict):
+                self.warnings.append(
+                    WarningRecord(
+                        "error",
+                        "missing_total_usage",
+                        "token_count 不包含 total_token_usage。",
+                        line=line_number,
+                        turn_id=self.current.turn_id if self.current else None,
                     )
-                turns_by_id[turn_id] = current
-                if window is not None and in_window:
-                    current.note_range_activity(timestamp)
-                    note_range_activity(timestamp)
-                continue
-
-            if event_type == "agent_message":
-                if current is not None and (window is None or in_window):
-                    current.add_output(
-                        timestamp,
-                        _coerce_text(payload.get("message") or payload.get("text")),
-                        payload.get("phase"),
-                    )
-                    current.note_range_activity(timestamp)
-                    note_range_activity(timestamp)
-                continue
-
-            if event_type == "user_message":
-                message = {
-                    "timestamp": timestamp,
-                    "text": _coerce_text(payload.get("message")),
-                    "clientId": _coerce_text(payload.get("client_id")) or None,
-                    "imageCount": len(payload.get("images") or [])
-                    + len(payload.get("local_images") or []),
-                    "audioCount": len(payload.get("audio") or [])
-                    + len(payload.get("local_audio") or []),
-                }
-                if current is not None:
-                    current.message_events += 1
-                if window is not None and not in_window:
-                    continue
-                if current is None:
-                    orphan_messages.append(message)
-                    if window is not None:
-                        note_range_activity(timestamp)
-                    warnings.append(
-                        WarningRecord(
-                            "warning",
-                            "orphan_user_message",
-                            "活动轮次之外出现了一条用户消息。",
-                            line=line_number,
-                        )
-                    )
-                else:
-                    message["steering"] = current.message_events > 1
-                    current.messages.append(message)
-                    if window is not None:
-                        current.note_range_activity(timestamp)
-                        note_range_activity(timestamp)
-                continue
-
-            if event_type == "token_count":
-                info = payload.get("info")
-                if not isinstance(info, dict):
-                    warnings.append(
-                        WarningRecord(
-                            "error",
-                            "missing_token_info",
-                            "token_count 不包含 info 对象。",
-                            line=line_number,
-                            turn_id=current.turn_id if current else None,
-                        )
-                    )
-                    continue
-                total_payload = info.get("total_token_usage")
-                if not isinstance(total_payload, dict):
-                    warnings.append(
-                        WarningRecord(
-                            "error",
-                            "missing_total_usage",
-                            "token_count 不包含 total_token_usage。",
-                            line=line_number,
-                            turn_id=current.turn_id if current else None,
-                        )
-                    )
-                    continue
-                cache_write_field_present = cache_write_field_present or (
-                    "cache_write_input_tokens" in total_payload
                 )
-                reasoning_field_present = reasoning_field_present or (
-                    "reasoning_output_tokens" in total_payload
+                return
+            self.cache_write_field_present = self.cache_write_field_present or (
+                "cache_write_input_tokens" in total_payload
+            )
+            self.reasoning_field_present = self.reasoning_field_present or (
+                "reasoning_output_tokens" in total_payload
+            )
+            self.total_field_present = self.total_field_present and (
+                "total_tokens" in total_payload
+            )
+            raw_usage = Usage.from_payload(total_payload)
+            logical_usage, event_delta = self.normalizer.normalize(raw_usage, line_number)
+            last_payload = info.get("last_token_usage")
+            context_snapshot: ContextSnapshot | None = None
+            if isinstance(last_payload, dict) and "total_tokens" in last_payload:
+                raw_window = info.get("model_context_window")
+                context_window = (
+                    _as_nonnegative_int(raw_window)
+                    if raw_window is not None
+                    else (
+                        self.current.context_windows[-1]
+                        if self.current is not None and self.current.context_windows
+                        else None
+                    )
                 )
-                total_field_present = total_field_present and ("total_tokens" in total_payload)
-                raw_usage = Usage.from_payload(total_payload)
-                logical_usage, event_delta = normalizer.normalize(raw_usage, line_number)
-                last_payload = info.get("last_token_usage")
-                context_snapshot: ContextSnapshot | None = None
-                if isinstance(last_payload, dict) and "total_tokens" in last_payload:
-                    raw_window = info.get("model_context_window")
-                    context_window = (
-                        _as_nonnegative_int(raw_window)
-                        if raw_window is not None
-                        else (
-                            current.context_windows[-1]
-                            if current is not None and current.context_windows
-                            else None
-                        )
-                    )
-                    if context_window == 0:
-                        context_window = None
-                    context_snapshot = ContextSnapshot(
-                        tokens=_as_nonnegative_int(last_payload.get("total_tokens")),
-                        window_tokens=context_window,
-                        timestamp=timestamp,
-                    )
-                    previous_context_snapshot = latest_context_snapshot
-                    latest_context_snapshot = context_snapshot
-                    if pending_compaction is not None and pending_compaction.after is None:
-                        pending_compaction.after = context_snapshot
-                if event_delta.total == 0 and in_window:
-                    duplicate_snapshots += 1
-                if in_window:
-                    token_events += 1
-                latest_usage = logical_usage
-                if current is not None:
-                    current.end_usage = logical_usage
-                    if context_snapshot is not None:
-                        current.latest_context_snapshot = context_snapshot
-                        turn_offset = (
-                            logical_usage - current.start_usage
-                        ).clamp_nonnegative().total
-                        range_turn_offset = (
-                            current.range_usage.total + event_delta.total
-                            if window is not None and in_window
-                            else None
-                        )
-                        current.context_timeline.append(
-                            ContextTimelinePoint(
-                                snapshot=context_snapshot,
-                                turn_token_offset=turn_offset,
-                                range_turn_token_offset=range_turn_offset,
-                            )
-                        )
-                        if in_window:
-                            current.range_latest_context_snapshot = context_snapshot
-                    if in_window:
-                        current.token_snapshots += 1
-                        if event_delta.total > 0:
-                            current.model_responses += 1
-                        if window is not None:
-                            current.range_usage = current.range_usage + event_delta
-                            current.note_range_activity(timestamp)
-                    context_window = info.get("model_context_window")
-                    if context_window is not None:
-                        current.add_unique(
-                            "context_windows", _as_nonnegative_int(context_window)
-                        )
-                elif event_delta.total > 0 and in_window:
-                    if window is None:
-                        unattributed = unattributed + event_delta
-                    else:
-                        range_unattributed = range_unattributed + event_delta
-                    warnings.append(
-                        WarningRecord(
-                            "warning",
-                            "unattributed_usage",
-                            f"活动轮次之外增加了 {event_delta.total:,} 个 Token。",
-                            line=line_number,
-                        )
-                    )
-                if window is not None and in_window:
-                    range_usage = range_usage + event_delta
-                    _add_usage_bucket(
-                        daily_usage,
-                        window.local_date_text(timestamp),
-                        event_delta,
-                    )
-                    note_range_activity(timestamp)
-                elif window is None and event_delta.total > 0:
-                    _add_usage_bucket(daily_usage, _local_date_text(timestamp), event_delta)
-                continue
-
-            if event_type in {"task_complete", "turn_aborted"}:
-                terminal_id = _coerce_text(payload.get("turn_id"))
-                if current is None:
-                    warnings.append(
-                        WarningRecord(
-                            "error",
-                            "orphan_task_terminal",
-                            f"没有活动轮次时出现了 {event_type}。",
-                            line=line_number,
-                            turn_id=terminal_id or None,
-                        )
-                    )
-                    continue
-                if terminal_id and terminal_id != current.turn_id:
-                    current.warning_codes.append("turn_id_mismatch")
-                    warnings.append(
-                        WarningRecord(
-                            "error",
-                            "turn_id_mismatch",
-                            f"结束事件的轮次 ID {terminal_id} 与活动轮次 {current.turn_id} 不一致。",
-                            line=line_number,
-                            turn_id=current.turn_id,
-                        )
-                    )
-                current.status = "complete" if event_type == "task_complete" else "aborted"
-                current.ended_at = timestamp
-                current.duration_ms = (
-                    _as_nonnegative_int(payload.get("duration_ms"))
-                    if payload.get("duration_ms") is not None
-                    else None
+                if context_window == 0:
+                    context_window = None
+                context_snapshot = ContextSnapshot(
+                    tokens=_as_nonnegative_int(last_payload.get("total_tokens")),
+                    window_tokens=context_window,
+                    timestamp=timestamp,
                 )
-                current.time_to_first_token_ms = (
-                    _as_nonnegative_int(payload.get("time_to_first_token_ms"))
-                    if payload.get("time_to_first_token_ms") is not None
-                    else None
-                )
-                current.abort_reason = (
-                    _coerce_text(payload.get("reason")) or None
-                    if event_type == "turn_aborted"
-                    else None
-                )
-                if window is not None and in_window:
-                    current.note_range_activity(timestamp)
-                    note_range_activity(timestamp)
-                turns.append(current)
-                current = None
-                pending_compaction = None
-                continue
-
-            if event_type == "context_compacted":
-                if current is not None and in_window:
-                    current.compactions += 1
-                    compaction = pending_compaction
-                    if compaction is None:
-                        turn_offset, range_turn_offset = compaction_offsets()
-                        compaction = ContextCompaction(
-                            timestamp=timestamp,
-                            before=previous_context_snapshot,
-                            after=latest_context_snapshot,
+                self.previous_context_snapshot = self.latest_context_snapshot
+                self.latest_context_snapshot = context_snapshot
+                if self.pending_compaction is not None and self.pending_compaction.after is None:
+                    self.pending_compaction.after = context_snapshot
+            if event_delta.total == 0 and in_window:
+                self.duplicate_snapshots += 1
+            if in_window:
+                self.token_events += 1
+            self.latest_usage = logical_usage
+            if self.current is not None:
+                current = self.current
+                current.end_usage = logical_usage
+                if context_snapshot is not None:
+                    current.latest_context_snapshot = context_snapshot
+                    turn_offset = (
+                        logical_usage - current.start_usage
+                    ).clamp_nonnegative().total
+                    range_turn_offset = (
+                        current.range_usage.total + event_delta.total
+                        if self.window is not None and in_window
+                        else None
+                    )
+                    current.context_timeline.append(
+                        ContextTimelinePoint(
+                            snapshot=context_snapshot,
                             turn_token_offset=turn_offset,
                             range_turn_token_offset=range_turn_offset,
                         )
-                    else:
-                        compaction.timestamp = timestamp
-                    current.context_compactions.append(compaction)
-                    pending_compaction = None
-                    if window is not None:
-                        current.note_range_activity(timestamp)
-                        note_range_activity(timestamp)
-                elif current is None and in_window:
-                    warnings.append(
-                        WarningRecord(
-                            "warning",
-                            "orphan_compaction",
-                            "活动轮次之外出现了上下文压缩事件。",
-                            line=line_number,
-                        )
                     )
-                continue
-
-            if event_type == "thread_rolled_back":
+                    if in_window:
+                        current.range_latest_context_snapshot = context_snapshot
                 if in_window:
-                    rollback_count += 1
-                    note_range_activity(timestamp)
-                if current is not None and in_window:
-                    warnings.append(
-                        WarningRecord(
-                            "warning",
-                            "rollback_during_turn",
-                            "活动轮次期间发生了线程回滚。",
-                            line=line_number,
-                            turn_id=current.turn_id,
-                        )
+                    current.token_snapshots += 1
+                    if event_delta.total > 0:
+                        current.model_responses += 1
+                    activity_day = (
+                        self.window.local_date_text(timestamp)
+                        if self.window is not None
+                        else _local_date_text(timestamp)
                     )
+                    if activity_day:
+                        _add_usage_bucket(current.daily_usage, activity_day, event_delta)
+                        current.daily_token_snapshots[activity_day] = (
+                            current.daily_token_snapshots.get(activity_day, 0) + 1
+                        )
+                        if event_delta.total > 0:
+                            current.daily_model_responses[activity_day] = (
+                                current.daily_model_responses.get(activity_day, 0) + 1
+                            )
+                    if self.window is not None:
+                        current.range_usage = current.range_usage + event_delta
+                        current.note_range_activity(timestamp)
+                context_window = info.get("model_context_window")
+                if context_window is not None:
+                    current.add_unique("context_windows", _as_nonnegative_int(context_window))
+            elif event_delta.total > 0 and in_window:
+                if self.window is None:
+                    self.unattributed = self.unattributed + event_delta
+                else:
+                    self.range_unattributed = self.range_unattributed + event_delta
+                self.warnings.append(
+                    WarningRecord(
+                        "warning",
+                        "unattributed_usage",
+                        f"活动轮次之外增加了 {event_delta.total:,} 个 Token。",
+                        line=line_number,
+                    )
+                )
+            if self.window is not None and in_window:
+                self.range_usage = self.range_usage + event_delta
+                _add_usage_bucket(
+                    self.daily_usage,
+                    self.window.local_date_text(timestamp),
+                    event_delta,
+                )
+                self._note_range_activity(timestamp)
+            elif self.window is None and event_delta.total > 0:
+                _add_usage_bucket(self.daily_usage, _local_date_text(timestamp), event_delta)
+            return
 
-    if current is not None:
-        current.status = "incomplete"
-        current.ended_at = None
-        current.warning_codes.append("unclosed_turn")
-        if window is None or current.range_relevant:
-            warnings.append(
+        if event_type in {"task_complete", "turn_aborted"}:
+            terminal_id = _coerce_text(payload.get("turn_id"))
+            if self.current is None:
+                self.warnings.append(
+                    WarningRecord(
+                        "error",
+                        "orphan_task_terminal",
+                        f"没有活动轮次时出现了 {event_type}。",
+                        line=line_number,
+                        turn_id=terminal_id or None,
+                    )
+                )
+                return
+            if terminal_id and terminal_id != self.current.turn_id:
+                self.current.warning_codes.append("turn_id_mismatch")
+                self.warnings.append(
+                    WarningRecord(
+                        "error",
+                        "turn_id_mismatch",
+                        f"结束事件的轮次 ID {terminal_id} 与活动轮次 {self.current.turn_id} 不一致。",
+                        line=line_number,
+                        turn_id=self.current.turn_id,
+                    )
+                )
+            self.current.status = "complete" if event_type == "task_complete" else "aborted"
+            self.current.ended_at = timestamp
+            self.current.duration_ms = (
+                _as_nonnegative_int(payload.get("duration_ms"))
+                if payload.get("duration_ms") is not None
+                else None
+            )
+            self.current.time_to_first_token_ms = (
+                _as_nonnegative_int(payload.get("time_to_first_token_ms"))
+                if payload.get("time_to_first_token_ms") is not None
+                else None
+            )
+            self.current.abort_reason = (
+                _coerce_text(payload.get("reason")) or None
+                if event_type == "turn_aborted"
+                else None
+            )
+            if self.window is not None and in_window:
+                self.current.note_range_activity(timestamp)
+                self._note_range_activity(timestamp)
+            self.turns.append(self.current)
+            self.current = None
+            self.pending_compaction = None
+            return
+
+        if event_type == "context_compacted":
+            if self.current is not None and in_window:
+                self.current.compactions += 1
+                compaction = self.pending_compaction
+                if compaction is None:
+                    turn_offset, range_turn_offset = self._compaction_offsets()
+                    compaction = ContextCompaction(
+                        timestamp=timestamp,
+                        before=self.previous_context_snapshot,
+                        after=self.latest_context_snapshot,
+                        turn_token_offset=turn_offset,
+                        range_turn_token_offset=range_turn_offset,
+                    )
+                else:
+                    compaction.timestamp = timestamp
+                self.current.context_compactions.append(compaction)
+                self.pending_compaction = None
+                if self.window is not None:
+                    self.current.note_range_activity(timestamp)
+                    self._note_range_activity(timestamp)
+            elif self.current is None and in_window:
+                self.warnings.append(
+                    WarningRecord(
+                        "warning",
+                        "orphan_compaction",
+                        "活动轮次之外出现了上下文压缩事件。",
+                        line=line_number,
+                    )
+                )
+            return
+
+        if event_type == "thread_rolled_back":
+            if in_window:
+                self.rollback_count += 1
+                self._note_range_activity(timestamp)
+            if self.current is not None and in_window:
+                self.warnings.append(
+                    WarningRecord(
+                        "warning",
+                        "rollback_during_turn",
+                        "活动轮次期间发生了线程回滚。",
+                        line=line_number,
+                        turn_id=self.current.turn_id,
+                    )
+                )
+
+    def finish(self) -> None:
+        if self.current is None:
+            return
+        self.current.status = "incomplete"
+        self.current.ended_at = None
+        self.current.warning_codes.append("unclosed_turn")
+        if self.window is None or self.current.range_relevant:
+            self.warnings.append(
                 WarningRecord(
-                    "warning" if tolerate_live else "error",
+                    "warning" if self.tolerate_live else "error",
                     "unclosed_turn",
                     "rollout 结束时仍有一个活动轮次未闭合。",
-                    turn_id=current.turn_id,
+                    turn_id=self.current.turn_id,
                 )
             )
-        turns.append(current)
+        self.turns.append(self.current)
+        self.current = None
 
+
+class RolloutParser:
+    """Deep rollout parser with a small request/result interface.
+
+    The parser owns JSONL decoding, event state, attribution, context, tool
+    events, and report-schema projection.  Only the line source is injectable;
+    callers do not need to know the state machine's internal phases.
+    """
+
+    def __init__(self, line_source: RolloutLineSource | None = None) -> None:
+        self._line_source = line_source or FileRolloutLineSource()
+
+    def parse(self, request: RolloutParseRequest) -> dict[str, Any]:
+        return _parse_rollout_impl(
+            request.path,
+            requested_thread_id=request.requested_thread_id,
+            window=request.window,
+            tolerate_live=request.tolerate_live,
+            line_source=self._line_source,
+        )
+
+
+def _parse_rollout_impl(
+    path: Path,
+    requested_thread_id: str | None = None,
+    window: DateWindow | None = None,
+    tolerate_live: bool = False,
+    line_source: RolloutLineSource | None = None,
+) -> dict[str, Any]:
+    line_source = line_source or FileRolloutLineSource()
+    filename_thread_id = _extract_thread_id(path.name)
+    reducer = RolloutEventReducer(filename_thread_id, window, tolerate_live)
+    for line_number, raw_line in enumerate(line_source.iter_lines(path), 1):
+        stripped = raw_line.strip()
+        if not stripped:
+            reducer.blank_lines += 1
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            reducer.malformed_lines += 1
+            trailing = not raw_line.endswith(("\n", "\r"))
+            reducer.warnings.append(
+                WarningRecord(
+                    "warning" if tolerate_live and trailing else "error",
+                    "trailing_partial_line" if trailing else "malformed_json",
+                    (
+                        "已忽略末尾疑似未写完的 JSON 行。"
+                        if trailing
+                        else f"已忽略格式错误的 JSON：{exc.msg}。"
+                    ),
+                    line=line_number,
+                )
+            )
+            continue
+        record_type = record.get("type")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        timestamp = _coerce_text(record.get("timestamp"))
+        reducer.consume(
+            RolloutEvent(
+                line_number=line_number,
+                record_type=record_type,
+                payload=payload,
+                timestamp=timestamp,
+                in_window=window is None or window.contains(timestamp),
+            )
+        )
+    reducer.finish()
+
+    warnings = reducer.warnings
+    normalizer = reducer.normalizer
+    latest_usage = reducer.latest_usage
+    turns = reducer.turns
+    unattributed = reducer.unattributed
+    session_meta = reducer.session_meta
+    orphan_messages = reducer.orphan_messages
+    malformed_lines = reducer.malformed_lines
+    blank_lines = reducer.blank_lines
+    token_events = reducer.token_events
+    duplicate_snapshots = reducer.duplicate_snapshots
+    rollback_count = reducer.rollback_count
+    cache_write_field_present = reducer.cache_write_field_present
+    reasoning_field_present = reducer.reasoning_field_present
+    total_field_present = reducer.total_field_present
+    range_usage = reducer.range_usage
+    range_unattributed = reducer.range_unattributed
+    daily_usage = reducer.daily_usage
+    range_activity = reducer.range_activity
+    range_first_activity_at = reducer.range_first_activity_at
+    range_last_activity_at = reducer.range_last_activity_at
+    subagent_baseline_applied = reducer.subagent_baseline_applied
     relevant_turns = (
         [turn for turn in turns if turn.range_relevant]
         if window is not None
@@ -1982,6 +2140,26 @@ def parse_rollout(
         "orphanMessages": orphan_messages,
         "turns": turn_dicts,
     }
+
+
+_DEFAULT_ROLLOUT_PARSER = RolloutParser()
+
+
+def parse_rollout(
+    path: Path,
+    requested_thread_id: str | None = None,
+    window: DateWindow | None = None,
+    tolerate_live: bool = False,
+) -> dict[str, Any]:
+    """Backward-compatible adapter over the deep rollout parser interface."""
+    return _DEFAULT_ROLLOUT_PARSER.parse(
+        RolloutParseRequest(
+            path=path,
+            requested_thread_id=requested_thread_id,
+            window=window,
+            tolerate_live=tolerate_live,
+        )
+    )
 
 
 def discover_rollouts(
@@ -3371,9 +3549,10 @@ RANGE_HTML_TEMPLATE = r"""<!doctype html>
 .tooltip-badges{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:5px}.tooltip-badge-secondary{background:rgba(183,122,38,.14);color:#8a6526}
 </style>
 <style>
-.model-filter{margin:10px 0 2px;padding:0 2px}.model-filter-title{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.model-filter-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.model-filter-toggle{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:5px 8px;border:1px solid color-mix(in srgb,var(--model-color,var(--border)) 48%,var(--border));border-radius:999px;background:color-mix(in srgb,var(--model-color,var(--panel)) 13%,var(--panel));color:var(--model-color,var(--muted));font-size:10px;font-weight:800;line-height:1.2;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease,opacity .14s ease}.model-filter-toggle:hover,.model-filter-toggle:focus-visible{border-color:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 16%,transparent);outline:none}.model-filter-toggle[aria-pressed="false"]{border-color:var(--border);background:transparent;color:var(--muted);opacity:.68}.model-filter-toggle[aria-pressed="false"] .model-filter-swatch{background:transparent;border:2px solid var(--model-color,var(--muted));opacity:.72}.model-filter-swatch{width:8px;height:8px;flex:none;border-radius:50%;background:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 15%,transparent)}.model-filter-count{color:inherit;font-size:9px;font-variant-numeric:tabular-nums;opacity:.76}.session-button.session-selected{box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 28%,transparent),0 7px 18px color-mix(in srgb,var(--model-color,var(--accent)) 13%,transparent)}.session-button.session-selected:not(.active){background:color-mix(in srgb,var(--model-tint,var(--panel)) 66%,var(--panel));border-color:color-mix(in srgb,var(--model-color,var(--accent)) 66%,var(--border))}.session-donut-sector.selected{filter:brightness(1.12) saturate(1.18);stroke:#2d2924;stroke-width:3}.session-total-jump{border:1px solid var(--border);border-radius:9px;padding:7px 10px;background:var(--panel);color:var(--accent);font-size:11px;font-weight:800;white-space:nowrap}.session-total-jump:hover,.session-total-jump:focus-visible{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,139,120,.12);outline:none}
+ .model-filter{margin:10px 0 2px;padding:0 2px}.model-filter-title{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.model-filter-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.model-filter-toggle{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:5px 8px;border:1px solid color-mix(in srgb,var(--model-color,var(--border)) 48%,var(--border));border-radius:999px;background:color-mix(in srgb,var(--model-color,var(--panel)) 13%,var(--panel));color:var(--model-color,var(--muted));font-size:10px;font-weight:800;line-height:1.2;white-space:nowrap;transition:background .14s ease,border-color .14s ease,color .14s ease,opacity .14s ease}.model-filter-toggle:hover,.model-filter-toggle:focus-visible{border-color:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 16%,transparent);outline:none}.model-filter-toggle[aria-pressed="false"]{border-color:var(--border);background:transparent;color:var(--muted);opacity:.68}.model-filter-toggle[aria-pressed="false"] .model-filter-swatch{background:transparent;border:2px solid var(--model-color,var(--muted));opacity:.72}.model-filter-swatch{width:8px;height:8px;flex:none;border-radius:50%;background:var(--model-color,var(--accent));box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 15%,transparent)}.model-filter-count{color:inherit;font-size:9px;font-variant-numeric:tabular-nums;opacity:.76}.date-filter{margin:14px 0 4px;padding:11px 10px;border:1px solid rgba(126,111,91,.24);border-radius:11px;background:rgba(255,254,250,.54)}.date-filter-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.date-filter-title{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.date-filter-note{color:var(--muted);font-size:9px}.date-filter-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.date-filter-field{display:grid;gap:3px;color:var(--muted);font-size:9px;font-weight:700}.date-filter-field input{min-width:0;width:100%;padding:6px 7px;border:1px solid var(--border);border-radius:7px;background:var(--panel);color:var(--text);font-size:11px}.date-filter-actions{display:flex;gap:6px;margin-top:8px}.date-filter-actions button{flex:1;padding:6px 8px;border:1px solid var(--border);border-radius:7px;background:var(--panel);color:var(--muted);font-size:10px;font-weight:750}.date-filter-actions button:first-child{border-color:var(--accent);background:rgba(59,139,120,.08);color:var(--accent)}.date-filter-actions button:hover,.date-filter-actions button:focus-visible{border-color:var(--accent);outline:none}.date-filter-status{min-height:16px;margin-top:6px;color:var(--muted);font-size:9px;line-height:1.35}.date-filter-status.error{color:var(--danger)}.session-button.session-selected{box-shadow:0 0 0 2px color-mix(in srgb,var(--model-color,var(--accent)) 28%,transparent),0 7px 18px color-mix(in srgb,var(--model-color,var(--accent)) 13%,transparent)}.session-button.session-selected:not(.active){background:color-mix(in srgb,var(--model-tint,var(--panel)) 66%,var(--panel));border-color:color-mix(in srgb,var(--model-color,var(--accent)) 66%,var(--border))}.session-donut-sector.selected{filter:brightness(1.12) saturate(1.18);stroke:#2d2924;stroke-width:3}.session-total-jump{border:1px solid var(--border);border-radius:9px;padding:7px 10px;background:var(--panel);color:var(--accent);font-size:11px;font-weight:800;white-space:nowrap}.session-total-jump:hover,.session-total-jump:focus-visible{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,139,120,.12);outline:none}
 </style>
 <style>
+.date-filter-head{align-items:center}.date-filter-reset{padding:0;border:0;background:transparent;color:var(--accent);font-size:10px;font-weight:800}.date-filter-reset:hover,.date-filter-reset:focus-visible{color:var(--text);outline:none;text-decoration:underline}.date-filter-trigger{display:flex;align-items:center;justify-content:space-between;width:100%;margin-top:8px;padding:8px 9px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);font-size:11px;font-variant-numeric:tabular-nums;text-align:left}.date-filter-trigger:hover,.date-filter-trigger:focus-visible,.date-filter-trigger[aria-expanded="true"]{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,139,120,.12);outline:none}.date-filter-trigger-icon{margin-left:8px;color:var(--accent);font-size:14px;line-height:1}.date-filter-status{margin-top:5px}.date-calendar{margin-top:8px;padding:9px;border:1px solid var(--border);border-radius:10px;background:var(--panel);box-shadow:0 10px 22px rgba(92,75,54,.12)}.date-calendar[hidden]{display:none}.date-calendar-selection{min-height:15px;color:var(--muted);font-size:9px;font-weight:750;text-align:center}.date-calendar-head{display:grid;grid-template-columns:28px minmax(0,1fr) 28px;align-items:center;gap:4px;margin-top:5px}.date-calendar-month{text-align:center;font-size:11px;font-variant-numeric:tabular-nums}.date-calendar-nav{width:28px;height:28px;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--accent);font-size:19px;line-height:1}.date-calendar-nav:hover:not(:disabled),.date-calendar-nav:focus-visible:not(:disabled){border-color:var(--accent);background:rgba(59,139,120,.08);outline:none}.date-calendar-nav:disabled{color:var(--muted);cursor:not-allowed;opacity:.35}.date-calendar-weekdays,.date-calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px}.date-calendar-weekdays{margin-top:7px;color:var(--muted);font-size:9px;font-weight:800;text-align:center}.date-calendar-grid{margin-top:4px}.date-calendar-blank{aspect-ratio:1/1}.date-calendar-day{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;aspect-ratio:1/1;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--text);font-size:10px;font-variant-numeric:tabular-nums}.date-calendar-day:hover:not(:disabled),.date-calendar-day:focus-visible:not(:disabled){z-index:1;border-color:var(--accent);outline:none}.date-calendar-day.in-range{border-radius:4px;background:rgba(59,139,120,.12);color:var(--accent)}.date-calendar-day.is-start,.date-calendar-day.is-end{border-color:var(--accent);border-radius:7px;background:var(--accent);color:#fffefa;font-weight:850}.date-calendar-day:disabled{color:var(--muted);cursor:not-allowed;opacity:.3}.date-calendar-hint{min-height:15px;margin-top:7px;color:var(--muted);font-size:9px;line-height:1.35;text-align:center}
 h1{font-size:clamp(14px,1.5vw,20px)}
 .brief-item .label{font-size:12px}
 .brief-item .value.lcd-value{min-width:0;margin:0;padding:4px 8px;border:1px solid #3e7e6c;border-radius:7px;background:linear-gradient(180deg,#17372f,#102a25);color:#a6f3c9;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:18px;font-weight:800;letter-spacing:.035em;line-height:1.2;white-space:nowrap;text-shadow:0 0 5px rgba(166,243,201,.6);box-shadow:inset 0 2px 8px rgba(0,0,0,.28),0 2px 0 rgba(255,254,250,.4);font-variant-numeric:tabular-nums}
@@ -3384,12 +3563,24 @@ h1{font-size:clamp(14px,1.5vw,20px)}
 </style>
 </head>
 <body>
-<div class="shell" id="report-shell">
+<div class="shell" id="report-shell" data-date-filter-enabled="__DATE_FILTER_ENABLED__">
   <button class="sidebar-rail-toggle" id="sidebar-rail-toggle" type="button" aria-controls="session-drawer" aria-label="打开会话列表"><span aria-hidden="true">›</span></button>
   <aside class="sidebar" id="session-drawer" aria-label="会话列表">
     <div class="sidebar-head"><div class="brand"><div class="eyebrow">Codex Token 使用报告</div><h2>会话列表</h2><div class="muted" id="range-label"></div></div><button id="session-drawer-close" type="button" aria-label="关闭会话列表"><span aria-hidden="true">‹</span></button></div>
     <input class="nav-search" id="nav-search" type="search" placeholder="搜索会话……">
-    <div class="model-filter" id="model-filter" role="group" aria-label="按模型筛选"><div class="model-filter-title">模型筛选</div><div class="model-filter-list" id="model-filter-list"></div></div>
+     <div class="model-filter" id="model-filter" role="group" aria-label="按模型筛选"><div class="model-filter-title">模型筛选</div><div class="model-filter-list" id="model-filter-list"></div></div>
+     <section class="date-filter" id="date-filter" aria-labelledby="date-filter-title">
+       <div class="date-filter-head"><span class="date-filter-title" id="date-filter-title">日期范围</span><button class="date-filter-reset" id="reset-date-filter" type="button">重置</button></div>
+       <button class="date-filter-trigger" id="date-filter-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="date-calendar"><span id="date-filter-trigger-label"></span><span class="date-filter-trigger-icon" aria-hidden="true">⌄</span></button>
+       <div class="date-filter-status" id="date-filter-status" role="status" aria-live="polite"></div>
+       <div class="date-calendar" id="date-calendar" role="dialog" aria-label="选择日期范围" hidden>
+         <div class="date-calendar-selection" id="date-calendar-selection" aria-live="polite"></div>
+         <div class="date-calendar-head"><button class="date-calendar-nav" id="date-calendar-prev" type="button" data-calendar-shift="-1" aria-label="上一个月">‹</button><strong class="date-calendar-month" id="date-calendar-month"></strong><button class="date-calendar-nav" id="date-calendar-next" type="button" data-calendar-shift="1" aria-label="下一个月">›</button></div>
+         <div class="date-calendar-weekdays" aria-hidden="true"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+         <div class="date-calendar-grid" id="date-calendar-grid" role="grid"></div>
+         <div class="date-calendar-hint" id="date-calendar-hint">请选择开始日期</div>
+       </div>
+     </section>
     <nav class="session-list" id="session-list" aria-label="报告视图"></nav>
   </aside>
   <button class="session-drawer-backdrop" id="session-drawer-backdrop" type="button" tabindex="-1" aria-label="关闭会话列表"></button>
@@ -3463,8 +3654,13 @@ h1{font-size:clamp(14px,1.5vw,20px)}
     data.summary.planExcludedUsage = safeObject(data.summary.planExcludedUsage);
     const reportTitle=String(data.metadata.reportTitle||"").trim();
     data.warnings = Array.isArray(data.warnings) ? data.warnings : [];
-    const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-    for (const session of sessions) {
+    const dateFilterEnabled = byId("report-shell")?.dataset.dateFilterEnabled === "true";
+    const baseDateWindow = safeObject(data.metadata.dateWindow);
+    const baseSessions = Array.isArray(data.sessions) ? data.sessions : [];
+    const baseSummary = data.summary;
+    const baseWarnings = data.warnings;
+    let sessions = baseSessions;
+    for (const session of baseSessions) {
       session.metadata = safeObject(session.metadata);
       session.summary = safeObject(session.summary);
       session.warnings = Array.isArray(session.warnings) ? session.warnings : [];
@@ -3474,14 +3670,20 @@ h1{font-size:clamp(14px,1.5vw,20px)}
       session.summary.finalBreakdown = safeObject(session.summary.finalBreakdown);
       session.summary.finalBreakdownMismatch = safeObject(session.summary.finalBreakdownMismatch);
       session.summary.statusCounts = safeObject(session.summary.statusCounts);
+      session.summary.dailyUsage = Array.isArray(session.summary.dailyUsage) ? session.summary.dailyUsage : [];
       session.summary.modelUsage = Array.isArray(session.summary.modelUsage) ? session.summary.modelUsage : [];
       session.summary.planExcludedUsage = safeObject(session.summary.planExcludedUsage);
       session.metadata.efforts = Array.isArray(session.metadata.efforts) ? session.metadata.efforts : [];
       for (const turn of session.turns) {
         turn.usage = safeObject(turn.usage); turn.breakdown = safeObject(turn.breakdown);
-        turn.contextSnapshot = safeObject(turn.contextSnapshot); turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
+        turn.dailyUsage = Array.isArray(turn.dailyUsage) ? turn.dailyUsage : [];
+        turn.dailyModelResponses = safeObject(turn.dailyModelResponses);
+        turn.dailyTokenSnapshots = safeObject(turn.dailyTokenSnapshots);
+        turn.contextSnapshot = safeObject(turn.contextSnapshot); turn.contextTimeline = Array.isArray(turn.contextTimeline) ? turn.contextTimeline : [];
+        turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
         turn.contextCompactions = Array.isArray(turn.contextCompactions) ? turn.contextCompactions : [];
         turn.messages = Array.isArray(turn.messages) ? turn.messages : [];
+        turn.outputs = Array.isArray(turn.outputs) ? turn.outputs : [];
       }
     }
     data.sessions = sessions;
@@ -3491,7 +3693,8 @@ h1{font-size:clamp(14px,1.5vw,20px)}
     const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
     const sessionNavMedia=window.matchMedia("(max-width:900px)");
     const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
-    const state={view:"total",tab:"context",scale:"linear",tokenUnit:"M",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches};
+    const state={view:"total",tab:"context",scale:"linear",tokenUnit:"M",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches,dateFilter:{start:String(baseDateWindow.startDate||""),end:String(baseDateWindow.endDate||"")}};
+    const datePicker={open:false,cursor:"",draftStart:state.dateFilter.start,draftEnd:state.dateFilter.end,selecting:"start"};
   const tooltip=document.getElementById("turn-tooltip"),TOOLTIP_MESSAGE_LIMIT=800;
   const toolLabels={"computer-use":"Computer Use","chrome-use":"Chrome Use / Browser Use",imagegen:"ImageGen","exec-reasoning":"Exec Reasoning",shell:"Shell / Terminal","code-interpreter":"Code Interpreter","web-search":"Web Search","file-search":"File Search",mcp:"MCP","function-calling":"Function Calling",other:"其他工具"};
   const toolColors={"computer-use":"#4f78a8","chrome-use":"#3b8b78",imagegen:"#bd7556","exec-reasoning":"#9a8f84",shell:"#8c78bd","code-interpreter":"#6d8c45","web-search":"#4f9d87","file-search":"#d9874c",mcp:"#b35f79","function-calling":"#a56c3f",other:"#6f8fb7"};
@@ -3504,8 +3707,59 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   function fmt(v){return formatTokenDisplay(v)} function compact(v){return formatTokenDisplay(v)} function formatCount(v){return formatGroupedNumber(v)} function isLcdValue(v){return /^[\d\u2009.\-]+[KMB]?$/.test(String(v))}
   function syncTokenUnitInputs(){const slider=byId("token-unit-slider"),output=byId("token-unit-output"),index=TOKEN_UNIT_ORDER.indexOf(state.tokenUnit);if(slider)slider.value=String(Math.max(0,index));if(output)output.textContent=TOKEN_UNIT_LABELS[state.tokenUnit]||TOKEN_UNIT_LABELS.raw}
   function setTokenUnit(unit){if(!TOKEN_UNIT_CONFIG[unit])return;state.tokenUnit=unit;syncTokenUnitInputs();render()}
-  function dateText(v){if(!v)return"—";const d=new Date(v);return Number.isNaN(d.valueOf())?v:d.toLocaleString("zh-CN")}
-  function aggregateScope(){const scope=data.metadata.scope||{},window=data.metadata.dateWindow||{};if(scope.type==="ids")return{eyebrow:"指定会话总览",label:`指定会话 · ${formatCount((scope.ids||[]).length)} 个 ID`,totalLabel:"所选会话总 Token",usageNote:"按显式 ID 汇总",empty:"指定 ID 对应的会话没有可用活动。"};return{eyebrow:"日期范围总览",label:`${window.startDate||"—"} — ${window.endDate||"—"} · ${window.timezone||""}`.replace(/ · $/,""),totalLabel:"区间总 Token",usageNote:"按 token_count 快照时间计入",empty:"指定日期范围内没有会话活动。"}}
+   function dateText(v){if(!v)return"—";const d=new Date(v);return Number.isNaN(d.valueOf())?v:d.toLocaleString("zh-CN")}
+    const MODEL_RATE_CARDS={"GPT-5.6 Sol":{input:125,cached:12.5,output:750,official:true},"GPT-5.6 Terra":{input:50,cached:5,output:300,official:true},"GPT-5.6 Luna":{input:5,cached:.5,output:30,official:true},"GPT-5.5":{input:125,cached:12.5,output:750,official:true},"GPT-5.5 Cyber":{input:312.5,cached:31.25,output:1875,official:true},"GPT-5.4":{input:62.5,cached:6.25,output:375,official:true},"GPT-5.4 mini":{input:18.75,cached:1.875,output:113,official:true},"GPT-5.3 Codex":{input:43.75,cached:4.375,output:350,official:true},"GPT-5.2":{input:43.75,cached:4.375,output:350,official:true},"GPT-Image-2.0（图像）":{input:200,cached:50,output:750,official:true},"GPT-Image-2.0（文本）":{input:125,cached:31.25,output:250,official:true}};
+    const MODEL_NAME_ALIASES={"gpt-5.6-sol":"GPT-5.6 Sol","gpt-5.6-luna":"GPT-5.6 Luna","gpt-5.6-terra":"GPT-5.6 Terra","gpt-5.5":"GPT-5.5","gpt-5.5-cyber":"GPT-5.5 Cyber","gpt-5.4":"GPT-5.4","gpt-5.4-mini":"GPT-5.4 mini","gpt-5.3-codex":"GPT-5.3 Codex","gpt-5.3-codex-spark":"Spark","gpt-5.2":"GPT-5.2"};
+   const SOL_RATE={input:125,cached:12.5,output:750};
+   function emptyUsage(){return{input:0,cached:0,cache_write:0,output:0,reasoning:0,total:0}}
+   function addUsage(a,b){return{input:(a.input||0)+(b.input||0),cached:(a.cached||0)+(b.cached||0),cache_write:(a.cache_write||0)+(b.cache_write||0),output:(a.output||0)+(b.output||0),reasoning:(a.reasoning||0)+(b.reasoning||0),total:(a.total||0)+(b.total||0)}}
+   function usageBreakdown(u){const cached=Math.max(0,Number(u.cached)||0),cacheWrite=Math.max(0,Number(u.cache_write)||0),input=Math.max(0,Number(u.input)||0),output=Math.max(0,Number(u.output)||0),reasoning=Math.min(output,Math.max(0,Number(u.reasoning)||0));return{cachedInput:cached,cacheWriteInput:cacheWrite,otherNonCachedInput:Math.max(0,input-cached-cacheWrite),ordinaryOutput:Math.max(0,output-reasoning),reasoningOutput:reasoning,unclassified:0}}
+   function usageFromDaily(buckets,start,end){return(buckets||[]).filter(bucket=>{const day=String(bucket.date||"");return day>=start&&day<=end}).reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage())}
+   function dailyCount(values,start,end){return Object.entries(values||{}).filter(([day])=>day>=start&&day<=end).reduce((sum,[,value])=>sum+(Number(value)||0),0)}
+   function dateBoundary(value,endExclusive=false){const parts=String(value||"").split("-").map(Number),offset=Number(baseDateWindow.timezoneOffsetMinutes??480);if(parts.length!==3||parts.some(part=>!Number.isFinite(part)))return NaN;return Date.UTC(parts[0],parts[1]-1,parts[2]+(endExclusive?1:0))-offset*60000}
+   function filterBounds(){return{start:state.dateFilter.start,end:state.dateFilter.end,startMs:dateBoundary(state.dateFilter.start),endMs:dateBoundary(state.dateFilter.end,true)}}
+   function eventMs(value){const result=Date.parse(value||"");return Number.isFinite(result)?result:null}
+   function eventInDateFilter(value){const timestamp=eventMs(value),bounds=filterBounds();return timestamp!=null&&timestamp>=bounds.startMs&&timestamp<bounds.endMs}
+   function eventOverlapsFilter(start,end){const first=eventMs(start),last=eventMs(end||start),bounds=filterBounds();return first!=null&&last!=null&&first<bounds.endMs&&last>=bounds.startMs}
+   function turnOverlapsFilter(turn){return eventOverlapsFilter(turn.rangeFirstActivityAt||turn.startedAt,turn.rangeLastActivityAt||turn.endedAt||turn.startedAt)}
+   function fullDateFilter(){return state.dateFilter.start===String(baseDateWindow.startDate||"")&&state.dateFilter.end===String(baseDateWindow.endDate||"")}
+   function filteredDailyBuckets(buckets){return(buckets||[]).filter(bucket=>{const day=String(bucket.date||"");return day>=state.dateFilter.start&&day<=state.dateFilter.end})}
+   function contextUnknown(){return{snapshotType:"unknown",tokens:null,windowTokens:null,occupancyRate:null,timestamp:null}}
+   function filteredTurn(source){
+     const selectedUsage=usageFromDaily(source.dailyUsage,state.dateFilter.start,state.dateFilter.end),beforeUsage=(source.dailyUsage||[]).filter(bucket=>String(bucket.date||"")<String(state.dateFilter.start||"")).reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage());
+     const sourceTimeline=Array.isArray(source.contextTimeline)?source.contextTimeline:[],timeline=sourceTimeline.filter(point=>eventInDateFilter(point.timestamp)).map(point=>({...point,turnTokenOffset:Math.max(0,(Number(point.turnTokenOffset)||0)-(beforeUsage.total||0))}));
+     const compactions=(source.contextCompactions||[]).filter(event=>eventInDateFilter(event.timestamp)).map(event=>({...event,turnTokenOffset:event.turnTokenOffset==null?null:Math.max(0,(Number(event.turnTokenOffset)||0)-(beforeUsage.total||0))}));
+     const latest=timeline.at(-1),clone={...source,usage:selectedUsage,breakdown:usageBreakdown(selectedUsage),messages:(source.messages||[]).filter(message=>eventInDateFilter(message.timestamp)),outputs:(source.outputs||[]).filter(output=>eventInDateFilter(output.timestamp)),toolCalls:(source.toolCalls||[]).filter(call=>eventInDateFilter(call.timestamp)||eventInDateFilter(call.endedAt)),contextTimeline:timeline,contextCompactions:compactions,contextSnapshot:latest?{snapshotType:source.contextSnapshot?.snapshotType||"range_latest",...latest}:contextUnknown(),modelResponses:dailyCount(source.dailyModelResponses,state.dateFilter.start,state.dateFilter.end),tokenSnapshots:dailyCount(source.dailyTokenSnapshots,state.dateFilter.start,state.dateFilter.end),rangeClipped:Boolean(source.rangeClipped)||!eventOverlapsFilter(source.startedAt,source.endedAt||source.rangeLastActivityAt||source.startedAt)};
+     if(!clone.modelResponses&&fullDateFilter())clone.modelResponses=Number(source.modelResponses)||0;
+     if(!clone.tokenSnapshots&&fullDateFilter())clone.tokenSnapshots=Number(source.tokenSnapshots)||0;
+     return clone;
+   }
+    function normalizedModelLabel(model){const value=String(model||""),key=value.toLowerCase().replace(/\s+/g,"-");return MODEL_NAME_ALIASES[key]||value}
+    function modelRateCard(model){const value=normalizedModelLabel(model);return MODEL_RATE_CARDS[value]||SOL_RATE}
+   function isSparkModel(model){return String(model||"").toLowerCase().includes("spark")}
+    function modelUsageForTurns(turns){const buckets=new Map();for(const turn of turns){const rawNames=(turn.models||[]).map(String),names=rawNames.filter(model=>!isSparkModel(model)).map(normalizedModelLabel);if(!names.length&&rawNames.length)continue;const label=names.length>1?"多模型":names.length?names[0]:"未知模型",card=names.length>1?SOL_RATE:names.length?modelRateCard(names[0]):SOL_RATE,status=names.length>1?"fallback":names.length?(card.official?"official":"fallback"):"unconfigured",usage=turn.usage||emptyUsage(),breakdown=turn.breakdown||usageBreakdown(usage),cached=Number(breakdown.cachedInput)||0,cacheWrite=Number(breakdown.cacheWriteInput)||0,other=Number(breakdown.otherNonCachedInput)||Math.max(0,(usage.input||0)-cached-cacheWrite),ordinary=Number(breakdown.ordinaryOutput)||Math.max(0,(usage.output||0)-(usage.reasoning||0)),reasoning=Number(breakdown.reasoningOutput)||Math.min(usage.reasoning||0,usage.output||0),unclassified=Number(breakdown.unclassified)||0,output=ordinary+reasoning+unclassified,weighted=other*card.input/SOL_RATE.input+cached*card.cached/SOL_RATE.cached+output*card.output/SOL_RATE.output,credits=(other*card.input+cached*card.cached+output*card.output)/1000000,bucket=buckets.get(label)||{model:label,rawTokens:0,weightedTokens:0,costCredits:0,rateMultiplier:null,rateStatus:status};bucket.rawTokens+=Number(usage.total)||0;bucket.weightedTokens+=weighted;bucket.costCredits+=credits;if(bucket.rateStatus==="official"&&status!=="official")bucket.rateStatus=status;buckets.set(label,bucket)}return[...buckets.values()].map(bucket=>({...bucket,weightedTokens:Math.round(bucket.weightedTokens*10000)/10000,costCredits:Math.round(bucket.costCredits*1000000)/1000000})).sort((a,b)=>b.weightedTokens-a.weightedTokens||a.model.localeCompare(b.model,"zh-CN"))}
+   function planExcludedUsageForTurns(turns){const sparkTurns=turns.filter(turn=>(turn.models||[]).length&&turn.models.every(isSparkModel));return{models:sparkTurns.length?["Spark"]:[],rawTokens:sparkTurns.reduce((sum,turn)=>sum+(Number(turn.usage?.total)||0),0),turnCount:sparkTurns.length}}
+   function sessionSummary(source,turns){const finalUsage=usageFromDaily(source.summary.dailyUsage,state.dateFilter.start,state.dateFilter.end),statusCounts={complete:0,aborted:0,incomplete:0};turns.forEach(turn=>{statusCounts[turn.status]=(statusCounts[turn.status]||0)+1});const turnUsage=turns.reduce((sum,turn)=>addUsage(sum,turn.usage||emptyUsage()),emptyUsage());return{...source.summary,turnCount:turns.length,statusCounts,zeroUsageTurns:turns.filter(turn=>(Number(turn.usage?.total)||0)===0).length,finalUsage,finalBreakdown:usageBreakdown(finalUsage),finalBreakdownMismatch:0,turnUsageSum:turnUsage,accountedUsage:turnUsage,modelUsage:modelUsageForTurns(turns),planExcludedUsage:planExcludedUsageForTurns(turns),dailyUsage:filteredDailyBuckets(source.summary.dailyUsage)}}
+   function filteredSession(source){const turns=source.turns.filter(turnOverlapsFilter).map(filteredTurn);if(!turns.length)return null;const modelUsage=modelUsageForTurns(turns),activityTimes=turns.flatMap(turn=>[...(turn.messages||[]).map(item=>item.timestamp),...(turn.outputs||[]).map(item=>item.timestamp),...(turn.toolCalls||[]).flatMap(item=>[item.timestamp,item.endedAt]),...(turn.contextTimeline||[]).map(item=>item.timestamp),...(turn.contextCompactions||[]).map(item=>item.timestamp)]).filter(eventInDateFilter).sort(),metadata={...source.metadata,rangeFirstActivityAt:activityTimes[0]||null,rangeLastActivityAt:activityTimes.at(-1)||null,modelUsage,planExcludedUsage:planExcludedUsageForTurns(turns),primaryModel:modelUsage[0]?.model||"未知模型"};return{...source,metadata,summary:sessionSummary(source,turns),turns}}
+   function aggregateSummary(visibleSessions){const allTurns=visibleSessions.flatMap(session=>session.turns||[]),finalUsage=visibleSessions.reduce((sum,session)=>addUsage(sum,session.summary.finalUsage||emptyUsage()),emptyUsage()),statusCounts={complete:0,aborted:0,incomplete:0};visibleSessions.forEach(session=>Object.entries(session.summary.statusCounts||{}).forEach(([status,count])=>statusCounts[status]=(statusCounts[status]||0)+(Number(count)||0)));const warnings=visibleSessions.flatMap(session=>session.warnings||[]);return{...baseSummary,sessionCount:visibleSessions.length,turnCount:allTurns.length,statusCounts,zeroUsageSessions:visibleSessions.filter(session=>(Number(session.summary.finalUsage?.total)||0)===0).length,zeroUsageTurns:allTurns.filter(turn=>(Number(turn.usage?.total)||0)===0).length,finalUsage,finalBreakdown:usageBreakdown(finalUsage),finalBreakdownMismatch:0,dailyUsage:filteredDailyBuckets(baseSummary.dailyUsage),integrityErrorCount:warnings.filter(warning=>warning.severity==="error").length,warningCount:warnings.length,modelUsage:modelUsageForTurns(allTurns),planExcludedUsage:planExcludedUsageForTurns(allTurns)}}
+   function rebuildDateView(){sessions=baseSessions.map(filteredSession).filter(Boolean);data.sessions=sessions;data.summary=aggregateSummary(sessions);data.warnings=sessions.flatMap(session=>session.warnings||[]);if(state.view!=="total"&&!sessions.some(session=>session.metadata.threadId===state.view)){state.view="total";state.returnToTotalSessionId=null;state.selected=null;closeDrawer()}byId("range-label").textContent=aggregateScope().label;populateToolFilter();renderModelFilter();renderNav();render()}
+   function dateFilterLabel(){return`${state.dateFilter.start||"—"} — ${state.dateFilter.end||"—"}`}
+   function setDateFilterStatus(message,error=false){const status=byId("date-filter-status");if(!status)return;status.textContent=message||"";status.classList.toggle("error",Boolean(error))}
+   function monthKeyForDate(value){const parts=String(value||"").split("-").map(Number);return parts.length===3&&parts.every(Number.isFinite)?`${parts[0]}-${String(parts[1]).padStart(2,"0")}`:""}
+   function monthParts(value){const parts=String(value||"").split("-").map(Number);return parts.length===2&&parts.every(Number.isFinite)?parts:[1970,1]}
+   function monthKey(year,month){return`${year}-${String(month).padStart(2,"0")}`}
+   function shiftMonth(value,delta){const [year,month]=monthParts(value),date=new Date(Date.UTC(year,month-1+delta,1));return monthKey(date.getUTCFullYear(),date.getUTCMonth()+1)}
+   function calendarDate(year,month,day){return`${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`}
+   function daysInCalendarMonth(year,month){return new Date(Date.UTC(year,month,0)).getUTCDate()}
+   function renderDateFilterTrigger(){const label=byId("date-filter-trigger-label");if(label)label.textContent=dateFilterLabel()}
+   function renderDateCalendar(){const grid=byId("date-calendar-grid"),monthLabel=byId("date-calendar-month"),selection=byId("date-calendar-selection"),hint=byId("date-calendar-hint"),previous=byId("date-calendar-prev"),next=byId("date-calendar-next");if(!grid||!monthLabel||!selection||!hint||!previous||!next)return;const [year,month]=monthParts(datePicker.cursor),min=String(baseDateWindow.startDate||""),max=String(baseDateWindow.endDate||""),firstWeekday=new Date(Date.UTC(year,month-1,1)).getUTCDay(),days=daysInCalendarMonth(year,month),cells=[];for(let index=0;index<firstWeekday;index++)cells.push('<span class="date-calendar-blank" aria-hidden="true"></span>');for(let day=1;day<=days;day++){const value=calendarDate(year,month,day),disabled=value<min||value>max,inRange=datePicker.draftStart&&datePicker.draftEnd&&value>=datePicker.draftStart&&value<=datePicker.draftEnd,isStart=value===datePicker.draftStart,isEnd=value===datePicker.draftEnd;cells.push(`<button class="date-calendar-day${inRange?" in-range":""}${isStart?" is-start":""}${isEnd?" is-end":""}" type="button" data-calendar-date="${value}" role="gridcell" aria-label="${value}" aria-pressed="${Boolean(isStart||isEnd||inRange)}"${disabled?" disabled":""}>${day}</button>`)}grid.innerHTML=cells.join("");monthLabel.textContent=`${year} 年 ${month} 月`;selection.textContent=datePicker.draftStart&&datePicker.draftEnd?`${datePicker.draftStart} — ${datePicker.draftEnd}`:datePicker.draftStart?`${datePicker.draftStart} — 请选择结束日期`:`请选择开始日期`;hint.textContent=datePicker.draftStart&&!datePicker.draftEnd?"请选择结束日期":`选择 ${datePicker.draftStart&&datePicker.draftEnd?"新的":""}日期范围`;previous.disabled=datePicker.cursor<=monthKeyForDate(min);next.disabled=datePicker.cursor>=monthKeyForDate(max)}
+   function openDateCalendar(){const panel=byId("date-calendar"),trigger=byId("date-filter-trigger");if(!panel||!trigger)return;datePicker.open=true;datePicker.cursor=monthKeyForDate(state.dateFilter.start||baseDateWindow.startDate);datePicker.draftStart=state.dateFilter.start;datePicker.draftEnd=state.dateFilter.end;datePicker.selecting="start";panel.hidden=false;trigger.setAttribute("aria-expanded","true");renderDateCalendar();setDateFilterStatus("点击开始日期，再点击结束日期即可自动应用。")}
+   function closeDateCalendar(){const panel=byId("date-calendar"),trigger=byId("date-filter-trigger");if(!panel||!trigger)return;datePicker.open=false;datePicker.draftStart=state.dateFilter.start;datePicker.draftEnd=state.dateFilter.end;datePicker.selecting="start";panel.hidden=true;trigger.setAttribute("aria-expanded","false")}
+   function applyDateRange(start,end){const min=String(baseDateWindow.startDate||""),max=String(baseDateWindow.endDate||"");if(!start||!end){setDateFilterStatus("请选择开始和结束日期。",true);return}if(start>end){setDateFilterStatus("结束日期不能早于开始日期。",true);return}if(start<min||end>max){setDateFilterStatus(`只能选择报告范围 ${min} — ${max}。`,true);return}state.dateFilter={start,end};datePicker.draftStart=start;datePicker.draftEnd=end;renderDateFilterTrigger();setDateFilterStatus(fullDateFilter()?"当前显示完整报告范围。":`当前显示 ${dateFilterLabel()}。`);rebuildDateView();closeDateCalendar()}
+   function chooseCalendarDate(value){if(value<String(baseDateWindow.startDate||"")||value>String(baseDateWindow.endDate||""))return;if(datePicker.selecting==="end"&&datePicker.draftStart){if(value<datePicker.draftStart){datePicker.draftStart=value;datePicker.draftEnd="";renderDateCalendar();return}applyDateRange(datePicker.draftStart,value);return}datePicker.draftStart=value;datePicker.draftEnd="";datePicker.selecting="end";renderDateCalendar();setDateFilterStatus("已选开始日期，请选择结束日期。")}
+   function resetDateFilter(){const start=String(baseDateWindow.startDate||""),end=String(baseDateWindow.endDate||"");state.dateFilter={start,end};datePicker.cursor=monthKeyForDate(start);datePicker.draftStart=start;datePicker.draftEnd=end;datePicker.selecting="start";renderDateFilterTrigger();setDateFilterStatus("已恢复完整报告范围。");rebuildDateView();closeDateCalendar()}
+   function configureDateFilter(){const container=byId("date-filter");if(!dateFilterEnabled){container?.remove();return}const trigger=byId("date-filter-trigger"),panel=byId("date-calendar"),reset=byId("reset-date-filter");if(!trigger||!panel||!reset)return;renderDateFilterTrigger();trigger.addEventListener("click",()=>datePicker.open?closeDateCalendar():openDateCalendar());reset.addEventListener("click",resetDateFilter);panel.addEventListener("click",event=>{event.stopPropagation();const shift=event.target.closest("[data-calendar-shift]"),day=event.target.closest("[data-calendar-date]");if(shift){datePicker.cursor=shiftMonth(datePicker.cursor,Number(shift.dataset.calendarShift)||0);renderDateCalendar();return}if(day&&!day.disabled)chooseCalendarDate(day.dataset.calendarDate)});document.addEventListener("click",event=>{if(datePicker.open&&!byId("date-filter").contains(event.target))closeDateCalendar()});document.addEventListener("keydown",event=>{if(event.key==="Escape"&&datePicker.open){closeDateCalendar();trigger.focus()}});setDateFilterStatus("当前显示完整报告范围。")}
+   function aggregateScope(){const scope=data.metadata.scope||{},window=baseDateWindow;if(scope.type==="ids")return{eyebrow:"指定会话总览",label:`指定会话 · ${formatCount((scope.ids||[]).length)} 个 ID`,totalLabel:"所选会话总 Token",usageNote:"按显式 ID 汇总",empty:"指定 ID 对应的会话没有可用活动。"};const filtered=!fullDateFilter();return{eyebrow:"日期范围总览",label:`${dateFilterLabel()} · ${window.timezone||""}${filtered?" · 已过滤":""}`.replace(/ · $/,""),totalLabel:"区间总 Token",usageNote:filtered?"按当前日期筛选重算":"按 token_count 快照时间计入",empty:"当前日期范围内没有会话活动。"}}
   function activeSession(){return sessions.find(s=>s.metadata.threadId===state.view)||null} function isTotal(){return state.view==="total"}
   function statusText(v){return({complete:"已完成",aborted:"已中止",incomplete:"未闭合"})[v]||v||"未知"}
   function cacheRate(u){return u.input?100*u.cached/u.input:0} function firstPrompt(t){return(t.messages||[]).map(m=>m.text).filter(Boolean).join("\n\n↳ 追加用户消息\n")}
@@ -3638,11 +3892,12 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   }
   function closeDrawer(){state.selected=null;byId("drawer").classList.remove("open");byId("drawer").setAttribute("aria-hidden","true");if(!isTotal())renderContext()}
   function setTab(tab){const contextButton=byId("tab-context");contextButton.disabled=false;contextButton.textContent=isTotal()?"模型消耗概览":"Token 与 Context";if(!["composition","trend","context","table"].includes(tab))tab="context";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab});syncFilterVisibility(tab)}
-  function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.modelFilters=new Set(modelFilterModels());state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";syncToolFilterInputs();renderModelFilter();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");renderNav();renderComposition();renderContext();renderTable()}
-  function render(){renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · ${aggregateScope().label}`}
+  function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.modelFilters=new Set(baseSessions.map(sessionModel));state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";const start=String(baseDateWindow.startDate||""),end=String(baseDateWindow.endDate||"");state.dateFilter={start,end};datePicker.cursor=monthKeyForDate(start);datePicker.draftStart=start;datePicker.draftEnd=end;datePicker.selecting="start";renderDateFilterTrigger();setDateFilterStatus("已恢复完整报告范围。");closeDateCalendar();syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");rebuildDateView()}
+  function render(){renderDateFilterTrigger();renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · ${aggregateScope().label}`}
   history.replaceState({...(history.state||{}),codexTokenReport:true,view:"total",returnToTotalSessionId:null},"","");
   window.addEventListener("popstate",event=>{const entry=event.state;applyView(entry?.codexTokenReport?entry.view:"total",Boolean(entry?.codexTokenReport&&entry.returnToTotalSessionId))});
-  byId("range-label").textContent=aggregateScope().label;
+   configureDateFilter();
+   byId("range-label").textContent=aggregateScope().label;
   byId("nav-search").addEventListener("input",renderNav);
   byId("return-total-from-ring").addEventListener("click",goToTotal);
   byId("go-total-session").addEventListener("click",goToTotal);
@@ -3675,40 +3930,87 @@ h1{font-size:clamp(14px,1.5vw,20px)}
 """
 
 
+REPORT_DOCUMENT_TEMPLATE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+__REPORT_HEAD__
+</head>
+<body>
+__REPORT_BODY__
+<script id="report-data" type="application/json">__REPORT_JSON__</script>
+__REPORT_SCRIPT__
+</body>
+</html>
+"""
+
+
+def _normalise_report_template(template: str) -> str:
+    """Convert a mode body into the shared self-contained document frame."""
+    try:
+        head = template.split("<head>", 1)[1].split("</head>", 1)[0]
+        body = template.split("<body>", 1)[1].split("</body>", 1)[0]
+        data_marker = '<script id="report-data" type="application/json">__REPORT_JSON__</script>'
+        report_body, report_script = body.split(data_marker, 1)
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("报告模板缺少共享 renderer 所需的文档标记。") from error
+    return (
+        REPORT_DOCUMENT_TEMPLATE.replace("__REPORT_HEAD__", head)
+        .replace("__REPORT_BODY__", report_body)
+        .replace("__REPORT_SCRIPT__", report_script)
+    )
+
+
+HTML_TEMPLATE = _normalise_report_template(HTML_TEMPLATE)
+RANGE_HTML_TEMPLATE = _normalise_report_template(RANGE_HTML_TEMPLATE)
+
+
+def _build_report_render_plan(
+    report: dict[str, Any], report_title: str
+) -> ReportRenderPlan:
+    """Resolve mode-specific presentation choices at one renderer seam."""
+    metadata = report.get("metadata", {})
+    if report.get("mode") != "range":
+        thread_id = metadata.get("threadId", "unknown")
+        return ReportRenderPlan(
+            template=HTML_TEMPLATE,
+            page_title=report_title or f"Codex Token 报告 · {thread_id}",
+            visible_title=report_title or "线程 Token 消耗",
+        )
+
+    scope = metadata.get("scope", {})
+    date_window = metadata.get("dateWindow") or {}
+    start_date = date_window.get("startDate", "unknown")
+    end_date = date_window.get("endDate", start_date)
+    date_label = start_date if start_date == end_date else f"{start_date} — {end_date}"
+    if scope.get("type") == "ids":
+        default_page_title = f"Codex Token 指定会话报告 · {len(scope.get('ids', []))} 个 ID"
+        default_visible_title = "指定会话 · Token 消耗"
+    elif scope.get("type") == "projects":
+        project_label = scope.get("label") or "项目集合"
+        default_page_title = f"Codex Token 项目报告 · {project_label}"
+        default_visible_title = f"{project_label} · 全部会话"
+    else:
+        default_page_title = f"Codex Token 日期报告 · {date_label}"
+        default_visible_title = "全部会话 · Token 消耗"
+    return ReportRenderPlan(
+        template=RANGE_HTML_TEMPLATE,
+        page_title=report_title or default_page_title,
+        visible_title=report_title or default_visible_title,
+        date_filter_enabled=scope.get("type") == "date-range",
+    )
+
+
 def render_html(report: dict[str, Any], title: str | None = None) -> str:
     metadata = report.get("metadata", {})
     requested_title = title if title is not None else metadata.get("reportTitle")
     report_title = _coerce_text(requested_title).strip()
+    render_plan = _build_report_render_plan(report, report_title)
     report_payload = report
     if report_title and metadata.get("reportTitle") != report_title:
         report_payload = {
             **report,
             "metadata": {**metadata, "reportTitle": report_title},
         }
-    if report.get("mode") == "range":
-        scope = metadata.get("scope", {})
-        date_window = metadata.get("dateWindow") or {}
-        start_date = date_window.get("startDate", "unknown")
-        end_date = date_window.get("endDate", start_date)
-        date_label = start_date if start_date == end_date else f"{start_date} — {end_date}"
-        if scope.get("type") == "ids":
-            default_page_title = f"Codex Token 指定会话报告 · {len(scope.get('ids', []))} 个 ID"
-            default_visible_title = "指定会话 · Token 消耗"
-        elif scope.get("type") == "projects":
-            project_label = scope.get("label") or "项目集合"
-            default_page_title = f"Codex Token 项目报告 · {project_label}"
-            default_visible_title = f"{project_label} · 全部会话"
-        else:
-            default_page_title = f"Codex Token 日期报告 · {date_label}"
-            default_visible_title = "全部会话 · Token 消耗"
-        page_title = report_title or default_page_title
-        visible_title = report_title or default_visible_title
-        template = RANGE_HTML_TEMPLATE
-    else:
-        thread_id = metadata.get("threadId", "unknown")
-        page_title = report_title or f"Codex Token 报告 · {thread_id}"
-        visible_title = report_title or "线程 Token 消耗"
-        template = HTML_TEMPLATE
     report_json = json.dumps(
         report_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=False
     )
@@ -3723,8 +4025,12 @@ def render_html(report: dict[str, Any], title: str | None = None) -> str:
         .replace("\u2029", "\\u2029")
     )
     rendered = (
-        template.replace("__PAGE_TITLE__", html.escape(page_title))
-        .replace("__REPORT_TITLE__", html.escape(visible_title))
+        render_plan.template.replace(
+            "__DATE_FILTER_ENABLED__",
+            "true" if render_plan.date_filter_enabled else "false",
+        )
+        .replace("__PAGE_TITLE__", html.escape(render_plan.page_title))
+        .replace("__REPORT_TITLE__", html.escape(render_plan.visible_title))
         .replace("__REPORT_JSON__", report_json)
     )
     return rendered.replace("</body>", TOOL_SATELLITE_HIT_SCRIPT + "\n</body>")
