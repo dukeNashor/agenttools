@@ -1,0 +1,8 @@
+{
+  "gitBypassProxy": false,
+  "tooling": {
+    "allowedRegistries": [
+      "https://registry.example.com/"
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "version": 4,
+  "agentsRoot": "~/.agents",
+  "gitBypassProxy": true,
+  "reportRetention": 12,
+  "tooling": {
+    "skillsCli": "skills@1.5.23",
+    "minimumNodeVersion": "22.20.0",
+    "allowedRegistries": [
+      "https://registry.npmjs.org/"
+    ]
+  },
+  "task": {
+    "name": "AgentTools Skill Update Report",
+    "dayOfWeek": "Monday",
+    "time": "09:00"
+  },
+  "sources": [
+    {
+      "id": "mattpocock-skills",
+      "label": "Matt Pocock Skills: engineering + productivity",
+      "repositorySlug": "mattpocock/skills",
+      "ref": "main",
+      "skillRoots": [
+        "skills/engineering",
+        "skills/productivity"
+      ],
+      "sharedFiles": []
+    },
+    {
+      "id": "critical-thinking-tools",
+      "label": "Critical Thinking Tools",
+      "repositorySlug": "cognitive-bias-lab/cognitive-bias-lab-plugins",
+      "ref": "main",
+      "skillRoots": [
+        "plugins/critical-thinking-tools/skills"
+      ],
+      "sharedFiles": [
+        {
+          "sourcePath": "plugins/critical-thinking-tools/references/evidence-map.md",
+          "destinationRelativeToAgentsRoot": "references/evidence-map.md"
+        }
+      ]
+    }
+  ]
+}

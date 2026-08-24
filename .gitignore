@@ -12,3 +12,5 @@ work/
 .codex/
 sessions/
 archived_sessions/
+
+skill-updater/config.local.json
