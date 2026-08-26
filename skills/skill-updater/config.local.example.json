@@ -1,6 +1,7 @@
 {
   "gitBypassProxy": false,
   "tooling": {
+    "runner": "user-npx",
     "allowedRegistries": [
       "https://registry.example.com/"
     ]

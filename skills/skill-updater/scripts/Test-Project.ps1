@@ -20,11 +20,12 @@ if ($failureMessages.Count -gt 0) {
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
 $config = Get-SkillUpdaterConfig
-if ([int]$config.version -ne 4) { throw 'Unsupported config version.' }
+if ([int]$config.version -ne 5) { throw 'Unsupported config version.' }
 if (@($config.sources).Count -ne 2) { throw 'Expected exactly two tracked sources.' }
 if ([int]$config.reportRetention -lt 1) { throw 'Report retention must be positive.' }
 
 $package = Get-PackageSpecParts -PackageSpec ([string]$config.tooling.skillsCli)
+if ([string]$config.tooling.runner -notin @('codex-bundled-pnpm', 'user-npx')) { throw 'tooling.runner must be codex-bundled-pnpm or user-npx.' }
 try { [version]([string]$config.tooling.minimumNodeVersion) | Out-Null }
 catch { throw 'minimumNodeVersion must be a numeric dotted version.' }
 if (@($config.tooling.allowedRegistries).Count -eq 0) { throw 'At least one trusted package registry is required.' }
@@ -50,7 +51,7 @@ foreach ($source in $config.sources) {
     if ([string]$source.repositorySlug -notmatch '^[^/\s]+/[^/\s]+$') { throw "$($source.id) has an invalid repository slug." }
     if ($repositorySlugs.ContainsKey([string]$source.repositorySlug)) { throw "Repository slugs must be unique: $($source.repositorySlug)" }
     $repositorySlugs[[string]$source.repositorySlug] = $true
-    if ([string]$source.ref -notmatch '^\S+$') { throw "$($source.id) has an invalid ref." }
+    if ([string]$source.sourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "$($source.id) has an invalid sourceCommit." }
     if (@($source.skillRoots).Count -eq 0) { throw "$($source.id) has no skill roots." }
     $roots = @{}
     foreach ($skillRoot in @($source.skillRoots)) {
@@ -79,6 +80,7 @@ $git = Assert-GitEnvironment -Config $config
 Write-Host "Parsed $($scriptFiles.Count) PowerShell scripts."
 Write-Host "Derived $($derivedInstallSpecs.Count) install specs from configured skill roots."
 Write-Host "Skill runner: $($tooling.Runner.DisplayName) via $($tooling.Runner.Manager) $($tooling.ManagerVersion)"
+Write-Host "Runner policy: $($tooling.RunnerMode)"
 Write-Host "Node.js: $($tooling.NodeVersion); registry: $($tooling.Registry)"
 Write-Host "Git: $($git.Git)"
 Write-Host 'Project validation passed.'

@@ -44,7 +44,7 @@ try {
     else {
         $latestToolVersion = Get-LatestToolVersion -Config $config -Diagnostics $tooling
         $toolStatus = if ($latestToolVersion -eq $tooling.PinnedVersion) { 'Current' } else { 'Different' }
-        $toolSummary = "Pinned $($tooling.PinnedVersion); registry latest $latestToolVersion; $($tooling.Runner.Manager) $($tooling.ManagerVersion); Node $($tooling.NodeVersion)"
+        $toolSummary = "Pinned $($tooling.PinnedVersion); registry latest $latestToolVersion; runner $($tooling.RunnerMode); $($tooling.Runner.Manager) $($tooling.ManagerVersion); Node $($tooling.NodeVersion)"
         $rows.Add([pscustomobject]@{
             Source = 'Tooling'
             Item = $tooling.PackageName
@@ -63,9 +63,9 @@ foreach ($source in $config.sources) {
     $upstreamNames = @()
     try {
         $snapshot = New-RepositorySnapshot -Config $config -Source $source
-        $commit = Invoke-ManagedGit -Config $config -GitArguments @('-C', $snapshot, 'rev-parse', '--short=12', 'HEAD')
+        $commit = Invoke-ManagedGit -Config $config -GitArguments @('-C', $snapshot, 'rev-parse', 'HEAD')
         $skillFiles = @(Get-ConfiguredSkillFiles -Snapshot $snapshot -Source $source)
-        $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = $commit; State = 'Available' })
+        $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = $commit; Roots = (@($source.skillRoots) -join ', '); State = 'Pinned' })
 
         foreach ($skillFile in $skillFiles) {
             $name = $skillFile.Directory.Name
@@ -96,7 +96,7 @@ foreach ($source in $config.sources) {
                 $files = @($comparison.Modified | ForEach-Object { "Modified: $_" }) +
                     @($comparison.Added | ForEach-Object { "Added upstream: $_" }) +
                     @($comparison.Removed | ForEach-Object { "Local-only: $_" })
-                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Different'; Summary = $summary; Files = $files })
+                    $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Different'; Summary = "$summary; pinned commit $commit"; Files = $files })
             }
         }
 
@@ -124,9 +124,19 @@ foreach ($source in $config.sources) {
                 }
             }
         }
+        foreach ($skillFile in $skillFiles) {
+            $name = $skillFile.Directory.Name
+            $entry = if ($lock) { $lock.skills.PSObject.Properties[$name] } else { $null }
+            $expectedPath = $skillFile.FullName.Substring($snapshot.Length).TrimStart('\').Replace('\', '/')
+            $installedPath = Join-Path $skillsDirectory $name
+            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or [string]$entry.Value.source -ne (Get-SourceIdentifier -Source $source) -or [string]$entry.Value.skillPath -ne $expectedPath)) {
+                $actual = if ($entry) { "source=$($entry.Value.source), path=$($entry.Value.skillPath)" } else { 'no lock entry' }
+                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Lock mismatch'; Summary = "Expected path=$expectedPath; actual $actual"; Files = @() })
+            }
+        }
     }
     catch {
-        $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = '-'; State = 'Unavailable' })
+        $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = '-'; Roots = '-'; State = 'Unavailable' })
         $rows.Add([pscustomobject]@{ Source = $source.label; Item = 'source'; Status = 'Source unavailable'; Summary = $_.Exception.Message; Files = @() })
     }
     finally {
@@ -139,7 +149,7 @@ $differentCount = @($rows | Where-Object { $_.Status -ne 'Current' }).Count
 $currentCount = @($rows | Where-Object { $_.Status -eq 'Current' }).Count
 
 $sourceHtml = ($sourceSummaries | ForEach-Object {
-    '<li><strong>' + (Encode-Html $_.Label) + '</strong><span>' + (Encode-Html $_.State) + ' · ' + (Encode-Html $_.Commit) + '</span></li>'
+    '<li><strong>' + (Encode-Html $_.Label) + '</strong><span>' + (Encode-Html $_.State) + ' · ' + (Encode-Html $_.Commit) + '<br><code>' + (Encode-Html $_.Roots) + '</code></span></li>'
 }) -join [Environment]::NewLine
 
 $rowHtml = ($rows | Sort-Object Source, Item | ForEach-Object {

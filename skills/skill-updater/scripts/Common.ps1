@@ -24,9 +24,15 @@ function Get-SkillUpdaterConfig {
     }
     if ($local.PSObject.Properties['tooling']) {
         foreach ($property in $local.tooling.PSObject.Properties) {
-            if ($property.Name -ne 'allowedRegistries') {
+            if ($property.Name -notin @('allowedRegistries', 'runner')) {
                 throw "Unsupported machine-local tooling setting: $($property.Name)"
             }
+            if ($property.Name -eq 'runner' -and [string]$property.Value -notin @('codex-bundled-pnpm', 'user-npx')) {
+                throw "Unsupported machine-local runner: $($property.Value)"
+            }
+        }
+        if ($local.tooling.PSObject.Properties['runner']) {
+            $config.tooling.runner = [string]$local.tooling.runner
         }
         if ($local.tooling.PSObject.Properties['allowedRegistries']) {
             $config.tooling.allowedRegistries = @($local.tooling.allowedRegistries)
@@ -89,73 +95,84 @@ function Add-DirectoryToProcessPath {
 function Resolve-SkillRunner {
     $config = Get-SkillUpdaterConfig
     $packageSpec = [string]$config.tooling.skillsCli
-    $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
-    if (-not $npx) { $npx = Get-Command npx -ErrorAction SilentlyContinue }
-    if ($npx) {
+    $runnerMode = [string]$config.tooling.runner
+    if ($runnerMode -eq 'user-npx') {
+        $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
+        if (-not $npx) { $npx = Get-Command npx -ErrorAction SilentlyContinue }
+        if (-not $npx) { throw 'Configured runner user-npx, but npx was not found on PATH.' }
         $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
         if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
         if (-not $npm) {
             $adjacentNpm = Join-Path (Split-Path -Parent $npx.Source) 'npm.cmd'
             if (Test-Path -LiteralPath $adjacentNpm) { $npm = Get-Item -LiteralPath $adjacentNpm }
         }
-        if (-not $npm) { throw 'npx was found, but its npm configuration command could not be resolved.' }
+        if (-not $npm) { throw 'Configured runner user-npx, but its npm configuration command could not be resolved.' }
         $npmPath = if ($npm.PSObject.Properties['FullName']) { $npm.FullName } else { $npm.Source }
         return [pscustomobject]@{
             FilePath = $npx.Source
             ConfigFilePath = $npmPath
             Manager = 'npm'
+            Mode = $runnerMode
             Prefix = @($packageSpec)
-            DisplayName = "npx $packageSpec"
+            DisplayName = "user npx $packageSpec"
         }
     }
 
-    $pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
-    if (-not $pnpm) { $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue }
+    if ($runnerMode -ne 'codex-bundled-pnpm') {
+        throw "Unsupported runner mode: $runnerMode"
+    }
+
+    $runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes'
+    $pnpm = $null
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        $pnpm = Get-ChildItem -LiteralPath $runtimeRoot -Filter 'pnpm.cmd' -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]dependencies[\\/]bin[\\/]fallback[\\/]pnpm\.cmd$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
 
     if (-not $pnpm) {
-        $runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes'
-        if (Test-Path -LiteralPath $runtimeRoot) {
-            $pnpm = Get-ChildItem -LiteralPath $runtimeRoot -Filter 'pnpm.cmd' -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '[\\/]dependencies[\\/]bin[\\/]fallback[\\/]pnpm\.cmd$' } |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 1
-        }
+        throw 'Configured runner codex-bundled-pnpm, but Codex bundled pnpm was not found.'
     }
 
     if ($pnpm) {
         $pnpmPath = if ($pnpm.PSObject.Properties['FullName']) { $pnpm.FullName } else { $pnpm.Source }
         $dependenciesRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $pnpmPath))
         $bundledNode = Join-Path $dependenciesRoot 'node\bin\node.exe'
-        if ((-not (Get-Command node.exe -ErrorAction SilentlyContinue)) -and (Test-Path -LiteralPath $bundledNode)) {
+        if (Test-Path -LiteralPath $bundledNode) {
             Add-DirectoryToProcessPath (Split-Path -Parent $bundledNode)
         }
         return [pscustomobject]@{
             FilePath = $pnpmPath
             ConfigFilePath = $pnpmPath
             Manager = 'pnpm'
+            Mode = $runnerMode
             Prefix = @('dlx', $packageSpec)
-            DisplayName = "pnpm dlx $packageSpec"
+            DisplayName = "Codex bundled pnpm dlx $packageSpec"
         }
     }
 
-    throw 'No npx or pnpm runner was found. Install Node.js/npm, or run this from a Codex installation that provides its bundled runtime.'
 }
 
 function Resolve-NodeExecutable {
-    $node = Get-Command node.exe -ErrorAction SilentlyContinue
-    if (-not $node) { $node = Get-Command node -ErrorAction SilentlyContinue }
-    if ($node) { return $node.Source }
-
+    $config = Get-SkillUpdaterConfig
     $runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes'
-    if (Test-Path -LiteralPath $runtimeRoot) {
+    if ([string]$config.tooling.runner -eq 'codex-bundled-pnpm') {
+        if (-not (Test-Path -LiteralPath $runtimeRoot)) {
+            throw 'Configured runner codex-bundled-pnpm, but Codex bundled Node.js was not found.'
+        }
         $bundledNode = Get-ChildItem -LiteralPath $runtimeRoot -Filter 'node.exe' -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '[\\/]dependencies[\\/]node[\\/]bin[\\/]node\.exe$' } |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
         if ($bundledNode) { return $bundledNode.FullName }
+        throw 'Configured runner codex-bundled-pnpm, but Codex bundled Node.js was not found.'
     }
 
-    throw 'Node.js was not found on PATH or in the Codex bundled runtime.'
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $node) { $node = Get-Command node -ErrorAction SilentlyContinue }
+    if ($node) { return $node.Source }
+    throw 'Configured runner user-npx, but user-provided Node.js was not found on PATH.'
 }
 
 function Get-NormalizedRegistryUrl {
@@ -278,6 +295,7 @@ function Get-ToolingDiagnostics {
         NodeVersion = if ($nodeVersion) { $nodeVersion.ToString() } else { $null }
         ManagerVersion = $managerVersion
         Registry = $registry
+        RunnerMode = if ($runner) { $runner.Mode } else { [string]$Config.tooling.runner }
     }
 }
 
@@ -455,7 +473,7 @@ function Get-SourceInstallSpec {
 
     return ('https://github.com/{0}/tree/{1}/{2}' -f
         (Get-SourceIdentifier -Source $Source),
-        ([string]$Source.ref).Trim('/'),
+        ([string]$Source.sourceCommit).Trim('/'),
         $SkillRoot.Replace('\', '/').Trim('/'))
 }
 
@@ -467,15 +485,20 @@ function New-RepositorySnapshot {
 
     Assert-GitEnvironment -Config $Config | Out-Null
     $repository = Get-SourceCloneUrl -Source $Source
-    $ref = [string]$Source.ref
+    $commit = [string]$Source.sourceCommit
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $path = Join-Path ([System.IO.Path]::GetTempPath()) ('agenttools-skill-updater-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $path | Out-Null
         try {
             Invoke-ManagedGit -Config $Config -GitArguments @(
-                'clone', '--depth', '1', '--branch', $ref, '--single-branch', '--quiet', $repository, $path
+                'clone', '--quiet', $repository, $path
             ) | Out-Null
+            Invoke-ManagedGit -Config $Config -GitArguments @('-C', $path, 'checkout', '--detach', '--quiet', $commit) | Out-Null
+            $checkedOut = Invoke-ManagedGit -Config $Config -GitArguments @('-C', $path, 'rev-parse', 'HEAD')
+            if ($checkedOut -ne $commit) {
+                throw "Repository checkout did not reach configured sourceCommit $commit (got $checkedOut)."
+            }
             return $path
         }
         catch {

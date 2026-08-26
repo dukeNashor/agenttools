@@ -1,13 +1,13 @@
 # Windows deployment procedure
 
-Use this procedure when a user asks to deploy, redeploy, move, or repair `skill-updater` on a Windows PC.
+Use this procedure when a user asks to deploy, redeploy, move, or repair `skills/skill-updater` on a Windows PC.
 
 ## Inspect
 
 1. Resolve the current checkout path; every scheduled-task path must come from it.
 2. Inspect `config.json`, optional `config.local.json`, `~/.agents/.skill-lock.json`, `~/.agents/skills/`, and the exact task named in `config.json`.
-3. Run `scripts/Test-Project.ps1`, then `scripts/Install-Skills.ps1 -PreflightOnly`. They must accept the effective registry, Node.js version, package-manager settings, Git configuration, upstream source paths, shared destinations, and skill names before any skill is changed. Prefer existing `npx`; otherwise use Codex's bundled `pnpm` and Node. If neither exists, explain the missing prerequisite before installing system software.
-4. Tell the user that skill deployment overwrites the configured subsets and removes same-source skills outside them without a backup. The report and task-only repair paths do not change skills.
+3. Run `scripts/Test-Project.ps1`, then `scripts/Install-Skills.ps1 -PreflightOnly`. They must accept the effective registry, Node.js version, explicitly selected runner, package-manager settings, Git configuration, pinned source commits, upstream source paths, shared destinations, and skill names before any skill is changed. If the selected runner is unavailable, explain the missing prerequisite before installing system software.
+4. Tell the user that `-Apply` changes the configured subset without a backup, `-Overwrite` is separately required for different local content or lock metadata, and `-Prune` is separately required to remove same-source skills outside the configured layout. The report and task-only repair paths do not change skills.
 
 For a machine-specific registry or Git proxy policy, copy `config.local.example.json` to the Git-ignored `config.local.json`. Add only explicitly trusted HTTPS registries. Keep proxy credentials and certificate paths in machine configuration; the project reads their presence without copying or printing their values.
 

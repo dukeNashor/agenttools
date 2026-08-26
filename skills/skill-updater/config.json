@@ -1,10 +1,11 @@
 {
-  "version": 4,
+  "version": 5,
   "agentsRoot": "~/.agents",
   "gitBypassProxy": true,
   "reportRetention": 12,
   "tooling": {
     "skillsCli": "skills@1.5.23",
+    "runner": "codex-bundled-pnpm",
     "minimumNodeVersion": "22.20.0",
     "allowedRegistries": [
       "https://registry.npmjs.org/"
@@ -20,7 +21,7 @@
       "id": "mattpocock-skills",
       "label": "Matt Pocock Skills: engineering + productivity",
       "repositorySlug": "mattpocock/skills",
-      "ref": "main",
+      "sourceCommit": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
       "skillRoots": [
         "skills/engineering",
         "skills/productivity"
@@ -31,7 +32,7 @@
       "id": "critical-thinking-tools",
       "label": "Critical Thinking Tools",
       "repositorySlug": "cognitive-bias-lab/cognitive-bias-lab-plugins",
-      "ref": "main",
+      "sourceCommit": "9447e4a4fc3d6b31207a8b1b84d4f0ee934e7b48",
       "skillRoots": [
         "plugins/critical-thinking-tools/skills"
       ],

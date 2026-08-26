@@ -1,6 +1,6 @@
 # Agent Tools
 
-Reusable Codex skills and scripts. This repository is packaged as a Codex plugin and currently contains one explicitly invoked skill: `$visualize-codex-tokens`.
+Reusable Codex skills and scripts. This repository is packaged as a Codex plugin and contains the explicitly invoked skills `$visualize-codex-tokens` and `$skill-updater`.
 
 ## Visualize Codex Tokens
 
@@ -30,7 +30,11 @@ The parser uses cumulative `total_token_usage` deltas between `task_started` and
 
 ### Install
 
-Ask Codex to install the skill from this repository with `$skill-installer`, or copy `skills/visualize-codex-tokens` into your user skill directory. The repository also includes `.codex-plugin/plugin.json` for plugin-compatible installation flows.
+Ask Codex to install the skills from this repository with `$skill-installer`, or copy the desired folder under `skills/` into your user skill directory. The repository also includes `.codex-plugin/plugin.json` for plugin-compatible installation flows.
+
+## Skill Updater
+
+`skills/skill-updater` manages the pinned global skill set on Windows. Its committed `config.json` is the expected state, while `~/.agents/.skill-lock.json` remains the only local actual-state protocol. See [skills/skill-updater/README.md](skills/skill-updater/README.md) and invoke `$skill-updater` explicitly before reviewing or applying updates.
 
 ### Use
 
@@ -65,6 +69,17 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
 
 Use `--date YYYY-MM-DD` for one historical local date. Use `--ids ID1 ID2 ...` for an explicit list of rollout IDs; repeat `--ids` when needed. ID-list reports de-duplicate IDs, preserve full selected-session activity without date clipping, and group selected subagent rollouts under their detected root task. The scope selectors and the original thread/JSONL positional input are mutually exclusive. Without `--output`, the report is written under the stable system temporary `agenttools` directory with a thread-, ID-list-, or date-based filename. Use `--open` to open it after generation.
 Use `--title "Project Token Report"` (or `--report-title`) to set the visible total title and the HTML page title, so the report remains identifiable when opened from a generic temporary folder.
+
+### Local live WebApp
+
+Start a localhost-only live report for the current Git project:
+
+```powershell
+py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
+  serve --current-project
+```
+
+The service polls Codex rollout JSONL files every three seconds, reparses only files whose size or modification time changed, and pushes new project snapshots to the browser over SSE. It keeps state in memory; restarting the service rebuilds the report from disk. Full user messages are excluded by default; use `--include-messages` only when needed. Use `--no-open` to keep the browser closed, `--port` to change the port, and `--sessions-root` to point at a test or alternate Codex session root. The default bind address is `127.0.0.1`.
 
 ### Privacy
 
@@ -153,6 +168,17 @@ py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
 
 单个历史日期可使用 `--date YYYY-MM-DD`。显式 ID 列表可使用 `--ids ID1 ID2 ...`，需要时可重复使用 `--ids`；ID 报告会去重、保留所选 rollout 的完整活动，不按日期裁剪，并将已选中的子代理 rollout 归并到检测到的根任务下。日期选择参数、ID 列表参数与原有线程／JSONL 位置参数互斥。未指定 `--output` 时，报告以线程、ID 列表摘要或日期范围命名，写入系统临时目录下稳定的 `agenttools` 目录。需要生成后打开时使用 `--open`。
 使用 `--title "项目 Token 报告"`（或 `--report-title`）可同时设置报告页面显示的总标题和 HTML 页签标题，避免打开临时目录中的文件时无法识别报告用途。
+
+### 本机实时 WebApp
+
+为当前 Git 项目启动仅本机可访问的实时报告：
+
+```powershell
+py -3 .\skills\visualize-codex-tokens\scripts\codex_token_visualizer.py `
+  serve --current-project
+```
+
+服务默认每 3 秒检查 Codex rollout JSONL，仅重解析尺寸或修改时间发生变化的文件，并通过 SSE 将新的项目快照推送到浏览器。状态保存在内存中，服务重启后会从磁盘重新构建。实时报告默认排除完整用户消息；确有需要时使用 `--include-messages`。使用 `--no-open` 可禁止自动打开浏览器，使用 `--port` 更换端口，使用 `--sessions-root` 指定测试或其他会话根目录，默认绑定 `127.0.0.1`。
 
 ### 隐私
 

@@ -9,7 +9,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not $SkipSkillInstall) {
-    & (Join-Path $PSScriptRoot 'Install-Skills.ps1')
+    & (Join-Path $PSScriptRoot 'Install-Skills.ps1') -Apply
 }
 if (-not $SkipTask) {
     & (Join-Path $PSScriptRoot 'Install-ScheduledTask.ps1')

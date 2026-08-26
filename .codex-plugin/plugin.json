@@ -1,7 +1,7 @@
 {
   "name": "agenttools",
   "version": "0.1.0",
-  "description": "Reusable agent tools for interactive Codex token and context-window reports.",
+  "description": "Reusable Codex reporting and explicit skill-set management tools.",
   "author": {
     "name": "dukeNashor",
     "url": "https://github.com/dukeNashor"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Agent Tools",
     "shortDescription": "Inspect Codex token usage by thread or date.",
-    "longDescription": "Agent Tools packages focused Codex workflows. Its first skill generates self-contained interactive reports for one thread or a local date range, with token totals, an inspectable token-progress dual-ring context view per session, a responsive session drawer, and unified subagent details.",
+    "longDescription": "Agent Tools packages focused Codex workflows: self-contained token and context-window reports, plus an explicitly invoked Windows updater for Git-pinned global skills.",
     "developerName": "dukeNashor",
     "category": "Productivity",
     "capabilities": [
