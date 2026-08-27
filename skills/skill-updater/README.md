@@ -23,7 +23,7 @@ To deploy and then remove unprotected legacy user skills from `~/.codex/skills`:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Deploy.ps1 -PurgeLegacy
 ```
 
-Deployment applies the committed source commits and creates no backup. It preserves source-owned skills outside the configured allowlist unless `-Prune` is explicitly requested. Existing different skill content or lock metadata requires the separate `-Overwrite` choice. Add `-PurgeLegacy` to remove unprotected contents from the deprecated `~/.codex/skills` root after successful verification; before doing so, show the user the exact candidates and protected entries. It then installs or replaces the current-user scheduled task named `AgentTools Skill Update Report`.
+Deployment applies the committed source commits and creates no backup. It preserves source-owned skills outside the configured allowlist unless `-Prune` is explicitly requested. Existing different skill content or lock metadata requires the separate `-Overwrite` choice. Add `-PurgeLegacy` to remove recognized legacy skill directories (those containing `SKILL.md`) from the deprecated `~/.codex/skills` root after successful verification; Unknown directories are retained. Before doing so, show the user the exact candidates and protected entries. It then installs or replaces the current-user scheduled task named `AgentTools Skill Update Report`.
 
 The updater writes only the selected user-level skills and configured shared files under `~/.agents`. Repository, admin/system, legacy, and plugin scopes are read-only inventory surfaces. A local skill/source is untrusted until the updater verifies its pinned commit, `SKILL.md` metadata, content, shared files, and lock entries; successfully processed pinned sources are updater-trusted for later comparison.
 
@@ -67,7 +67,7 @@ Apply reviewed updates and remove unprotected legacy user skills under `~/.codex
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-Skills.ps1 -Apply -PurgeLegacy
 ```
 
-`-PurgeLegacy` does not create a backup. Before running it, tell the user the exact paths that will be removed. It never removes `.system`, `codex-primary-runtime`, or symlink/Junction entries, and it is blocked when a same-name legacy skill differs from the pinned source. Any symlink/Junction is reported to the user because ChatGPT Windows discovery may not follow it reliably.
+`-PurgeLegacy` does not create a backup. Before running it, tell the user the exact paths that will be removed. It removes only top-level legacy directories containing `SKILL.md`; directories without `SKILL.md` are reported as Unknown and retained. It never removes `.system`, `codex-primary-runtime`, or symlink/Junction entries, and it is blocked when a same-name legacy skill differs from the pinned source. Any symlink/Junction is reported to the user because ChatGPT Windows discovery may not follow it reliably.
 
 Shared files such as `references/evidence-map.md` are explicit source dependencies, not skills. Their source path, destination, and hash are reported separately; a differing destination requires `-Overwrite`, and the updater writes only the configured destination under the user root.
 

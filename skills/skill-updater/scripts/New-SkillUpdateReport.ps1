@@ -196,9 +196,10 @@ if (Test-Path -LiteralPath $legacyRoot) {
             if ($legacyNames.ContainsKey($legacyItem.Name)) { continue }
             $isReparse = (($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or [bool]$legacyItem.LinkType
             $isProtected = $isReparse -or $legacyItem.Name -in @('.system', 'codex-primary-runtime')
-            $status = if ($isProtected) { 'Protected' } else { 'Legacy unmanaged' }
+            $hasSkillFile = [bool](Get-ChildItem -LiteralPath $legacyItem.FullName -Filter 'SKILL.md' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+            $status = if ($isProtected) { 'Protected' } elseif ($hasSkillFile) { 'Legacy unmanaged' } else { 'Unknown' }
             $linkKind = if ($legacyItem.LinkType) { [string]$legacyItem.LinkType } elseif ($isReparse) { 'reparse point' } else { $null }
-            $summary = if ($linkKind) { "Detected $linkKind; tell the user and leave it untouched because ChatGPT Windows discovery may not follow it reliably" } elseif ($isProtected) { 'Protected legacy entry; never removed by the updater' } else { 'Not in the configured allowlist; removed only with -PurgeLegacy' }
+            $summary = if ($linkKind) { "Detected $linkKind; tell the user and leave it untouched because ChatGPT Windows discovery may not follow it reliably" } elseif ($isProtected) { 'Protected legacy entry; never removed by the updater' } elseif ($hasSkillFile) { 'Recognized skill outside the configured allowlist; removed only with -PurgeLegacy' } else { 'No SKILL.md found; retained and never removed by -PurgeLegacy' }
             $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $legacyItem.Name; Status = $status; Summary = $summary; Files = @() })
         }
     }

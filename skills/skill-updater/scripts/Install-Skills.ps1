@@ -239,19 +239,22 @@ try {
             }
             'Legacy match' { "Matches the configured pinned source for $($legacy.Source)." }
             'Divergent legacy' { "Same-name legacy skill differs from the configured pinned source for $($legacy.Source)." }
-            'Unmanaged' { 'No configured source ownership; retained unless -PurgeLegacy is explicitly supplied.' }
-            default { 'Not a recognized skill directory; retained unless -PurgeLegacy is explicitly supplied.' }
+            'Unmanaged' { 'No configured source ownership; this recognized skill is removed only with -PurgeLegacy.' }
+            'Unknown' { 'No SKILL.md was found; retained and never removed by -PurgeLegacy.' }
+            default { 'Not a recognized skill directory; retained unless explicitly reviewed.' }
         }
         $status = switch ($legacy.State) {
             'Legacy match' { 'Legacy duplicate' }
             'Divergent legacy' { 'Legacy conflict' }
             'Protected' { 'Protected' }
+            'Unmanaged' { 'Legacy unmanaged' }
+            'Unknown' { 'Unknown' }
             default { 'Legacy unmanaged' }
         }
         Add-Finding -Findings $findings -Source 'Legacy .codex/skills' -Item $legacy.Name -Status $status -Summary $summary
     }
     foreach ($finding in $findings) {
-        if ($finding.Status -in @('Unmanaged', 'Legacy unmanaged', 'Legacy duplicate', 'Protected')) { Write-Warning "$($finding.Source) / $($finding.Item): $($finding.Summary)" }
+        if ($finding.Status -in @('Unmanaged', 'Legacy unmanaged', 'Legacy duplicate', 'Protected', 'Unknown')) { Write-Warning "$($finding.Source) / $($finding.Item): $($finding.Summary)" }
         else { Write-Host "$($finding.Status): $($finding.Source) / $($finding.Item) — $($finding.Summary)" }
     }
     foreach ($legacy in @($legacyInventory | Where-Object { $_.ReparsePoint })) {
@@ -346,7 +349,7 @@ try {
         $legacyRoot = Get-LegacySkillsRoot
         if (Test-Path -LiteralPath $legacyRoot) {
             $resolvedLegacyRoot = (Resolve-Path -LiteralPath $legacyRoot).Path.TrimEnd('\')
-            foreach ($legacy in $legacyInventory | Where-Object { -not $_.Protected }) {
+            foreach ($legacy in $legacyInventory | Where-Object { -not $_.Protected -and $_.HasSkillFile }) {
                 $resolvedLegacyPath = (Resolve-Path -LiteralPath $legacy.Path).Path
                 if (-not $resolvedLegacyPath.StartsWith($resolvedLegacyRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw "Refusing to remove a legacy path outside .codex/skills: $resolvedLegacyPath"

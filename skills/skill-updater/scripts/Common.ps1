@@ -715,6 +715,7 @@ function Get-LegacySkillInventory {
             Path = $item.FullName
             State = $state
             Protected = $isProtected
+            HasSkillFile = [bool]$skillFile
             ReparsePoint = $isReparse
             LinkType = if ($item.LinkType) { [string]$item.LinkType } elseif ($isReparse) { 'reparse point' } else { $null }
             Source = if ($knownSkill) { [string]$knownSkill.Source.id } else { $null }
