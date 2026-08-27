@@ -16,7 +16,7 @@ function Encode-Html {
 $config = Get-SkillUpdaterConfig
 Assert-CanonicalAgentsRoot -Config $config
 $projectRoot = Get-SkillUpdaterRoot
-$repositoryRoot = Split-Path -Parent $projectRoot
+$repositoryRoot = Split-Path -Parent (Split-Path -Parent $projectRoot)
 $agentsRoot = Resolve-PortablePath $config.agentsRoot
 $skillsDirectory = Join-Path $agentsRoot 'skills'
 $lockPath = Join-Path $agentsRoot '.skill-lock.json'
