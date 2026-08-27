@@ -20,7 +20,8 @@ if ($failureMessages.Count -gt 0) {
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
 $config = Get-SkillUpdaterConfig
-if ([int]$config.version -ne 5) { throw 'Unsupported config version.' }
+if ([int]$config.version -ne 7) { throw 'Unsupported config version.' }
+if ([string]$config.agentsRoot -ne '~/.agents') { throw 'agentsRoot must remain the canonical ~/.agents user skill root.' }
 if (@($config.sources).Count -ne 2) { throw 'Expected exactly two tracked sources.' }
 if ([int]$config.reportRetention -lt 1) { throw 'Report retention must be positive.' }
 
@@ -43,6 +44,7 @@ catch { throw 'Scheduled-task time must use HH:mm.' }
 $sourceIds = @{}
 $repositorySlugs = @{}
 $sharedDestinations = @{}
+$selectedSkillOwners = @{}
 foreach ($source in $config.sources) {
     if ([string]::IsNullOrWhiteSpace([string]$source.id) -or $sourceIds.ContainsKey([string]$source.id)) {
         throw "Source IDs must be non-empty and unique: $($source.id)"
@@ -58,6 +60,19 @@ foreach ($source in $config.sources) {
         if (-not (Test-SafeRelativePath -Path ([string]$skillRoot))) { throw "$($source.id) has an invalid skill root: $skillRoot" }
         if ($roots.ContainsKey([string]$skillRoot)) { throw "$($source.id) has a duplicate skill root: $skillRoot" }
         $roots[[string]$skillRoot] = $true
+    }
+    $selectedSkills = @([string[]]$source.selectedSkills)
+    if ($selectedSkills.Count -eq 0) { throw "$($source.id) has no selectedSkills allowlist." }
+    $skillNames = @{}
+    foreach ($skillName in $selectedSkills) {
+        $name = [string]$skillName
+        if ($name -notmatch '^[^/\\.][^/\\]*$') { throw "$($source.id) has an invalid selected skill name: $name" }
+        if ($skillNames.ContainsKey($name)) { throw "$($source.id) has a duplicate selected skill: $name" }
+        if ($selectedSkillOwners.ContainsKey($name)) {
+            throw "Selected skill names must be unique across sources: $name ($($selectedSkillOwners[$name]) and $($source.id))."
+        }
+        $skillNames[$name] = $true
+        $selectedSkillOwners[$name] = [string]$source.id
     }
     foreach ($sharedFile in @($source.sharedFiles)) {
         if (-not (Test-SafeRelativePath -Path ([string]$sharedFile.sourcePath))) {

@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 7,
   "agentsRoot": "~/.agents",
   "gitBypassProxy": true,
   "reportRetention": 12,
@@ -26,6 +26,33 @@
         "skills/engineering",
         "skills/productivity"
       ],
+      "selectedSkills": [
+        "ask-matt",
+        "code-review",
+        "codebase-design",
+        "diagnosing-bugs",
+        "domain-modeling",
+        "grill-me",
+        "grill-with-docs",
+        "grilling",
+        "handoff",
+        "implement",
+        "improve-codebase-architecture",
+        "prototype",
+        "research",
+        "resolving-merge-conflicts",
+        "setup-matt-pocock-skills",
+        "tdd",
+        "teach",
+        "to-questionnaire",
+        "to-spec",
+        "to-tickets",
+        "triage",
+        "wait-what",
+        "wayfinder",
+        "wizard",
+        "writing-for-agents"
+      ],
       "sharedFiles": []
     },
     {
@@ -35,6 +62,21 @@
       "sourceCommit": "9447e4a4fc3d6b31207a8b1b84d4f0ee934e7b48",
       "skillRoots": [
         "plugins/critical-thinking-tools/skills"
+      ],
+      "selectedSkills": [
+        "base-rate-audit",
+        "calibration-forecasting",
+        "causal-story-dissection",
+        "competing-hypotheses",
+        "consider-the-opposite",
+        "critical-thinking-toolkit",
+        "decision-journal",
+        "devils-advocate",
+        "groupthink-red-team",
+        "outside-view",
+        "pre-mortem",
+        "socratic-ladder",
+        "steelman"
       ],
       "sharedFiles": [
         {

@@ -14,7 +14,9 @@ function Encode-Html {
 }
 
 $config = Get-SkillUpdaterConfig
+Assert-CanonicalAgentsRoot -Config $config
 $projectRoot = Get-SkillUpdaterRoot
+$repositoryRoot = Split-Path -Parent $projectRoot
 $agentsRoot = Resolve-PortablePath $config.agentsRoot
 $skillsDirectory = Join-Path $agentsRoot 'skills'
 $lockPath = Join-Path $agentsRoot '.skill-lock.json'
@@ -29,6 +31,19 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $rows = New-Object System.Collections.Generic.List[object]
 $sourceSummaries = New-Object System.Collections.Generic.List[object]
 $skillNameOwners = @{}
+$legacyNames = @{}
+
+foreach ($scope in @(Get-ReadonlySkillScopeInventory -ProjectRoot $repositoryRoot -AgentsRoot $agentsRoot)) {
+    $scopeSummary = if (-not $scope.Exists) { 'Not present on this Windows node' } else { "$($scope.SkillCount) skill directories found; read-only inventory" }
+    if ($scope.ReparseCount -gt 0) { $scopeSummary += "; $($scope.ReparseCount) symlink/Junction/reparse entry(ies) detected" }
+    $rows.Add([pscustomobject]@{
+        Source = "Scope: $($scope.Scope)"
+        Item = $scope.Path
+        Status = 'Read-only inventory'
+        Summary = $scopeSummary
+        Files = @()
+    })
+}
 
 try {
     $tooling = Get-ToolingDiagnostics -Config $config
@@ -82,6 +97,26 @@ foreach ($source in $config.sources) {
             }
             $skillNameOwners[$name] = [string]$source.label
             $installedPath = Join-Path $skillsDirectory $name
+            $legacyPath = Join-Path (Get-LegacySkillsRoot) $name
+            if (Test-Path -LiteralPath $legacyPath) {
+                $legacyNames[$name] = $true
+                $legacyItem = Get-Item -LiteralPath $legacyPath
+                $legacyProtected = (($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or [bool]$legacyItem.LinkType -or $name -in @('.system', 'codex-primary-runtime')
+                if ($legacyProtected) {
+                    $linkKind = if ($legacyItem.LinkType) { [string]$legacyItem.LinkType } elseif (($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { 'reparse point' } else { $null }
+                    $summary = if ($linkKind) { "Detected $linkKind; tell the user and leave it untouched because ChatGPT Windows discovery may not follow it reliably" } else { 'Protected legacy entry; never removed by the updater' }
+                    $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $name; Status = 'Protected'; Summary = $summary; Files = @() })
+                }
+                else {
+                    $legacyComparison = Compare-DirectoryContent -Upstream $skillFile.Directory.FullName -Installed $legacyPath
+                    if ($legacyComparison.Equal) {
+                        $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $name; Status = 'Legacy duplicate'; Summary = "Matches $($source.label); will be removed only with -PurgeLegacy"; Files = @() })
+                    }
+                    else {
+                        $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $name; Status = 'Legacy conflict'; Summary = "Same-name legacy skill differs from $($source.label); -PurgeLegacy is blocked"; Files = @() })
+                    }
+                }
+            }
             if (-not (Test-Path -LiteralPath $installedPath)) {
                 $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Not installed'; Summary = 'Install from upstream'; Files = @() })
                 continue
@@ -98,6 +133,7 @@ foreach ($source in $config.sources) {
                     @($comparison.Removed | ForEach-Object { "Local-only: $_" })
                     $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Different'; Summary = "$summary; pinned commit $commit"; Files = $files })
             }
+
         }
 
         foreach ($sharedFile in $source.sharedFiles) {
@@ -107,11 +143,15 @@ foreach ($source in $config.sources) {
             if (-not (Test-Path -LiteralPath $installedPath)) {
                 $rows.Add([pscustomobject]@{ Source = $source.label; Item = $itemName; Status = 'Not installed'; Summary = 'Shared dependency is missing'; Files = @() })
             }
-            elseif ((Get-FileHash -LiteralPath $upstreamPath -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $installedPath -Algorithm SHA256).Hash) {
-                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $itemName; Status = 'Current'; Summary = 'Matches upstream'; Files = @() })
-            }
             else {
-                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $itemName; Status = 'Different'; Summary = 'Shared dependency differs from upstream'; Files = @([string]$sharedFile.sourcePath) })
+                $upstreamHash = (Get-FileHash -LiteralPath $upstreamPath -Algorithm SHA256).Hash
+                $installedHash = (Get-FileHash -LiteralPath $installedPath -Algorithm SHA256).Hash
+                if ($upstreamHash -eq $installedHash) {
+                    $rows.Add([pscustomobject]@{ Source = $source.label; Item = $itemName; Status = 'Current'; Summary = "Pack-level compatibility resource matches upstream; SHA-256 $upstreamHash"; Files = @() })
+                }
+                else {
+                    $rows.Add([pscustomobject]@{ Source = $source.label; Item = $itemName; Status = 'Different'; Summary = "Pack-level compatibility resource differs; upstream SHA-256 $upstreamHash; installed SHA-256 $installedHash"; Files = @([string]$sharedFile.sourcePath) })
+                }
             }
         }
 
@@ -137,10 +177,30 @@ foreach ($source in $config.sources) {
     }
     catch {
         $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = '-'; Roots = '-'; State = 'Unavailable' })
-        $rows.Add([pscustomobject]@{ Source = $source.label; Item = 'source'; Status = 'Source unavailable'; Summary = $_.Exception.Message; Files = @() })
+        $metadataFailure = $_.Exception.Message -match 'SKILL\.md frontmatter'
+        $rows.Add([pscustomobject]@{ Source = $source.label; Item = 'source'; Status = if ($metadataFailure) { 'Invalid metadata' } else { 'Source unavailable' }; Summary = $_.Exception.Message; Files = @() })
     }
     finally {
         if ($snapshot -and (Test-Path -LiteralPath $snapshot)) { Remove-Item -LiteralPath $snapshot -Recurse -Force }
+    }
+}
+
+$legacyRoot = Get-LegacySkillsRoot
+if (Test-Path -LiteralPath $legacyRoot) {
+    $legacyRootItem = Get-Item -LiteralPath $legacyRoot
+    if (($legacyRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $legacyRoot; Status = 'Protected'; Summary = 'Legacy root is a reparse point; no legacy content will be inspected or removed'; Files = @() })
+    }
+    else {
+        foreach ($legacyItem in @(Get-ChildItem -LiteralPath $legacyRoot -Force -Directory | Sort-Object Name)) {
+            if ($legacyNames.ContainsKey($legacyItem.Name)) { continue }
+            $isReparse = (($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or [bool]$legacyItem.LinkType
+            $isProtected = $isReparse -or $legacyItem.Name -in @('.system', 'codex-primary-runtime')
+            $status = if ($isProtected) { 'Protected' } else { 'Legacy unmanaged' }
+            $linkKind = if ($legacyItem.LinkType) { [string]$legacyItem.LinkType } elseif ($isReparse) { 'reparse point' } else { $null }
+            $summary = if ($linkKind) { "Detected $linkKind; tell the user and leave it untouched because ChatGPT Windows discovery may not follow it reliably" } elseif ($isProtected) { 'Protected legacy entry; never removed by the updater' } else { 'Not in the configured allowlist; removed only with -PurgeLegacy' }
+            $rows.Add([pscustomobject]@{ Source = 'Legacy .codex/skills'; Item = $legacyItem.Name; Status = $status; Summary = $summary; Files = @() })
+        }
     }
 }
 
@@ -166,7 +226,8 @@ $rowHtml = ($rows | Sort-Object Source, Item | ForEach-Object {
     '<tr><td>' + (Encode-Html $_.Source) + '</td><td><code>' + (Encode-Html $_.Item) + '</code></td><td><span class="status ' + $className + '">' + (Encode-Html $_.Status) + '</span></td><td>' + (Encode-Html $_.Summary) + $filesHtml + '</td></tr>'
 }) -join [Environment]::NewLine
 
-$installCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-Skills.ps1'
+$installCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-Skills.ps1 -Apply'
+$purgeCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-Skills.ps1 -Apply -PurgeLegacy'
 $html = @"
 <!doctype html>
 <html lang="en">
@@ -180,11 +241,11 @@ $html = @"
 </head>
 <body><main class="page">
 <h1>Agent skill update report</h1>
-<p class="lede">Read-only comparison generated $(Encode-Html ($generatedAt.ToString('yyyy-MM-dd HH:mm:ss zzz'))) on $(Encode-Html $env:COMPUTERNAME). No skill was changed.</p>
+<p class="lede">Read-only comparison generated $(Encode-Html ($generatedAt.ToString('yyyy-MM-dd HH:mm:ss zzz'))) on $(Encode-Html $env:COMPUTERNAME). No skill was changed; this scheduled report does not perform automatic updates.</p>
 <section class="metrics"><div class="metric"><strong>$currentCount</strong><span>current items</span></div><div class="metric"><strong>$differentCount</strong><span>items needing attention</span></div></section>
 <section class="panel"><h2>Sources</h2><ul class="sources">$sourceHtml</ul></section>
 <section class="panel"><h2>Comparison</h2><table><thead><tr><th>Source</th><th>Item</th><th>Status</th><th>Details</th></tr></thead><tbody>$rowHtml</tbody></table></section>
-<section class="panel"><h2>Apply reviewed updates</h2><p>Run from the <code>skill-updater</code> directory:</p><div class="command"><code>$(Encode-Html $installCommand)</code></div></section>
+<section class="panel"><h2>Apply reviewed updates</h2><p>Run from the <code>skill-updater</code> directory:</p><div class="command"><code>$(Encode-Html $installCommand)</code></div><p>This assists only the selected user-level skills. Before appending <code>-PurgeLegacy</code>, tell the user the exact candidate paths and protected paths; no backup is created. Symlink/Junction entries are reported and left untouched.</p><div class="command"><code>$(Encode-Html $purgeCommand)</code></div></section>
 </main></body></html>
 "@
 

@@ -2,14 +2,17 @@
 param(
     [switch]$SkipSkillInstall,
     [switch]$SkipTask,
-    [switch]$NoOpen
+    [switch]$NoOpen,
+    [switch]$PurgeLegacy
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not $SkipSkillInstall) {
-    & (Join-Path $PSScriptRoot 'Install-Skills.ps1') -Apply
+    $installArguments = @{ Apply = $true }
+    if ($PurgeLegacy) { $installArguments.PurgeLegacy = $true }
+    & (Join-Path $PSScriptRoot 'Install-Skills.ps1') @installArguments
 }
 if (-not $SkipTask) {
     & (Join-Path $PSScriptRoot 'Install-ScheduledTask.ps1')

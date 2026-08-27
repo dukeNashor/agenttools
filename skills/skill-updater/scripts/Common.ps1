@@ -53,6 +53,14 @@ function Resolve-PortablePath {
     return $Path
 }
 
+function Assert-CanonicalAgentsRoot {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    if ([string]$Config.agentsRoot -ne '~/.agents') {
+        throw 'agentsRoot must remain the canonical ~/.agents user skill root.'
+    }
+}
+
 function Test-SafeRelativePath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -550,6 +558,42 @@ function Compare-DirectoryContent {
     }
 }
 
+function Assert-SkillMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$SkillFile,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+
+    $lines = @(Get-Content -LiteralPath $SkillFile -ErrorAction Stop)
+    if ($lines.Count -lt 3 -or $lines[0].Trim() -ne '---') {
+        throw "SKILL.md is missing YAML frontmatter: $SkillFile"
+    }
+    $closingIndex = -1
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        if ($lines[$index].Trim() -eq '---') { $closingIndex = $index; break }
+    }
+    if ($closingIndex -lt 0) { throw "SKILL.md frontmatter is not closed: $SkillFile" }
+
+    $name = $null
+    $description = $null
+    foreach ($line in @($lines | Select-Object -Skip 1 -First ($closingIndex - 1))) {
+        if ($line -match '^\s*name\s*:\s*(?<value>.*?)\s*$') {
+            $name = [string]$Matches.value
+            $name = $name.Trim()
+            if ($name.Length -ge 2 -and (($name[0] -eq '"' -and $name[$name.Length - 1] -eq '"') -or ($name[0] -eq "'" -and $name[$name.Length - 1] -eq "'"))) { $name = $name.Substring(1, $name.Length - 2) }
+        }
+        elseif ($line -match '^\s*description\s*:\s*(?<value>.*?)\s*$') {
+            $description = [string]$Matches.value
+            $description = $description.Trim()
+            if ($description.Length -ge 2 -and (($description[0] -eq '"' -and $description[$description.Length - 1] -eq '"') -or ($description[0] -eq "'" -and $description[$description.Length - 1] -eq "'"))) { $description = $description.Substring(1, $description.Length - 2) }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw "SKILL.md frontmatter has no name: $SkillFile" }
+    if ([string]::IsNullOrWhiteSpace($description)) { throw "SKILL.md frontmatter has no description: $SkillFile" }
+    if ($name -ne $ExpectedName) { throw "SKILL.md name '$name' does not match directory '$ExpectedName': $SkillFile" }
+    return [pscustomobject]@{ Name = $name; Description = $description }
+}
+
 function Get-ConfiguredSkillFiles {
     param(
         [Parameter(Mandatory = $true)][string]$Snapshot,
@@ -557,12 +601,125 @@ function Get-ConfiguredSkillFiles {
     )
 
     $files = @()
+    $selectedNames = @([string[]]$Source.selectedSkills)
+    if ($selectedNames.Count -eq 0) {
+        throw "Source $($Source.id) has no selectedSkills allowlist."
+    }
     foreach ($relativeRoot in @($Source.skillRoots)) {
         $root = Join-Path $Snapshot ([string]$relativeRoot)
         if (-not (Test-Path -LiteralPath $root)) {
             throw "Configured skill root is missing upstream: $relativeRoot"
         }
-        $files += @(Get-ChildItem -LiteralPath $root -Filter 'SKILL.md' -File -Recurse)
+        $files += @(Get-ChildItem -LiteralPath $root -Filter 'SKILL.md' -File -Recurse |
+            Where-Object { $selectedNames -contains $_.Directory.Name })
     }
-    return @($files | Sort-Object FullName -Unique)
+    $result = @($files | Sort-Object FullName -Unique)
+    foreach ($skillFile in $result) {
+        Assert-SkillMetadata -SkillFile $skillFile.FullName -ExpectedName $skillFile.Directory.Name | Out-Null
+    }
+    $foundNames = @($result | ForEach-Object { $_.Directory.Name } | Sort-Object -Unique)
+    if ($result.Count -ne $foundNames.Count) {
+        throw "A selected skill name appears in more than one configured root for source $($Source.id)."
+    }
+    $missingNames = @($selectedNames | Where-Object { $foundNames -notcontains $_ })
+    if ($missingNames.Count -gt 0) {
+        throw "Selected skill(s) are missing from the configured upstream roots: $($missingNames -join ', ')"
+    }
+    return $result
+}
+
+function Get-LegacySkillsRoot {
+    return (Join-Path $env:USERPROFILE '.codex\skills')
+}
+
+function Get-ReadonlySkillScopeInventory {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$AgentsRoot
+    )
+
+    $candidates = @(
+        [pscustomobject]@{ Scope = 'Repository'; Path = Join-Path $ProjectRoot '.agents\skills' },
+        [pscustomobject]@{ Scope = 'Legacy Codex user'; Path = (Get-LegacySkillsRoot) },
+        [pscustomobject]@{ Scope = 'System'; Path = Join-Path (Get-LegacySkillsRoot) '.system' },
+        [pscustomobject]@{ Scope = 'Plugin cache'; Path = Join-Path $env:USERPROFILE '.codex\plugins' }
+    )
+    foreach ($candidate in $candidates) {
+        $resolved = [System.IO.Path]::GetFullPath($candidate.Path)
+        $sameAsWritable = $resolved.TrimEnd('\', '/') -eq ([System.IO.Path]::GetFullPath($AgentsRoot).TrimEnd('\', '/'))
+        if ($sameAsWritable) { continue }
+        $exists = Test-Path -LiteralPath $resolved
+        $skillCount = 0
+        $reparseCount = 0
+        if ($exists -and (Get-Item -LiteralPath $resolved).PSIsContainer) {
+            $skillDirs = if ($candidate.Scope -eq 'Plugin cache') {
+                @(Get-ChildItem -LiteralPath $resolved -Force -Directory -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') })
+            }
+            else {
+                @(Get-ChildItem -LiteralPath $resolved -Force -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') })
+            }
+            $skillCount = @($skillDirs).Count
+            $reparseCount = @($skillDirs | Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or [bool]$_.LinkType }).Count
+        }
+        [pscustomobject]@{
+            Scope = $candidate.Scope
+            Path = $resolved
+            Exists = $exists
+            SkillCount = $skillCount
+            ReparseCount = $reparseCount
+            WritableByUpdater = $false
+        }
+    }
+}
+
+function Get-LegacySkillInventory {
+    param(
+        [Parameter(Mandatory = $true)][string]$LegacyRoot,
+        [Parameter(Mandatory = $true)]$SourcePlans
+    )
+
+    if (-not (Test-Path -LiteralPath $LegacyRoot)) { return @() }
+    $rootItem = Get-Item -LiteralPath $LegacyRoot
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to inspect a reparse-point legacy skills root: $LegacyRoot"
+    }
+
+    $known = @{}
+    foreach ($plan in $SourcePlans) {
+        foreach ($skillFile in @($plan.SkillFiles)) {
+            $known[$skillFile.Directory.Name] = [pscustomobject]@{
+                Source = $plan.Source
+                Upstream = $skillFile.Directory.FullName
+            }
+        }
+    }
+
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @(Get-ChildItem -LiteralPath $LegacyRoot -Force -Directory | Sort-Object Name)) {
+        $isReparse = (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or [bool]$item.LinkType
+        $isProtected = $isReparse -or $item.Name -in @('.system', 'codex-primary-runtime')
+        $skillFile = Get-ChildItem -LiteralPath $item.FullName -Filter 'SKILL.md' -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        $knownSkill = if ($known.ContainsKey($item.Name)) { $known[$item.Name] } else { $null }
+        $state = if ($isProtected) { 'Protected' }
+            elseif (-not $skillFile) { 'Unknown' }
+            elseif (-not $knownSkill) { 'Unmanaged' }
+            else {
+                $comparison = Compare-DirectoryContent -Upstream $knownSkill.Upstream -Installed $item.FullName
+                if ($comparison.Equal) { 'Legacy match' } else { 'Divergent legacy' }
+            }
+        $items.Add([pscustomobject]@{
+            Name = $item.Name
+            Path = $item.FullName
+            State = $state
+            Protected = $isProtected
+            ReparsePoint = $isReparse
+            LinkType = if ($item.LinkType) { [string]$item.LinkType } elseif ($isReparse) { 'reparse point' } else { $null }
+            Source = if ($knownSkill) { [string]$knownSkill.Source.id } else { $null }
+            SkillPath = if ($knownSkill) { [string]$knownSkill.Upstream } else { $null }
+        })
+    }
+    return $items.ToArray()
 }
