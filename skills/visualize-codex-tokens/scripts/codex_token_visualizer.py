@@ -3652,45 +3652,50 @@ h1{font-size:clamp(14px,1.5vw,20px)}
     data.summary.toolCategories = safeObject(data.summary.toolCategories);
     data.summary.modelUsage = Array.isArray(data.summary.modelUsage) ? data.summary.modelUsage : [];
     data.summary.planExcludedUsage = safeObject(data.summary.planExcludedUsage);
-    const reportTitle=String(data.metadata.reportTitle||"").trim();
+    let reportTitle=String(data.metadata.reportTitle||"").trim();
     data.warnings = Array.isArray(data.warnings) ? data.warnings : [];
     const dateFilterEnabled = byId("report-shell")?.dataset.dateFilterEnabled === "true";
-    const baseDateWindow = safeObject(data.metadata.dateWindow);
-    const baseSessions = Array.isArray(data.sessions) ? data.sessions : [];
-    const baseSummary = data.summary;
-    const baseWarnings = data.warnings;
-    let sessions = baseSessions;
-    for (const session of baseSessions) {
-      session.metadata = safeObject(session.metadata);
-      session.summary = safeObject(session.summary);
-      session.warnings = Array.isArray(session.warnings) ? session.warnings : [];
-      session.orphanMessages = Array.isArray(session.orphanMessages) ? session.orphanMessages : [];
-      session.turns = Array.isArray(session.turns) ? session.turns : [];
-      session.summary.finalUsage = safeObject(session.summary.finalUsage);
-      session.summary.finalBreakdown = safeObject(session.summary.finalBreakdown);
-      session.summary.finalBreakdownMismatch = safeObject(session.summary.finalBreakdownMismatch);
-      session.summary.statusCounts = safeObject(session.summary.statusCounts);
-      session.summary.dailyUsage = Array.isArray(session.summary.dailyUsage) ? session.summary.dailyUsage : [];
-      session.summary.modelUsage = Array.isArray(session.summary.modelUsage) ? session.summary.modelUsage : [];
-      session.summary.planExcludedUsage = safeObject(session.summary.planExcludedUsage);
-      session.metadata.efforts = Array.isArray(session.metadata.efforts) ? session.metadata.efforts : [];
-      for (const turn of session.turns) {
-        turn.usage = safeObject(turn.usage); turn.breakdown = safeObject(turn.breakdown);
-        turn.dailyUsage = Array.isArray(turn.dailyUsage) ? turn.dailyUsage : [];
-        turn.dailyModelResponses = safeObject(turn.dailyModelResponses);
-        turn.dailyTokenSnapshots = safeObject(turn.dailyTokenSnapshots);
-        turn.contextSnapshot = safeObject(turn.contextSnapshot); turn.contextTimeline = Array.isArray(turn.contextTimeline) ? turn.contextTimeline : [];
-        turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
-        turn.contextCompactions = Array.isArray(turn.contextCompactions) ? turn.contextCompactions : [];
-        turn.messages = Array.isArray(turn.messages) ? turn.messages : [];
-        turn.outputs = Array.isArray(turn.outputs) ? turn.outputs : [];
+    let baseDateWindow = safeObject(data.metadata.dateWindow);
+    let baseSessions = [];
+    let baseSummary = data.summary;
+    let baseWarnings = data.warnings;
+    let sessions = [];
+    function normalizeSessions(value){
+      const normalized=Array.isArray(value)?value:[];
+      for(const session of normalized){
+        session.metadata=safeObject(session.metadata);session.summary=safeObject(session.summary);
+        session.warnings=Array.isArray(session.warnings)?session.warnings:[];
+        session.orphanMessages=Array.isArray(session.orphanMessages)?session.orphanMessages:[];
+        session.turns=Array.isArray(session.turns)?session.turns:[];
+        session.summary.finalUsage=safeObject(session.summary.finalUsage);
+        session.summary.finalBreakdown=safeObject(session.summary.finalBreakdown);
+        session.summary.finalBreakdownMismatch=safeObject(session.summary.finalBreakdownMismatch);
+        session.summary.statusCounts=safeObject(session.summary.statusCounts);
+        session.summary.dailyUsage=Array.isArray(session.summary.dailyUsage)?session.summary.dailyUsage:[];
+        session.summary.modelUsage=Array.isArray(session.summary.modelUsage)?session.summary.modelUsage:[];
+        session.summary.planExcludedUsage=safeObject(session.summary.planExcludedUsage);
+        session.metadata.efforts=Array.isArray(session.metadata.efforts)?session.metadata.efforts:[];
+        for(const turn of session.turns){
+          turn.usage=safeObject(turn.usage);turn.breakdown=safeObject(turn.breakdown);
+          turn.dailyUsage=Array.isArray(turn.dailyUsage)?turn.dailyUsage:[];
+          turn.dailyModelResponses=safeObject(turn.dailyModelResponses);
+          turn.dailyTokenSnapshots=safeObject(turn.dailyTokenSnapshots);
+          turn.contextSnapshot=safeObject(turn.contextSnapshot);turn.contextTimeline=Array.isArray(turn.contextTimeline)?turn.contextTimeline:[];
+          turn.toolCalls=Array.isArray(turn.toolCalls)?turn.toolCalls:[];
+          turn.contextCompactions=Array.isArray(turn.contextCompactions)?turn.contextCompactions:[];
+          turn.messages=Array.isArray(turn.messages)?turn.messages:[];
+          turn.outputs=Array.isArray(turn.outputs)?turn.outputs:[];
+        }
       }
+      return normalized;
     }
-    data.sessions = sessions;
-    const messagesIncluded=data.metadata.messagesIncluded!==false;
+    baseSessions=normalizeSessions(data.sessions);
+    sessions=baseSessions;
+    data.sessions=sessions;
+    let messagesIncluded=data.metadata.messagesIncluded!==false;
     const colors={cachedInput:css("--cached"),cacheWriteInput:css("--cache-write"),otherNonCachedInput:css("--uncached"),ordinaryOutput:css("--output"),reasoningOutput:css("--reasoning"),unclassified:css("--unclassified")};
     const labels={cachedInput:"缓存输入",cacheWriteInput:"缓存写入",otherNonCachedInput:"其他非缓存输入",ordinaryOutput:"普通输出",reasoningOutput:"推理输出",unclassified:"未分类调整"};
-    const segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
+    let segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
     const sessionNavMedia=window.matchMedia("(max-width:900px)");
     const DEFAULT_TOOL_CATEGORIES=["computer-use","chrome-use","imagegen","web-search"];
     const state={view:"total",tab:"context",scale:"linear",tokenUnit:"M",query:"",toolCategories:new Set(DEFAULT_TOOL_CATEGORIES),modelFilters:null,statuses:new Set(["complete","aborted","incomplete"]),selected:null,selectedSessionIds:new Set(),hoverSessionId:null,returnToTotalSessionId:null,sessionNavOpen:!sessionNavMedia.matches,dateFilter:{start:String(baseDateWindow.startDate||""),end:String(baseDateWindow.endDate||"")}};
@@ -3714,16 +3719,16 @@ h1{font-size:clamp(14px,1.5vw,20px)}
    function emptyUsage(){return{input:0,cached:0,cache_write:0,output:0,reasoning:0,total:0}}
    function addUsage(a,b){return{input:(a.input||0)+(b.input||0),cached:(a.cached||0)+(b.cached||0),cache_write:(a.cache_write||0)+(b.cache_write||0),output:(a.output||0)+(b.output||0),reasoning:(a.reasoning||0)+(b.reasoning||0),total:(a.total||0)+(b.total||0)}}
    function usageBreakdown(u){const cached=Math.max(0,Number(u.cached)||0),cacheWrite=Math.max(0,Number(u.cache_write)||0),input=Math.max(0,Number(u.input)||0),output=Math.max(0,Number(u.output)||0),reasoning=Math.min(output,Math.max(0,Number(u.reasoning)||0));return{cachedInput:cached,cacheWriteInput:cacheWrite,otherNonCachedInput:Math.max(0,input-cached-cacheWrite),ordinaryOutput:Math.max(0,output-reasoning),reasoningOutput:reasoning,unclassified:0}}
-   function usageFromDaily(buckets,start,end){return(buckets||[]).filter(bucket=>{const day=String(bucket.date||"");return day>=start&&day<=end}).reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage())}
-   function dailyCount(values,start,end){return Object.entries(values||{}).filter(([day])=>day>=start&&day<=end).reduce((sum,[,value])=>sum+(Number(value)||0),0)}
+   function usageFromDaily(buckets,start,end){const items=buckets||[];if(!baseDateWindow.startDate||!baseDateWindow.endDate)return items.reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage());return items.filter(bucket=>{const day=String(bucket.date||"");return day>=start&&day<=end}).reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage())}
+   function dailyCount(values,start,end){const entries=Object.entries(values||{});if(!baseDateWindow.startDate||!baseDateWindow.endDate)return entries.reduce((sum,[,value])=>sum+(Number(value)||0),0);return entries.filter(([day])=>day>=start&&day<=end).reduce((sum,[,value])=>sum+(Number(value)||0),0)}
    function dateBoundary(value,endExclusive=false){const parts=String(value||"").split("-").map(Number),offset=Number(baseDateWindow.timezoneOffsetMinutes??480);if(parts.length!==3||parts.some(part=>!Number.isFinite(part)))return NaN;return Date.UTC(parts[0],parts[1]-1,parts[2]+(endExclusive?1:0))-offset*60000}
    function filterBounds(){return{start:state.dateFilter.start,end:state.dateFilter.end,startMs:dateBoundary(state.dateFilter.start),endMs:dateBoundary(state.dateFilter.end,true)}}
    function eventMs(value){const result=Date.parse(value||"");return Number.isFinite(result)?result:null}
-   function eventInDateFilter(value){const timestamp=eventMs(value),bounds=filterBounds();return timestamp!=null&&timestamp>=bounds.startMs&&timestamp<bounds.endMs}
-   function eventOverlapsFilter(start,end){const first=eventMs(start),last=eventMs(end||start),bounds=filterBounds();return first!=null&&last!=null&&first<bounds.endMs&&last>=bounds.startMs}
+   function eventInDateFilter(value){if(!baseDateWindow.startDate||!baseDateWindow.endDate)return true;const timestamp=eventMs(value),bounds=filterBounds();return timestamp!=null&&timestamp>=bounds.startMs&&timestamp<bounds.endMs}
+   function eventOverlapsFilter(start,end){if(!baseDateWindow.startDate||!baseDateWindow.endDate)return true;const first=eventMs(start),last=eventMs(end||start),bounds=filterBounds();return first!=null&&last!=null&&first<bounds.endMs&&last>=bounds.startMs}
    function turnOverlapsFilter(turn){return eventOverlapsFilter(turn.rangeFirstActivityAt||turn.startedAt,turn.rangeLastActivityAt||turn.endedAt||turn.startedAt)}
-   function fullDateFilter(){return state.dateFilter.start===String(baseDateWindow.startDate||"")&&state.dateFilter.end===String(baseDateWindow.endDate||"")}
-   function filteredDailyBuckets(buckets){return(buckets||[]).filter(bucket=>{const day=String(bucket.date||"");return day>=state.dateFilter.start&&day<=state.dateFilter.end})}
+   function fullDateFilter(){return!baseDateWindow.startDate||!baseDateWindow.endDate||state.dateFilter.start===String(baseDateWindow.startDate||"")&&state.dateFilter.end===String(baseDateWindow.endDate||"")}
+   function filteredDailyBuckets(buckets){if(!baseDateWindow.startDate||!baseDateWindow.endDate)return buckets||[];return(buckets||[]).filter(bucket=>{const day=String(bucket.date||"");return day>=state.dateFilter.start&&day<=state.dateFilter.end})}
    function contextUnknown(){return{snapshotType:"unknown",tokens:null,windowTokens:null,occupancyRate:null,timestamp:null}}
    function filteredTurn(source){
      const selectedUsage=usageFromDaily(source.dailyUsage,state.dateFilter.start,state.dateFilter.end),beforeUsage=(source.dailyUsage||[]).filter(bucket=>String(bucket.date||"")<String(state.dateFilter.start||"")).reduce((sum,bucket)=>addUsage(sum,safeObject(bucket.usage)),emptyUsage());
@@ -3759,7 +3764,7 @@ h1{font-size:clamp(14px,1.5vw,20px)}
    function chooseCalendarDate(value){if(value<String(baseDateWindow.startDate||"")||value>String(baseDateWindow.endDate||""))return;if(datePicker.selecting==="end"&&datePicker.draftStart){if(value<datePicker.draftStart){datePicker.draftStart=value;datePicker.draftEnd="";renderDateCalendar();return}applyDateRange(datePicker.draftStart,value);return}datePicker.draftStart=value;datePicker.draftEnd="";datePicker.selecting="end";renderDateCalendar();setDateFilterStatus("已选开始日期，请选择结束日期。")}
    function resetDateFilter(){const start=String(baseDateWindow.startDate||""),end=String(baseDateWindow.endDate||"");state.dateFilter={start,end};datePicker.cursor=monthKeyForDate(start);datePicker.draftStart=start;datePicker.draftEnd=end;datePicker.selecting="start";renderDateFilterTrigger();setDateFilterStatus("已恢复完整报告范围。");rebuildDateView();closeDateCalendar()}
    function configureDateFilter(){const container=byId("date-filter");if(!dateFilterEnabled){container?.remove();return}const trigger=byId("date-filter-trigger"),panel=byId("date-calendar"),reset=byId("reset-date-filter");if(!trigger||!panel||!reset)return;renderDateFilterTrigger();trigger.addEventListener("click",()=>datePicker.open?closeDateCalendar():openDateCalendar());reset.addEventListener("click",resetDateFilter);panel.addEventListener("click",event=>{event.stopPropagation();const shift=event.target.closest("[data-calendar-shift]"),day=event.target.closest("[data-calendar-date]");if(shift){datePicker.cursor=shiftMonth(datePicker.cursor,Number(shift.dataset.calendarShift)||0);renderDateCalendar();return}if(day&&!day.disabled)chooseCalendarDate(day.dataset.calendarDate)});document.addEventListener("click",event=>{if(datePicker.open&&!byId("date-filter").contains(event.target))closeDateCalendar()});document.addEventListener("keydown",event=>{if(event.key==="Escape"&&datePicker.open){closeDateCalendar();trigger.focus()}});setDateFilterStatus("当前显示完整报告范围。")}
-   function aggregateScope(){const scope=data.metadata.scope||{},window=baseDateWindow;if(scope.type==="ids")return{eyebrow:"指定会话总览",label:`指定会话 · ${formatCount((scope.ids||[]).length)} 个 ID`,totalLabel:"所选会话总 Token",usageNote:"按显式 ID 汇总",empty:"指定 ID 对应的会话没有可用活动。"};const filtered=!fullDateFilter();return{eyebrow:"日期范围总览",label:`${dateFilterLabel()} · ${window.timezone||""}${filtered?" · 已过滤":""}`.replace(/ · $/,""),totalLabel:"区间总 Token",usageNote:filtered?"按当前日期筛选重算":"按 token_count 快照时间计入",empty:"当前日期范围内没有会话活动。"}}
+   function aggregateScope(){const scope=data.metadata.scope||{},window=baseDateWindow;if(scope.type==="ids")return{eyebrow:"指定会话总览",label:`指定会话 · ${formatCount((scope.ids||[]).length)} 个 ID`,totalLabel:"所选会话总 Token",usageNote:"按显式 ID 汇总",empty:"指定 ID 对应的会话没有可用活动。"};if(scope.type==="projects")return{eyebrow:"项目总览",label:scope.label||"当前项目",totalLabel:"项目总 Token",usageNote:"当前项目全部会话",empty:"当前项目没有可用会话。"};const filtered=!fullDateFilter();return{eyebrow:"日期范围总览",label:`${dateFilterLabel()} · ${window.timezone||""}${filtered?" · 已过滤":""}`.replace(/ · $/,""),totalLabel:"区间总 Token",usageNote:filtered?"按当前日期筛选重算":"按 token_count 快照时间计入",empty:"当前日期范围内没有会话活动。"}}
   function activeSession(){return sessions.find(s=>s.metadata.threadId===state.view)||null} function isTotal(){return state.view==="total"}
   function statusText(v){return({complete:"已完成",aborted:"已中止",incomplete:"未闭合"})[v]||v||"未知"}
   function cacheRate(u){return u.input?100*u.cached/u.input:0} function firstPrompt(t){return(t.messages||[]).map(m=>m.text).filter(Boolean).join("\n\n↳ 追加用户消息\n")}
@@ -3894,6 +3899,18 @@ h1{font-size:clamp(14px,1.5vw,20px)}
   function setTab(tab){const contextButton=byId("tab-context");contextButton.disabled=false;contextButton.textContent=isTotal()?"模型消耗概览":"Token 与 Context";if(!["composition","trend","context","table"].includes(tab))tab="context";state.tab=tab;document.querySelectorAll("[data-tab-target]").forEach(button=>{const active=button.dataset.tabTarget===tab;button.classList.toggle("active",active);button.setAttribute("aria-selected",String(active))});document.querySelectorAll("[data-tab-panel]").forEach(panel=>{panel.hidden=panel.dataset.tabPanel!==tab});syncFilterVisibility(tab)}
   function resetFilters(){state.query="";state.toolCategories=new Set(DEFAULT_TOOL_CATEGORIES);state.modelFilters=new Set(baseSessions.map(sessionModel));state.statuses=new Set(["complete","aborted","incomplete"]);state.scale="linear";byId("content-search").value="";const start=String(baseDateWindow.startDate||""),end=String(baseDateWindow.endDate||"");state.dateFilter={start,end};datePicker.cursor=monthKeyForDate(start);datePicker.draftStart=start;datePicker.draftEnd=end;datePicker.selecting="start";renderDateFilterTrigger();setDateFilterStatus("已恢复完整报告范围。");closeDateCalendar();syncToolFilterInputs();document.querySelectorAll("[data-status]").forEach(input=>input.checked=true);byId("linear").classList.add("active");byId("log").classList.remove("active");rebuildDateView()}
   function render(){renderDateFilterTrigger();renderHeader();renderTabModelLabel();syncAnalysisControls();renderWarnings();renderComposition();renderTrend();renderContext();renderTable();setTab(state.tab);byId("footer").textContent=`生成时间：${dateText(data.metadata.generatedAt)} · ${data.generator.name} ${data.generator.version} · ${aggregateScope().label}`}
+  window.__codexApplyReport=function(next){
+    if(!next||typeof next!=="object")return;
+    data.metadata=safeObject(next.metadata);data.summary=safeObject(next.summary);data.summary.finalUsage=safeObject(data.summary.finalUsage);
+    data.summary.finalBreakdown=safeObject(data.summary.finalBreakdown);data.summary.reconciliationDifference=safeObject(data.summary.reconciliationDifference);
+    data.summary.statusCounts=safeObject(data.summary.statusCounts);data.summary.dailyUsage=Array.isArray(data.summary.dailyUsage)?data.summary.dailyUsage:[];
+    data.summary.toolCategories=safeObject(data.summary.toolCategories);data.summary.modelUsage=Array.isArray(data.summary.modelUsage)?data.summary.modelUsage:[];data.summary.planExcludedUsage=safeObject(data.summary.planExcludedUsage);
+    data.warnings=Array.isArray(next.warnings)?next.warnings:[];data.generator=safeObject(next.generator);reportTitle=String(data.metadata.reportTitle||"").trim();
+    baseDateWindow=safeObject(data.metadata.dateWindow);baseSessions=normalizeSessions(next.sessions);baseSummary=data.summary;baseWarnings=data.warnings;
+    data.sessions=baseSessions;messagesIncluded=data.metadata.messagesIncluded!==false;segmentKeys=["cachedInput",...(data.metadata.cacheWriteFieldAvailable?["cacheWriteInput"]:[]),"otherNonCachedInput","ordinaryOutput","reasoningOutput","unclassified"];
+    state.modelFilters=new Set(baseSessions.map(sessionModel));if(!baseDateWindow.startDate||!baseDateWindow.endDate){state.dateFilter={start:"",end:""}}else if(fullDateFilter()){state.dateFilter={start:String(baseDateWindow.startDate),end:String(baseDateWindow.endDate)}}
+    sessions=baseSessions;rebuildDateView();
+  };
   history.replaceState({...(history.state||{}),codexTokenReport:true,view:"total",returnToTotalSessionId:null},"","");
   window.addEventListener("popstate",event=>{const entry=event.state;applyView(entry?.codexTokenReport?entry.view:"total",Boolean(entry?.codexTokenReport&&entry.returnToTotalSessionId))});
    configureDateFilter();
@@ -4250,6 +4267,11 @@ def configure_console_encoding() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     configure_console_encoding()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0].lower() == "serve":
+        from live_server import main as live_server_main
+
+        return live_server_main(raw_argv[1:])
     started_at = monotonic_time.perf_counter()
     args = build_parser().parse_args(argv)
     roots = [path.expanduser().resolve() for path in args.sessions_root] if args.sessions_root else None
