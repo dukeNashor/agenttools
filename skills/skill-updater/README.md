@@ -7,7 +7,7 @@ A small, Windows-only project that assists with comparing and applying two Git-p
 
 Only the names listed in each source's `selectedSkills` allowlist are assisted by this updater. The scheduled job is read-only and does not perform continuous updates. Every Monday at 09:00 it compares installed files with the pinned upstream commits, inventories repository/legacy/system/plugin scopes without modifying them, scans the legacy `~/.codex/skills` root for duplicates and conflicts, checks whether the pinned `skills` CLI has a newer registry release, writes a self-contained HTML report under `reports/`, and opens `latest.html` in the default browser. If the PC is unavailable, Task Scheduler starts it when the signed-in user is next available.
 
-`config.json` is the committed expected state. Each source names an exact 40-character `sourceCommit` and its `skillRoots`; changing either is a normal Git change and therefore changes the `agenttools` release identity. The only local state protocol is the global `~/.agents/.skill-lock.json` written by the `skills` CLI. This project compares the two; it does not create another lock file.
+`config.json` is the committed expected state. Each source names an exact 40-character `sourceCommit` and its `skillRoots`; changing either is a normal Git change and therefore changes the `agenttools` release identity. The only local state protocol is the global `~/.agents/.skill-lock.json`. Because `skills@1.5.23` treats a remote ref as a branch during clone, the updater gives that fixed CLI an exact local Git snapshot and writes CLI-compatible canonical source/ref/path entries only after verifying the copied content. It does not create a second lock file.
 
 ## Deploy
 

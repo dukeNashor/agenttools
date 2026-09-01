@@ -212,9 +212,9 @@ foreach ($source in $config.sources) {
             $entry = if ($lock) { $lock.skills.PSObject.Properties[$name] } else { $null }
             $expectedPath = $skillFile.FullName.Substring($snapshot.Length).TrimStart('\').Replace('\', '/')
             $installedPath = Join-Path $skillsDirectory $name
-            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or [string]$entry.Value.source -ne (Get-SourceIdentifier -Source $source) -or [string]$entry.Value.skillPath -ne $expectedPath)) {
-                $actual = if ($entry) { "source=$($entry.Value.source), path=$($entry.Value.skillPath)" } else { 'no lock entry' }
-                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Lock mismatch'; Summary = "Expected path=$expectedPath; actual $actual"; Files = @() })
+            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or [string]$entry.Value.source -ne (Get-SourceIdentifier -Source $source) -or [string]$entry.Value.skillPath -ne $expectedPath -or [string]$entry.Value.ref -ne [string]$source.sourceCommit)) {
+                $actual = if ($entry) { "source=$($entry.Value.source), ref=$($entry.Value.ref), path=$($entry.Value.skillPath)" } else { 'no lock entry' }
+                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Lock mismatch'; Summary = "Expected ref=$($source.sourceCommit) path=$expectedPath; actual $actual"; Files = @() })
             }
         }
     }

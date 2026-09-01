@@ -702,6 +702,98 @@ function Get-FileManifest {
     return $manifest
 }
 
+function Get-SkillFolderHash {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw "Skill directory does not exist: $Root"
+    }
+
+    $rootPath = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\')
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse | Sort-Object FullName)
+        foreach ($file in $files) {
+            $relativePath = $file.FullName.Substring($rootPath.Length).TrimStart('\').Replace('\', '/')
+            $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($relativePath)
+            if ($pathBytes.Length -gt 0) {
+                $algorithm.TransformBlock($pathBytes, 0, $pathBytes.Length, $pathBytes, 0) | Out-Null
+            }
+            $contentBytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            if ($contentBytes.Length -gt 0) {
+                $algorithm.TransformBlock($contentBytes, 0, $contentBytes.Length, $contentBytes, 0) | Out-Null
+            }
+        }
+        $algorithm.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
+        return (($algorithm.Hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Set-CanonicalLockEntries {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Lock,
+        [Parameter(Mandatory = $true)]$SourcePlan,
+        [Parameter(Mandatory = $true)][string]$AgentsRoot,
+        [Parameter(Mandatory = $true)][string]$LockPath
+    )
+
+    if (-not $Lock) {
+        $Lock = [pscustomobject]@{
+            version = 3
+            skills = [pscustomobject]@{}
+            dismissed = [pscustomobject]@{}
+        }
+    }
+    if (-not $Lock.skills) { throw "Global skill lock has no skills object: $LockPath" }
+
+    $now = [DateTime]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    foreach ($name in $SourcePlan.DesiredNames) {
+        $installedPath = Resolve-PathUnderRoot -Root $AgentsRoot -RelativePath ('skills/' + $name)
+        if (-not (Test-Path -LiteralPath $installedPath -PathType Container)) {
+            throw "$($SourcePlan.Source.label) did not install the expected skill directory: $installedPath"
+        }
+        $installedItem = Get-Item -LiteralPath $installedPath
+        if (($installedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or [bool]$installedItem.LinkType) {
+            throw "Refusing to record a symlink/Junction/reparse point as an installed skill: $installedPath"
+        }
+
+        $upstreamPath = $SourcePlan.SkillFiles |
+            Where-Object { $_.Directory.Name -eq $name } |
+            Select-Object -ExpandProperty Directory -First 1
+        if (-not $upstreamPath) { throw "Pinned source did not contain the expected skill: $name" }
+        $comparison = Compare-DirectoryContent -Upstream $upstreamPath.FullName -Installed $installedPath
+        if (-not $comparison.Equal) {
+            throw "$($SourcePlan.Source.label) installed content differs from pinned sourceCommit for $name."
+        }
+
+        $oldProperty = $Lock.skills.PSObject.Properties[$name]
+        $oldEntry = if ($oldProperty) { $oldProperty.Value } else { $null }
+        $installedAt = if ($oldEntry -and $oldEntry.PSObject.Properties['installedAt']) {
+            [string]$oldEntry.installedAt
+        }
+        else { $now }
+        $entry = [pscustomobject][ordered]@{
+            source = Get-SourceIdentifier -Source $SourcePlan.Source
+            sourceType = 'github'
+            sourceUrl = Get-SourceCloneUrl -Source $SourcePlan.Source
+            ref = [string]$SourcePlan.Source.sourceCommit
+            skillPath = [string]$SourcePlan.SkillPaths[$name]
+            skillFolderHash = Get-SkillFolderHash -Root $installedPath
+            installedAt = $installedAt
+            updatedAt = $now
+        }
+        $Lock.skills.PSObject.Properties.Remove($name)
+        $Lock.skills | Add-Member -MemberType NoteProperty -Name $name -Value $entry
+    }
+
+    $json = $Lock | ConvertTo-Json -Depth 20
+    [System.IO.File]::WriteAllText($LockPath, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    return $Lock
+}
+
 function Compare-DirectoryContent {
     param(
         [Parameter(Mandatory = $true)][string]$Upstream,

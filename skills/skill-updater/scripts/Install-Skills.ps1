@@ -76,7 +76,7 @@ function Test-SourceOwnedLockEntry {
 
 function Add-Finding {
     param(
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Findings,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Findings,
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Item,
         [Parameter(Mandatory = $true)][string]$Status,
@@ -113,10 +113,11 @@ function Get-InstallationFindings {
                 Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Unsafe path' -Summary "Detected $linkKind at the selected user skill path; tell the user and leave it untouched."
                 continue
             }
-            if (-not $entry -or [string]$entry.source -ne $sourceIdentifier -or [string]$entry.skillPath -ne [string]$plan.SkillPaths[$name]) {
+            if (-not $entry -or [string]$entry.source -ne $sourceIdentifier -or [string]$entry.skillPath -ne [string]$plan.SkillPaths[$name] -or [string]$entry.ref -ne [string]$plan.Source.sourceCommit) {
                 $actualSource = if ($entry) { [string]$entry.source } else { '<no lock entry>' }
                 $actualPath = if ($entry) { [string]$entry.skillPath } else { '<no lock entry>' }
-                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Lock mismatch' -Summary "Expected source=$sourceIdentifier path=$($plan.SkillPaths[$name]); actual source=$actualSource path=$actualPath."
+                $actualRef = if ($entry) { [string]$entry.ref } else { '<no lock entry>' }
+                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Lock mismatch' -Summary "Expected source=$sourceIdentifier ref=$($plan.Source.sourceCommit) path=$($plan.SkillPaths[$name]); actual source=$actualSource ref=$actualRef path=$actualPath."
                 continue
             }
 
@@ -288,7 +289,10 @@ try {
         foreach ($skillRoot in @($source.skillRoots)) {
             $skillNames = @($plan.SkillNamesByRoot[[string]$skillRoot])
             if ($skillNames.Count -eq 0) { continue }
-            $installSpec = Get-SourceInstallSpec -Source $source -SkillRoot ([string]$skillRoot)
+            # skills@1.5.23 passes a remote ref to git clone as --branch, which
+            # cannot resolve an arbitrary commit SHA. Install from the exact
+            # verified local snapshot instead; the lock is normalized below.
+            $installSpec = Resolve-PathUnderRoot -Root $plan.Snapshot -RelativePath ([string]$skillRoot)
             $lastError = $null
             for ($attempt = 1; $attempt -le 3; $attempt++) {
                 try {
@@ -322,8 +326,7 @@ try {
             Write-Host "Synced shared file: $destination"
         }
 
-        $updatedLock = Get-LockObject -LockPath $lockPath
-        if (-not $updatedLock) { throw "Global skill lock does not exist after installation: $lockPath" }
+        $updatedLock = Set-CanonicalLockEntries -Lock (Get-LockObject -LockPath $lockPath) -SourcePlan $plan -AgentsRoot $agentsRoot -LockPath $lockPath
         $sourceIdentifier = Get-SourceIdentifier -Source $source
         $tracked = @($updatedLock.skills.PSObject.Properties | Where-Object { $_.Value.source -eq $sourceIdentifier })
         if ($Prune) {
@@ -337,8 +340,8 @@ try {
 
         foreach ($name in $plan.DesiredNames) {
             $entry = $updatedLock.skills.PSObject.Properties[$name]
-            if (-not $entry -or [string]$entry.Value.source -ne $sourceIdentifier -or [string]$entry.Value.skillPath -ne [string]$plan.SkillPaths[$name]) {
-                throw "$($source.label) did not produce the expected .skill-lock.json entry for $name."
+            if (-not $entry -or [string]$entry.Value.source -ne $sourceIdentifier -or [string]$entry.Value.skillPath -ne [string]$plan.SkillPaths[$name] -or [string]$entry.Value.ref -ne [string]$source.sourceCommit) {
+                throw "$($source.label) did not produce the expected pinned .skill-lock.json entry for $name."
             }
         }
         $remaining = @($updatedLock.skills.PSObject.Properties | Where-Object { $_.Value.source -eq $sourceIdentifier })
