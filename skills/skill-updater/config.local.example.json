@@ -1,5 +1,5 @@
 {
-  "gitBypassProxy": false,
+  "gitProxyMode": "windows-user-proxy",
   "tooling": {
     "runner": "user-npx",
     "allowedRegistries": [

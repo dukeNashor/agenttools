@@ -31,7 +31,7 @@ The committed runner policy is `codex-bundled-pnpm`. A machine-local `config.loc
 
 ## Machine-local settings
 
-Keep portable policy in `config.json`. For a PC that needs a trusted enterprise registry, must use its Git proxy, or must explicitly use user-provided `npx`, copy `config.local.example.json` to `config.local.json` and edit only the required values. The local file is ignored by Git and may override only `gitBypassProxy`, `tooling.runner`, and `tooling.allowedRegistries`; proxy credentials and certificate paths remain in the machine's package-manager configuration.
+Keep portable policy in `config.json`. For a PC that needs a trusted enterprise registry, a Windows user proxy, or explicitly user-provided `npx`, copy `config.local.example.json` to `config.local.json` and edit only the required values. The local file is ignored by Git and may override only `gitProxyMode`, `tooling.runner`, and `tooling.allowedRegistries`; proxy credentials and certificate paths remain in machine configuration. Supported Git proxy modes are `git-config` (default), `windows-user-proxy` (the current user's fixed Windows Internet Settings proxy), and `direct` (explicitly disables Git proxies).
 
 Run `scripts/Test-Project.ps1` after creating or editing the local file. An unknown registry, non-HTTPS registry, disabled SSL verification, unsafe Git rewrite, unsupported local key, or insufficient Node.js version blocks installation.
 

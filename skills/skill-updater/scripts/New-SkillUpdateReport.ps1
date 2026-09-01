@@ -32,6 +32,8 @@ $rows = New-Object System.Collections.Generic.List[object]
 $sourceSummaries = New-Object System.Collections.Generic.List[object]
 $skillNameOwners = @{}
 $legacyNames = @{}
+$gitConnectivityRow = $null
+$gitProbeError = $null
 
 foreach ($scope in @(Get-ReadonlySkillScopeInventory -ProjectRoot $repositoryRoot -AgentsRoot $agentsRoot)) {
     $scopeSummary = if (-not $scope.Exists) { 'Not present on this Windows node' } else { "$($scope.SkillCount) skill directories found; read-only inventory" }
@@ -41,6 +43,47 @@ foreach ($scope in @(Get-ReadonlySkillScopeInventory -ProjectRoot $repositoryRoo
         Item = $scope.Path
         Status = 'Read-only inventory'
         Summary = $scopeSummary
+        Files = @()
+    })
+}
+
+try {
+    $gitTransport = Get-ManagedGitTransport -Config $config
+    $rows.Add([pscustomobject]@{
+        Source = 'Git transport'
+        Item = [string]$config.gitProxyMode
+        Status = 'Current'
+        Summary = $gitTransport.Description
+        Files = @()
+    })
+    try {
+        Test-ManagedGitHubConnection -Config $config -Source @($config.sources)[0] | Out-Null
+        $rows.Add([pscustomobject]@{
+            Source = 'Git transport'
+            Item = 'GitHub connectivity'
+            Status = 'Current'
+            Summary = 'Explicit GitHub connectivity probe succeeded.'
+            Files = @()
+        })
+    }
+    catch {
+        $gitProbeError = $_.Exception.Message
+        $gitConnectivityRow = [pscustomobject]@{
+            Source = 'Git transport'
+            Item = 'GitHub connectivity'
+            Status = 'Probe failed'
+            Summary = $gitProbeError
+            Files = @()
+        }
+        $rows.Add($gitConnectivityRow)
+    }
+}
+catch {
+    $rows.Add([pscustomobject]@{
+        Source = 'Git transport'
+        Item = [string]$config.gitProxyMode
+        Status = 'Configuration blocked'
+        Summary = $_.Exception.Message
         Files = @()
     })
 }
@@ -182,6 +225,17 @@ foreach ($source in $config.sources) {
     }
     finally {
         if ($snapshot -and (Test-Path -LiteralPath $snapshot)) { Remove-Item -LiteralPath $snapshot -Recurse -Force }
+    }
+}
+
+if ($gitProbeError -and $gitConnectivityRow) {
+    $verifiedSourceCount = @($sourceSummaries | Where-Object { $_.State -eq 'Pinned' }).Count
+    if ($verifiedSourceCount -eq @($config.sources).Count) {
+        $gitConnectivityRow.Status = 'Transient failure'
+        $gitConnectivityRow.Summary = "Connectivity probe failed after retry, but all configured sources were verified successfully: $gitProbeError"
+    }
+    else {
+        $gitConnectivityRow.Status = 'Failed'
     }
 }
 

@@ -22,6 +22,7 @@ if ($failureMessages.Count -gt 0) {
 $config = Get-SkillUpdaterConfig
 if ([int]$config.version -ne 7) { throw 'Unsupported config version.' }
 if ([string]$config.agentsRoot -ne '~/.agents') { throw 'agentsRoot must remain the canonical ~/.agents user skill root.' }
+if ([string]$config.gitProxyMode -notin @('direct', 'git-config', 'windows-user-proxy')) { throw 'gitProxyMode must be direct, git-config, or windows-user-proxy.' }
 if (@($config.sources).Count -ne 2) { throw 'Expected exactly two tracked sources.' }
 if ([int]$config.reportRetention -lt 1) { throw 'Report retention must be positive.' }
 
@@ -98,4 +99,5 @@ Write-Host "Skill runner: $($tooling.Runner.DisplayName) via $($tooling.Runner.M
 Write-Host "Runner policy: $($tooling.RunnerMode)"
 Write-Host "Node.js: $($tooling.NodeVersion); registry: $($tooling.Registry)"
 Write-Host "Git: $($git.Git)"
+Write-Host "Git transport: $($git.Transport.Description)"
 Write-Host 'Project validation passed.'

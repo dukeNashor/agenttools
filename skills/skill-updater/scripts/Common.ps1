@@ -9,18 +9,23 @@ function Get-SkillUpdaterConfig {
     $path = Join-Path (Get-SkillUpdaterRoot) 'config.json'
     $config = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     $localPath = Join-Path (Get-SkillUpdaterRoot) 'config.local.json'
-    if (-not (Test-Path -LiteralPath $localPath)) { return $config }
+    if (-not (Test-Path -LiteralPath $localPath)) {
+        if ([string]$config.gitProxyMode -notin @('direct', 'git-config', 'windows-user-proxy')) {
+            throw "Unsupported gitProxyMode: $($config.gitProxyMode)"
+        }
+        return $config
+    }
 
     $local = Get-Content -LiteralPath $localPath -Raw | ConvertFrom-Json
-    $allowedTopLevel = @('gitBypassProxy', 'tooling')
+    $allowedTopLevel = @('gitProxyMode', 'tooling')
     foreach ($property in $local.PSObject.Properties) {
         if ($allowedTopLevel -notcontains $property.Name) {
             throw "Unsupported machine-local setting: $($property.Name)"
         }
     }
 
-    if ($local.PSObject.Properties['gitBypassProxy']) {
-        $config.gitBypassProxy = [bool]$local.gitBypassProxy
+    if ($local.PSObject.Properties['gitProxyMode']) {
+        $config.gitProxyMode = [string]$local.gitProxyMode
     }
     if ($local.PSObject.Properties['tooling']) {
         foreach ($property in $local.tooling.PSObject.Properties) {
@@ -37,6 +42,9 @@ function Get-SkillUpdaterConfig {
         if ($local.tooling.PSObject.Properties['allowedRegistries']) {
             $config.tooling.allowedRegistries = @($local.tooling.allowedRegistries)
         }
+    }
+    if ([string]$config.gitProxyMode -notin @('direct', 'git-config', 'windows-user-proxy')) {
+        throw "Unsupported gitProxyMode: $($config.gitProxyMode)"
     }
     return $config
 }
@@ -338,21 +346,35 @@ function Invoke-SkillCli {
 
     $config = Get-SkillUpdaterConfig
     $diagnostics = Assert-ToolingEnvironment -Config $config
-    Assert-GitEnvironment -Config $config
+    $gitDiagnostics = Assert-GitEnvironment -Config $config
+    $transport = $gitDiagnostics.Transport
     $runner = $diagnostics.Runner
     $arguments = @($runner.Prefix) + $CliArguments
     Write-Host ('=> ' + $runner.DisplayName + ' ' + ($CliArguments -join ' '))
 
     $originalPath = $env:PATH
     $gitWrapperRoot = $null
+    $proxyEnvironmentNames = @('AGENTTOOLS_GIT_HTTP_PROXY', 'AGENTTOOLS_GIT_HTTPS_PROXY')
+    $proxyEnvironmentWasSet = @{}
+    $proxyEnvironmentValues = @{}
+    foreach ($name in $proxyEnvironmentNames) {
+        $proxyEnvironmentWasSet[$name] = Test-Path -LiteralPath "Env:$name"
+        if ($proxyEnvironmentWasSet[$name]) {
+            $proxyEnvironmentValues[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        }
+    }
 
     try {
-        if ($config.gitBypassProxy) {
+        if ($transport.RequiresWrapper) {
             $realGit = Resolve-GitExecutable
             $gitWrapperRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('agenttools-git-wrapper-' + [guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $gitWrapperRoot | Out-Null
             $wrapperPath = Join-Path $gitWrapperRoot 'git.cmd'
-            $wrapper = "@echo off`r`n`"$realGit`" -c http.proxy= -c https.proxy= %*`r`n"
+            if ($transport.Mode -eq 'windows-user-proxy') {
+                [Environment]::SetEnvironmentVariable('AGENTTOOLS_GIT_HTTP_PROXY', [string]$transport.HttpProxy, 'Process')
+                [Environment]::SetEnvironmentVariable('AGENTTOOLS_GIT_HTTPS_PROXY', [string]$transport.HttpsProxy, 'Process')
+            }
+            $wrapper = Get-GitWrapperContent -Transport $transport -RealGit $realGit
             [System.IO.File]::WriteAllText($wrapperPath, $wrapper, [System.Text.Encoding]::ASCII)
             $env:PATH = $gitWrapperRoot + ';' + $env:PATH
         }
@@ -363,6 +385,14 @@ function Invoke-SkillCli {
     }
     finally {
         $env:PATH = $originalPath
+        foreach ($name in $proxyEnvironmentNames) {
+            if ($proxyEnvironmentWasSet[$name]) {
+                [Environment]::SetEnvironmentVariable($name, $proxyEnvironmentValues[$name], 'Process')
+            }
+            else {
+                [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            }
+        }
         if ($gitWrapperRoot -and (Test-Path -LiteralPath $gitWrapperRoot)) {
             Remove-Item -LiteralPath $gitWrapperRoot -Recurse -Force
         }
@@ -386,15 +416,131 @@ function Resolve-GitExecutable {
     throw 'Git was not found on PATH or in the Codex bundled runtime.'
 }
 
+function ConvertTo-GitProxyValues {
+    param([Parameter(Mandatory = $true)][string]$ProxyServer)
+
+    if ([string]::IsNullOrWhiteSpace($ProxyServer)) {
+        throw 'Windows Internet Settings proxy is empty.'
+    }
+    if ($ProxyServer.Contains("`r") -or $ProxyServer.Contains("`n")) {
+        throw 'Windows Internet Settings proxy contains an invalid line break.'
+    }
+
+    $defaultProxy = $null
+    $schemeProxies = @{}
+    foreach ($entry in @($ProxyServer -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $parts = $entry -split '=', 2
+        if ($parts.Count -eq 2) {
+            $scheme = $parts[0].Trim().ToLowerInvariant()
+            $value = $parts[1].Trim()
+            if ($scheme -in @('http', 'https')) {
+                $schemeProxies[$scheme] = $value
+            }
+            continue
+        }
+        if (-not $defaultProxy) { $defaultProxy = $entry }
+    }
+
+    $httpProxy = if ($schemeProxies.ContainsKey('http')) { $schemeProxies['http'] } else { $defaultProxy }
+    $httpsProxy = if ($schemeProxies.ContainsKey('https')) { $schemeProxies['https'] } else { $defaultProxy }
+    if (-not $httpProxy) { $httpProxy = $httpsProxy }
+    if (-not $httpsProxy) { $httpsProxy = $httpProxy }
+    if ([string]::IsNullOrWhiteSpace($httpProxy) -or [string]::IsNullOrWhiteSpace($httpsProxy)) {
+        throw 'Windows Internet Settings proxy has no usable HTTP or HTTPS proxy entry.'
+    }
+
+    foreach ($value in @($httpProxy, $httpsProxy)) {
+        $uriText = if ($value -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $value } else { 'http://' + $value }
+        $uri = $null
+        if (-not [uri]::TryCreate($uriText, [System.UriKind]::Absolute, [ref]$uri) -or -not $uri.Host) {
+            throw 'Windows Internet Settings proxy is not a valid proxy endpoint.'
+        }
+    }
+
+    return [pscustomobject]@{
+        HttpProxy = [string]$httpProxy
+        HttpsProxy = [string]$httpsProxy
+    }
+}
+
+function Get-ManagedGitTransport {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [AllowNull()]$WindowsProxySettings
+    )
+
+    $mode = [string]$Config.gitProxyMode
+    switch ($mode) {
+        'direct' {
+            return [pscustomobject]@{
+                Mode = $mode
+                Description = 'Direct Git connection (proxy explicitly disabled)'
+                Arguments = @('-c', 'http.proxy=', '-c', 'https.proxy=')
+                RequiresWrapper = $true
+                HttpProxy = $null
+                HttpsProxy = $null
+            }
+        }
+        'git-config' {
+            return [pscustomobject]@{
+                Mode = $mode
+                Description = 'Git configuration and process environment'
+                Arguments = @()
+                RequiresWrapper = $false
+                HttpProxy = $null
+                HttpsProxy = $null
+            }
+        }
+        'windows-user-proxy' {
+            $settings = if ($PSBoundParameters.ContainsKey('WindowsProxySettings')) {
+                $WindowsProxySettings
+            }
+            else {
+                Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+            }
+            if (-not $settings -or [int]$settings.ProxyEnable -ne 1) {
+                throw 'Windows Internet Settings proxy is not enabled for the current user.'
+            }
+            $proxies = ConvertTo-GitProxyValues -ProxyServer ([string]$settings.ProxyServer)
+            return [pscustomobject]@{
+                Mode = $mode
+                Description = 'Windows Internet Settings proxy for the current user'
+                Arguments = @(
+                    '-c', "http.proxy=$($proxies.HttpProxy)",
+                    '-c', "https.proxy=$($proxies.HttpsProxy)",
+                    '-c', 'http.noProxy='
+                )
+                RequiresWrapper = $true
+                HttpProxy = $proxies.HttpProxy
+                HttpsProxy = $proxies.HttpsProxy
+            }
+        }
+        default {
+            throw "Unsupported gitProxyMode: $mode"
+        }
+    }
+}
+
+function Get-GitWrapperContent {
+    param(
+        [Parameter(Mandatory = $true)]$Transport,
+        [Parameter(Mandatory = $true)][string]$RealGit
+    )
+
+    if ($Transport.Mode -eq 'windows-user-proxy') {
+        return "@echo off`r`n`"$RealGit`" -c `"http.proxy=%AGENTTOOLS_GIT_HTTP_PROXY%`" -c `"https.proxy=%AGENTTOOLS_GIT_HTTPS_PROXY%`" -c `"http.noProxy=`" %*`r`n"
+    }
+    return "@echo off`r`n`"$RealGit`" -c `"http.proxy=`" -c `"https.proxy=`" %*`r`n"
+}
+
 function Get-GitSafetyDiagnostics {
     param([Parameter(Mandatory = $true)]$Config)
 
     $errors = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
+    $transport = Get-ManagedGitTransport -Config $Config
     $git = Resolve-GitExecutable
-    $arguments = @()
-    if ($Config.gitBypassProxy) { $arguments += @('-c', 'http.proxy=', '-c', 'https.proxy=') }
-    $arguments += @('config', '--get-regexp', '^(url\..*\.insteadof|http(\..*)?\.(sslverify|extraheader))$')
+    $arguments = @($transport.Arguments) + @('config', '--get-regexp', '^(url\..*\.insteadof|http(\..*)?\.(sslverify|extraheader))$')
     $entries = & $git @arguments 2>$null
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
         $errors.Add('Git safety configuration could not be inspected.')
@@ -428,7 +574,7 @@ function Get-GitSafetyDiagnostics {
         if (Test-Path -LiteralPath "Env:$name") { $warnings.Add("Process environment setting is present: $name") }
     }
 
-    return [pscustomobject]@{ Errors = @($errors); Warnings = @($warnings); Git = $git }
+    return [pscustomobject]@{ Errors = @($errors); Warnings = @($warnings); Git = $git; Transport = $transport }
 }
 
 function Assert-GitEnvironment {
@@ -448,17 +594,42 @@ function Invoke-ManagedGit {
         [Parameter(Mandatory = $true)][string[]]$GitArguments
     )
 
-    $arguments = @()
-    if ($Config.gitBypassProxy) {
-        $arguments += @('-c', 'http.proxy=', '-c', 'https.proxy=')
-    }
-    $arguments += $GitArguments
+    $transport = Get-ManagedGitTransport -Config $Config
+    $arguments = @($transport.Arguments) + $GitArguments
 
     $output = & (Resolve-GitExecutable) @arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
     }
     return (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
+}
+
+function Test-ManagedGitHubConnection {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$Source
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        try {
+            $output = Invoke-ManagedGit -Config $Config -GitArguments @(
+                '-c', 'http.connectTimeout=10',
+                '-c', 'http.lowSpeedLimit=1',
+                '-c', 'http.lowSpeedTime=10',
+                'ls-remote', '--quiet', (Get-SourceCloneUrl -Source $Source), 'HEAD'
+            )
+            if ([string]::IsNullOrWhiteSpace($output)) {
+                throw 'GitHub connectivity probe returned no HEAD result.'
+            }
+            return $true
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt 2) { Start-Sleep -Seconds 1 }
+        }
+    }
+    throw $lastError
 }
 
 function Get-SourceIdentifier {

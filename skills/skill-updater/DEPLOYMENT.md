@@ -15,7 +15,7 @@ For a machine-specific registry or Git proxy policy, copy `config.local.example.
 
 Run `scripts/Deploy.ps1` from Windows PowerShell. Add `-PurgeLegacy` when the reviewed run should also remove recognized skill directories from the deprecated `~/.codex/skills` root. Unknown directories are retained. The scripts resolve the clone path and current user at runtime, so copying a task definition from another PC is invalid. Register the task for the current interactive user with limited privileges; it should start when available and should not wake the PC.
 
-If Git must use the machine proxy, set `gitBypassProxy` to `false` in `config.local.json`. Keep proxy behavior command-scoped; do not rewrite global Git configuration as part of deployment.
+If Git must use the current user's Windows proxy, set `gitProxyMode` to `windows-user-proxy` in `config.local.json`. The updater reads the fixed proxy from Windows Internet Settings and passes it explicitly to each Git invocation, including Git processes started by the skills CLI. PAC-only settings and disabled proxies fail fast. Keep proxy behavior command-scoped; do not rewrite global Git configuration as part of deployment.
 
 ## Validate
 

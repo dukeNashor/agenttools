@@ -1,7 +1,7 @@
 {
   "version": 7,
   "agentsRoot": "~/.agents",
-  "gitBypassProxy": true,
+  "gitProxyMode": "git-config",
   "reportRetention": 12,
   "tooling": {
     "skillsCli": "skills@1.5.23",
