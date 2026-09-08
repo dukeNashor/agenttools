@@ -57,14 +57,17 @@ try {
         Files = @()
     })
     try {
-        Test-ManagedGitHubConnection -Config $config -Source @($config.sources)[0] | Out-Null
-        $rows.Add([pscustomobject]@{
-            Source = 'Git transport'
-            Item = 'GitHub connectivity'
-            Status = 'Current'
-            Summary = 'Explicit GitHub connectivity probe succeeded.'
-            Files = @()
-        })
+        $githubSources = @($config.sources | Where-Object { (Get-SourceType -Source $_) -eq 'github' })
+        if ($githubSources.Count -gt 0) {
+            Test-ManagedGitHubConnection -Config $config -Source $githubSources[0] | Out-Null
+            $rows.Add([pscustomobject]@{
+                Source = 'Git transport'
+                Item = 'GitHub connectivity'
+                Status = 'Current'
+                Summary = 'Explicit GitHub connectivity probe succeeded.'
+                Files = @()
+            })
+        }
     }
     catch {
         $gitProbeError = $_.Exception.Message
@@ -212,19 +215,19 @@ foreach ($source in $config.sources) {
             $entry = if ($lock) { $lock.skills.PSObject.Properties[$name] } else { $null }
             $expectedPath = $skillFile.FullName.Substring($snapshot.Length).TrimStart('\').Replace('\', '/')
             $installedPath = Join-Path $skillsDirectory $name
-            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or [string]$entry.Value.source -ne (Get-SourceIdentifier -Source $source) -or [string]$entry.Value.skillPath -ne $expectedPath -or [string]$entry.Value.ref -ne [string]$source.sourceCommit)) {
-                $actual = if ($entry) { "source=$($entry.Value.source), ref=$($entry.Value.ref), path=$($entry.Value.skillPath)" } else { 'no lock entry' }
+            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or -not (Test-CanonicalLockEntry -Entry $entry.Value -Source $source -SkillPath $expectedPath))) {
+                $actual = Format-SkillLockIdentity -Entry $(if ($entry) { $entry.Value } else { $null })
                 $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Lock mismatch'; Summary = "Expected ref=$($source.sourceCommit) path=$expectedPath; actual $actual"; Files = @() })
             }
         }
     }
     catch {
         $sourceSummaries.Add([pscustomobject]@{ Label = $source.label; Commit = '-'; Roots = '-'; State = 'Unavailable' })
-        $metadataFailure = $_.Exception.Message -match 'SKILL\.md frontmatter'
+        $metadataFailure = $_.Exception.Message -match 'SKILL\.md frontmatter|UTF-8 without BOM|not valid UTF-8'
         $rows.Add([pscustomobject]@{ Source = $source.label; Item = 'source'; Status = if ($metadataFailure) { 'Invalid metadata' } else { 'Source unavailable' }; Summary = $_.Exception.Message; Files = @() })
     }
     finally {
-        if ($snapshot -and (Test-Path -LiteralPath $snapshot)) { Remove-Item -LiteralPath $snapshot -Recurse -Force }
+        if ($snapshot) { Remove-UpdaterTemporaryDirectory -Path $snapshot }
     }
 }
 

@@ -113,11 +113,9 @@ function Get-InstallationFindings {
                 Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Unsafe path' -Summary "Detected $linkKind at the selected user skill path; tell the user and leave it untouched."
                 continue
             }
-            if (-not $entry -or [string]$entry.source -ne $sourceIdentifier -or [string]$entry.skillPath -ne [string]$plan.SkillPaths[$name] -or [string]$entry.ref -ne [string]$plan.Source.sourceCommit) {
-                $actualSource = if ($entry) { [string]$entry.source } else { '<no lock entry>' }
-                $actualPath = if ($entry) { [string]$entry.skillPath } else { '<no lock entry>' }
-                $actualRef = if ($entry) { [string]$entry.ref } else { '<no lock entry>' }
-                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Lock mismatch' -Summary "Expected source=$sourceIdentifier ref=$($plan.Source.sourceCommit) path=$($plan.SkillPaths[$name]); actual source=$actualSource ref=$actualRef path=$actualPath."
+            if (-not (Test-CanonicalLockEntry -Entry $entry -Source $plan.Source -SkillPath ([string]$plan.SkillPaths[$name]))) {
+                $actual = Format-SkillLockIdentity -Entry $entry
+                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Lock mismatch' -Summary "Expected source=$sourceIdentifier ref=$($plan.Source.sourceCommit) path=$($plan.SkillPaths[$name]); actual $actual."
                 continue
             }
 
@@ -286,7 +284,11 @@ try {
 
     foreach ($plan in $sourcePlans) {
         $source = $plan.Source
+        if ((Get-SourceType -Source $source) -eq 'local') {
+            Copy-LocalSourceSkills -SourcePlan $plan -AgentsRoot $agentsRoot -Overwrite:$Overwrite
+        }
         foreach ($skillRoot in @($source.skillRoots)) {
+            if ((Get-SourceType -Source $source) -eq 'local') { continue }
             $skillNames = @($plan.SkillNamesByRoot[[string]$skillRoot])
             if ($skillNames.Count -eq 0) { continue }
             # skills@1.5.23 passes a remote ref to git clone as --branch, which
@@ -340,7 +342,7 @@ try {
 
         foreach ($name in $plan.DesiredNames) {
             $entry = $updatedLock.skills.PSObject.Properties[$name]
-            if (-not $entry -or [string]$entry.Value.source -ne $sourceIdentifier -or [string]$entry.Value.skillPath -ne [string]$plan.SkillPaths[$name] -or [string]$entry.Value.ref -ne [string]$source.sourceCommit) {
+            if (-not $entry -or -not (Test-CanonicalLockEntry -Entry $entry.Value -Source $source -SkillPath ([string]$plan.SkillPaths[$name]))) {
                 throw "$($source.label) did not produce the expected pinned .skill-lock.json entry for $name."
             }
         }
@@ -365,7 +367,7 @@ try {
 }
 finally {
     foreach ($snapshotPath in $snapshotPaths) {
-        if (Test-Path -LiteralPath $snapshotPath) { Remove-Item -LiteralPath $snapshotPath -Recurse -Force }
+        Remove-UpdaterTemporaryDirectory -Path $snapshotPath
     }
 }
 

@@ -10,15 +10,17 @@ Use this skill only when the user explicitly asks to inspect, preflight, apply, 
 
 Before any write, read the repository's `config.json`, optional `config.local.json`, and the target `~/.agents/.skill-lock.json`. Report the expected layout from `config.json` and the actual layout from the lock and filesystem, including:
 
-- each source's exact `sourceCommit` and `skillRoots`;
+- each source's type, exact `sourceCommit`, and `skillRoots`; resolve local repository paths from `config.local.json`'s `localRepositories` mapping;
 - missing, different, extra, and lock-mismatch items;
 - the selected runner (`codex-bundled-pnpm` or explicitly overridden `user-npx`), its resolved executable, Node.js, registry, proxy, and SSL diagnostics;
-- the target `agentsRoot` and the fact that `.skill-lock.json` is the only local state protocol; for pinned arbitrary commits, the updater uses the fixed `skills` CLI to copy from its exact verified local snapshot and writes CLI-compatible lock entries only after content verification;
+- the target `agentsRoot` and the fact that `.skill-lock.json` is the only local state protocol; GitHub sources use the fixed `skills` CLI and local sources use native byte-preserving copy from exact verified snapshots; both write CLI-compatible lock entries only after content verification;
 - read-only inventory for repository, legacy Codex, system, and plugin scopes; only the configured user root may be changed.
 
 Use the deterministic PowerShell scripts in this folder. Generate the read-only report or run `Install-Skills.ps1 -PreflightOnly` first. Ask the user to confirm before running `Install-Skills.ps1 -Apply`; require a separate explicit choice of `-Overwrite` for existing different content or lock metadata, `-Prune` for source-owned entries outside the configured layout, and `-PurgeLegacy` for recognized skill directories under `~/.codex/skills`. Before any purge, tell the user the exact candidate paths, protected paths, retained Unknown directories, and that no backup is created. Never infer those choices from context.
 
 The repository commit is the release identity. Do not invent a second local lock or silently replace the configured runner, source commit, skill layout, registry, or proxy policy. The pinned `skills` CLI is not given a raw commit as a branch; its copy step receives the exact local Git snapshot, and the updater records the canonical remote source/ref/path in the one global lock file after verification.
+
+Local Git sources use independent snapshots of the configured commit and native copy. Before any copy, require `SKILL.md` and optional `agents/openai.yaml` to be valid UTF-8 without BOM; reject the source with the exact file path when this invariant fails. Copy valid source bytes unchanged and apply the same metadata, overwrite, content, and lock checks. Keep machine paths in `config.local.json`; local lock entries use the resolved repository path and `sourceType: "local"`. A newer HEAD or dirty worktree does not change the pin. If source-relative document links break after installation, repair them in the source and pin the resulting commit before applying; never transform the installed copy. For an explicitly requested command-scoped Git proxy override, use `AGENTTOOLS_GIT_PROXY_MODE` in the child process; persistent settings remain unchanged.
 
 Trust boundary: before this updater successfully processes a source, treat local skill repositories and skill content as untrusted and inspect them without executing their code. A source becomes updater-trusted only after its pinned commit, selected skill metadata, installed content, shared files, and `.skill-lock.json` entries all verify successfully. Other scopes and unselected local skills remain read-only and untrusted.
 

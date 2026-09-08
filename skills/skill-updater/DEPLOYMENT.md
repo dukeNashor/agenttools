@@ -5,7 +5,7 @@ Use this procedure when a user asks to deploy, redeploy, move, or repair `skills
 ## Inspect
 
 1. Resolve the current checkout path; every scheduled-task path must come from it.
-2. Inspect `config.json`, optional `config.local.json`, `~/.agents/.skill-lock.json`, `~/.agents/skills/`, `~/.codex/skills/`, and the exact task named in `config.json`.
+2. Inspect `config.json`, optional `config.local.json`, `~/.agents/.skill-lock.json`, `~/.agents/skills/`, `~/.codex/skills/`, and the exact task named in `config.json`. Resolve every configured local source through `config.local.json`'s `localRepositories` mapping; verify its pinned commit exists locally.
 3. Run `scripts/Test-Project.ps1`, then `scripts/Install-Skills.ps1 -PreflightOnly`. They must accept the effective registry, Node.js version, explicitly selected runner, package-manager settings, Git configuration, pinned source commits, upstream source paths, shared destinations, and skill names before any skill is changed. If the selected runner is unavailable, explain the missing prerequisite before installing system software.
 4. Tell the user that `-Apply` assists only the configured user-level subset without a backup, `-Overwrite` is separately required for different local content or lock metadata, `-Prune` is separately required to remove source-owned entries outside the configured allowlist, and `-PurgeLegacy` is separately required to remove recognized skill directories containing `SKILL.md` from the deprecated `~/.codex/skills` root. Unknown directories are retained. Before purge, show exact candidates, retained Unknown directories, and protected paths; report any symlink/Junction and leave it untouched. Repository, admin/system, legacy, and plugin scopes are read-only inventory surfaces. The report and task-only repair paths do not change skills.
 
@@ -21,9 +21,10 @@ If Git must use the current user's Windows proxy, set `gitProxyMode` to `windows
 
 Deployment is complete only when every item below is true:
 
-- the global lock contains entries from both configured `repositorySlug` values;
-- every selected skill under the configured `skillRoots` exists under `~/.agents/skills/`, has valid `SKILL.md` frontmatter (`name` and non-empty `description`), and same-source entries outside the selected layout remain untouched unless `-Prune` was explicitly requested;
+- the global lock contains entries for every configured source: GitHub `repositorySlug` identities and resolved local repository paths with `sourceType: "local"`;
+- every selected skill under the configured `skillRoots` exists under `~/.agents/skills/`, has valid `SKILL.md` frontmatter (`name` and non-empty `description`), and its `SKILL.md` plus optional `agents/openai.yaml` are valid UTF-8 without BOM; same-source entries outside the selected layout remain untouched unless `-Prune` was explicitly requested;
 - no configured or installed skills from different sources share a name, and every shared destination remains under `~/.agents`;
+- local source snapshots match their pinned commits, the source worktrees remain untouched by installation, and external document references resolve from the installed location;
 - no divergent same-name entry remains under `~/.codex/skills`; recognized legacy skill entries are absent after `-PurgeLegacy`, while Unknown directories without `SKILL.md`, `.system`, `codex-primary-runtime`, and reparse-point entries remain protected;
 - `~/.agents/references/evidence-map.md` exists;
 - `reports/latest.html` opens, states that the comparison is read-only, and shows the pinned and registry-latest CLI versions;

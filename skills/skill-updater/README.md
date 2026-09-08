@@ -1,13 +1,14 @@
 # Skill updater
 
-A small, Windows-only project that assists with comparing and applying two Git-pinned skill sources into the canonical user root `~/.agents/skills`:
+A small, Windows-only project that assists with comparing and applying Git-pinned skill sources into the canonical user root `~/.agents/skills`:
 
 - skills under `mattpocock/skills/skills/engineering` and `skills/productivity` only;
-- all 13 skills from Cognitive Bias Lab's `critical-thinking-tools`, plus its shared `references/evidence-map.md` dependency.
+- all 13 skills from Cognitive Bias Lab's `critical-thinking-tools`, plus its shared `references/evidence-map.md` dependency;
+- `ad-engineering-context` from the local ADJenkinsContext Git repository.
 
 Only the names listed in each source's `selectedSkills` allowlist are assisted by this updater. The scheduled job is read-only and does not perform continuous updates. Every Monday at 09:00 it compares installed files with the pinned upstream commits, inventories repository/legacy/system/plugin scopes without modifying them, scans the legacy `~/.codex/skills` root for duplicates and conflicts, checks whether the pinned `skills` CLI has a newer registry release, writes a self-contained HTML report under `reports/`, and opens `latest.html` in the default browser. If the PC is unavailable, Task Scheduler starts it when the signed-in user is next available.
 
-`config.json` is the committed expected state. Each source names an exact 40-character `sourceCommit` and its `skillRoots`; changing either is a normal Git change and therefore changes the `agenttools` release identity. The only local state protocol is the global `~/.agents/.skill-lock.json`. Because `skills@1.5.23` treats a remote ref as a branch during clone, the updater gives that fixed CLI an exact local Git snapshot and writes CLI-compatible canonical source/ref/path entries only after verifying the copied content. It does not create a second lock file.
+`config.json` is the committed expected state. Each source names an exact 40-character `sourceCommit` and its `skillRoots`; changing either is a normal Git change and therefore changes the `agenttools` release identity. The only local state protocol is the global `~/.agents/.skill-lock.json`. Because `skills@1.5.23` treats a remote ref as a branch during clone, GitHub sources give that fixed CLI an exact local Git snapshot. Local sources use the updater's native byte-preserving copy. Both paths first require `SKILL.md` and optional `agents/openai.yaml` to be valid UTF-8 without BOM, then write CLI-compatible canonical source/ref/path entries only after verifying copied content. No second lock file is created.
 
 ## Deploy
 
@@ -31,7 +32,13 @@ The committed runner policy is `codex-bundled-pnpm`. A machine-local `config.loc
 
 ## Machine-local settings
 
-Keep portable policy in `config.json`. For a PC that needs a trusted enterprise registry, a Windows user proxy, or explicitly user-provided `npx`, copy `config.local.example.json` to `config.local.json` and edit only the required values. The local file is ignored by Git and may override only `gitProxyMode`, `tooling.runner`, and `tooling.allowedRegistries`; proxy credentials and certificate paths remain in machine configuration. Supported Git proxy modes are `git-config` (default), `windows-user-proxy` (the current user's fixed Windows Internet Settings proxy), and `direct` (explicitly disables Git proxies).
+Keep portable policy in `config.json`. The Git-ignored `config.local.json` may set `gitProxyMode`, `tooling.runner`, `tooling.allowedRegistries`, and `localRepositories` (a mapping from configured local source IDs to absolute local Git worktree paths). Proxy credentials and certificate paths remain in machine configuration. Supported Git proxy modes are `git-config` (default), `windows-user-proxy` (the current user's fixed Windows Internet Settings proxy), and `direct` (explicitly disables Git proxies). An explicit process environment variable `AGENTTOOLS_GIT_PROXY_MODE` overrides the file policy for a single child-process run without changing persistent settings.
+
+For the configured AD source, add `"localRepositories": { "ad-engineering-context": "D:\\dev\\ADJenkinsContext" }` to the local file. `config.local.example.json` shows the supported settings; copy only the values appropriate for this PC. A missing local repository blocks that source instead of silently skipping it.
+
+Local sources use `sourceType: "local"`, with the commit, roots, and selected skill names in `config.json`. The updater clones an independent snapshot and checks out exactly `sourceCommit`; newer commits and uncommitted edits in the original worktree are excluded. It rejects BOM-prefixed or invalid UTF-8 skill metadata, copies valid source bytes unchanged, rejects reparse points, and retains the same explicit overwrite and content-verification gates. The global lock records the resolved repository path, `sourceType: "local"`, commit, skill path, and verified folder hash. Moving the repository changes its lock identity and requires reviewing the mismatch. The fixed skills CLI accepts local lock entries, but its own update command skips local sources; use this updater to review/apply them.
+
+The AD skill points to canonical documents in `D:\dev\ADJenkinsContext`; that checkout must remain available after installation. Cross-repository document links must resolve from the installed skill location. Fix such links in the source and pin the resulting commit; installation never rewrites the copied skill.
 
 Run `scripts/Test-Project.ps1` after creating or editing the local file. An unknown registry, non-HTTPS registry, disabled SSL verification, unsafe Git rewrite, unsupported local key, or insufficient Node.js version blocks installation.
 
@@ -76,6 +83,10 @@ Run the complete network, source, collision, and tooling preflight without chang
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-Skills.ps1 -PreflightOnly
 ```
+
+To install only the configured local AD skill, run preflight with `-SourceId ad-engineering-context -PreflightOnly`, then use the same source filter with `-Apply`. Existing skills from other sources are retained.
+
+Regression checks: run `tests/Test-GitProxy.ps1` and `tests/Test-LocalSource.ps1`. The local-source test uses an isolated temporary Git repository and does not modify installed skills.
 
 Retry one source independently after a transient network failure:
 

@@ -5,9 +5,26 @@ function Get-SkillUpdaterRoot {
     return (Split-Path -Parent $PSScriptRoot)
 }
 
+function Remove-UpdaterTemporaryDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
+    $item = Get-Item -LiteralPath $resolved
+    if ((Split-Path -Parent $resolved) -ne $temporaryRoot -or
+        $item.Name -notmatch '^agenttools-(skill-updater|git-wrapper)-[0-9a-f]{32}$' -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing unsafe updater temporary directory cleanup: $resolved"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
+
 function Get-SkillUpdaterConfig {
     $path = Join-Path (Get-SkillUpdaterRoot) 'config.json'
     $config = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    # An explicit process override keeps one-off transport policy out of machine settings.
+    if ($env:AGENTTOOLS_GIT_PROXY_MODE) { $config.gitProxyMode = $env:AGENTTOOLS_GIT_PROXY_MODE }
     $localPath = Join-Path (Get-SkillUpdaterRoot) 'config.local.json'
     if (-not (Test-Path -LiteralPath $localPath)) {
         if ([string]$config.gitProxyMode -notin @('direct', 'git-config', 'windows-user-proxy')) {
@@ -17,7 +34,7 @@ function Get-SkillUpdaterConfig {
     }
 
     $local = Get-Content -LiteralPath $localPath -Raw | ConvertFrom-Json
-    $allowedTopLevel = @('gitProxyMode', 'tooling')
+    $allowedTopLevel = @('gitProxyMode', 'tooling', 'localRepositories')
     foreach ($property in $local.PSObject.Properties) {
         if ($allowedTopLevel -notcontains $property.Name) {
             throw "Unsupported machine-local setting: $($property.Name)"
@@ -26,6 +43,14 @@ function Get-SkillUpdaterConfig {
 
     if ($local.PSObject.Properties['gitProxyMode']) {
         $config.gitProxyMode = [string]$local.gitProxyMode
+    }
+    if ($env:AGENTTOOLS_GIT_PROXY_MODE) { $config.gitProxyMode = $env:AGENTTOOLS_GIT_PROXY_MODE }
+    if ($local.PSObject.Properties['localRepositories']) {
+        foreach ($property in $local.localRepositories.PSObject.Properties) {
+            $sources = @($config.sources | Where-Object { $_.id -eq $property.Name -and (Get-SourceType -Source $_) -eq 'local' })
+            if ($sources.Count -ne 1) { throw "Unknown local source mapping: $($property.Name)" }
+            $sources[0] | Add-Member -MemberType NoteProperty -Name repositoryPath -Value ([string]$property.Value) -Force
+        }
     }
     if ($local.PSObject.Properties['tooling']) {
         foreach ($property in $local.tooling.PSObject.Properties) {
@@ -394,7 +419,7 @@ function Invoke-SkillCli {
             }
         }
         if ($gitWrapperRoot -and (Test-Path -LiteralPath $gitWrapperRoot)) {
-            Remove-Item -LiteralPath $gitWrapperRoot -Recurse -Force
+            Remove-UpdaterTemporaryDirectory -Path $gitWrapperRoot
         }
     }
 }
@@ -632,15 +657,43 @@ function Test-ManagedGitHubConnection {
     throw $lastError
 }
 
+function Get-SourceType {
+    param([Parameter(Mandatory = $true)]$Source)
+
+    $type = if ($Source.PSObject.Properties['sourceType']) { [string]$Source.sourceType } else { 'github' }
+    if ($type -notin @('github', 'local')) { throw "Unsupported sourceType: $type" }
+    return $type
+}
+
+function Get-LocalRepositoryPath {
+    param([Parameter(Mandatory = $true)]$Source)
+
+    if (-not $Source.PSObject.Properties['repositoryPath'] -or [string]$Source.repositoryPath -notmatch '^[A-Za-z]:[\\/]') {
+        throw "Local source $($Source.id) requires an absolute local drive path in config.local.json localRepositories."
+    }
+    $path = [System.IO.Path]::GetFullPath([string]$Source.repositoryPath).TrimEnd('\', '/')
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "Local repository is unavailable: $path" }
+    $cursor = Get-Item -LiteralPath $path
+    while ($cursor) {
+        if (($cursor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Local repository uses a symlink/Junction/reparse point; leave it untouched: $($cursor.FullName)"
+        }
+        $cursor = $cursor.Parent
+    }
+    return $path
+}
+
 function Get-SourceIdentifier {
     param([Parameter(Mandatory = $true)]$Source)
 
+    if ((Get-SourceType -Source $Source) -eq 'local') { return (Get-LocalRepositoryPath -Source $Source).Replace('\', '/') }
     return [string]$Source.repositorySlug
 }
 
 function Get-SourceCloneUrl {
     param([Parameter(Mandatory = $true)]$Source)
 
+    if ((Get-SourceType -Source $Source) -eq 'local') { return Get-LocalRepositoryPath -Source $Source }
     return ('https://github.com/{0}.git' -f (Get-SourceIdentifier -Source $Source))
 }
 
@@ -650,6 +703,9 @@ function Get-SourceInstallSpec {
         [Parameter(Mandatory = $true)][string]$SkillRoot
     )
 
+    if ((Get-SourceType -Source $Source) -eq 'local') {
+        return Resolve-PathUnderRoot -Root (Get-LocalRepositoryPath -Source $Source) -RelativePath $SkillRoot
+    }
     return ('https://github.com/{0}/tree/{1}/{2}' -f
         (Get-SourceIdentifier -Source $Source),
         ([string]$Source.sourceCommit).Trim('/'),
@@ -665,14 +721,21 @@ function New-RepositorySnapshot {
     Assert-GitEnvironment -Config $Config | Out-Null
     $repository = Get-SourceCloneUrl -Source $Source
     $commit = [string]$Source.sourceCommit
+    if ($commit -notmatch '^[0-9a-fA-F]{40}$') { throw 'sourceCommit must be a full Git commit SHA.' }
+    $localSource = (Get-SourceType -Source $Source) -eq 'local'
+    if ($localSource) {
+        $top = Invoke-ManagedGit -Config $Config -GitArguments @('-C', $repository, 'rev-parse', '--show-toplevel')
+        if ([System.IO.Path]::GetFullPath($top).TrimEnd('\', '/') -ne $repository) { throw 'Local repository path must name its Git worktree root.' }
+        Invoke-ManagedGit -Config $Config -GitArguments @('-C', $repository, 'cat-file', '-e', ($commit + '^{commit}')) | Out-Null
+    }
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $path = Join-Path ([System.IO.Path]::GetTempPath()) ('agenttools-skill-updater-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $path | Out-Null
         try {
-            Invoke-ManagedGit -Config $Config -GitArguments @(
-                'clone', '--quiet', $repository, $path
-            ) | Out-Null
+            $cloneArguments = @('clone', '--quiet', '--no-checkout')
+            if ($localSource) { $cloneArguments += '--no-hardlinks' }
+            Invoke-ManagedGit -Config $Config -GitArguments ($cloneArguments + @('--', $repository, $path)) | Out-Null
             Invoke-ManagedGit -Config $Config -GitArguments @('-C', $path, 'checkout', '--detach', '--quiet', $commit) | Out-Null
             $checkedOut = Invoke-ManagedGit -Config $Config -GitArguments @('-C', $path, 'rev-parse', 'HEAD')
             if ($checkedOut -ne $commit) {
@@ -682,7 +745,7 @@ function New-RepositorySnapshot {
         }
         catch {
             $lastError = $_
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+            Remove-UpdaterTemporaryDirectory -Path $path
             if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
         }
     }
@@ -732,6 +795,49 @@ function Get-SkillFolderHash {
     }
 }
 
+function Copy-LocalSourceSkills {
+    param(
+        [Parameter(Mandatory = $true)]$SourcePlan,
+        [Parameter(Mandatory = $true)][string]$AgentsRoot,
+        [switch]$Overwrite
+    )
+
+    if ((Get-SourceType -Source $SourcePlan.Source) -ne 'local') { throw 'Native copy is only for configured local sources.' }
+    $skillsRoot = Resolve-PathUnderRoot -Root $AgentsRoot -RelativePath 'skills'
+    foreach ($root in @($AgentsRoot, $skillsRoot)) {
+        if ((Test-Path -LiteralPath $root) -and ((Get-Item -LiteralPath $root).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Selected user root is a symlink/Junction/reparse point; leave it untouched: $root"
+        }
+    }
+    New-Item -ItemType Directory -Path $skillsRoot -Force | Out-Null
+    foreach ($skillFile in $SourcePlan.SkillFiles) {
+        $upstream = $skillFile.Directory.FullName
+        $destination = Resolve-PathUnderRoot -Root $skillsRoot -RelativePath $skillFile.Directory.Name
+        foreach ($root in @($upstream, $destination)) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            $items = @(Get-Item -LiteralPath $root) + @(Get-ChildItem -LiteralPath $root -Recurse -Force)
+            if (@($items | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -gt 0) {
+                throw "Skill tree contains a symlink/Junction/reparse point; leave it untouched: $root"
+            }
+        }
+        Assert-SkillMetadata -SkillFile $skillFile.FullName -ExpectedName $skillFile.Directory.Name | Out-Null
+        if (Test-Path -LiteralPath $destination) {
+            if ((Compare-DirectoryContent -Upstream $upstream -Installed $destination).Equal) { continue }
+            if (-not $Overwrite) { throw 'Different local skill content requires -Overwrite.' }
+            $resolved = (Resolve-Path -LiteralPath $destination).Path
+            if ((Split-Path -Parent $resolved) -ne [IO.Path]::GetFullPath($skillsRoot)) { throw "Unsafe local skill replacement: $resolved" }
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+        }
+        # Metadata was validated as strict UTF-8 without BOM. Copy all source
+        # bytes intact; the same pinned-content and canonical-lock gates follow.
+        Copy-Item -LiteralPath $upstream -Destination $destination -Recurse -Force
+        if (-not (Compare-DirectoryContent -Upstream $upstream -Installed $destination).Equal) {
+            throw "Local source copy differs from pinned content: $destination"
+        }
+        Write-Host "Copied verified local skill: $destination"
+    }
+}
+
 function Set-CanonicalLockEntries {
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Lock,
@@ -777,7 +883,7 @@ function Set-CanonicalLockEntries {
         else { $now }
         $entry = [pscustomobject][ordered]@{
             source = Get-SourceIdentifier -Source $SourcePlan.Source
-            sourceType = 'github'
+            sourceType = Get-SourceType -Source $SourcePlan.Source
             sourceUrl = Get-SourceCloneUrl -Source $SourcePlan.Source
             ref = [string]$SourcePlan.Source.sourceCommit
             skillPath = [string]$SourcePlan.SkillPaths[$name]
@@ -792,6 +898,39 @@ function Set-CanonicalLockEntries {
     $json = $Lock | ConvertTo-Json -Depth 20
     [System.IO.File]::WriteAllText($LockPath, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
     return $Lock
+}
+
+function Format-SkillLockIdentity {
+    param([AllowNull()]$Entry)
+
+    if (-not $Entry) { return '<no lock entry>' }
+    $parts = foreach ($name in @('source', 'sourceType', 'sourceUrl', 'ref', 'skillPath')) {
+        $property = $Entry.PSObject.Properties[$name]
+        $value = if ($property) { [string]$property.Value } else { '<missing>' }
+        "${name}=$value"
+    }
+    return ($parts -join ', ')
+}
+
+function Test-CanonicalLockEntry {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Entry,
+        [Parameter(Mandatory = $true)]$Source,
+        [Parameter(Mandatory = $true)][string]$SkillPath
+    )
+
+    if (-not $Entry) { return $false }
+    $expected = @{
+        source = Get-SourceIdentifier -Source $Source
+        sourceType = Get-SourceType -Source $Source
+        sourceUrl = Get-SourceCloneUrl -Source $Source
+        ref = [string]$Source.sourceCommit
+        skillPath = $SkillPath
+    }
+    foreach ($key in $expected.Keys) {
+        if (-not $Entry.PSObject.Properties[$key] -or [string]$Entry.$key -cne [string]$expected[$key]) { return $false }
+    }
+    return $true
 }
 
 function Compare-DirectoryContent {
@@ -821,13 +960,32 @@ function Compare-DirectoryContent {
     }
 }
 
+function Get-StrictUtf8TextWithoutBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "$Label must use UTF-8 without BOM: $Path"
+    }
+    try {
+        return [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    }
+    catch {
+        throw "$Label is not valid UTF-8: $Path"
+    }
+}
+
 function Assert-SkillMetadata {
     param(
         [Parameter(Mandatory = $true)][string]$SkillFile,
         [Parameter(Mandatory = $true)][string]$ExpectedName
     )
 
-    $lines = @(Get-Content -LiteralPath $SkillFile -ErrorAction Stop)
+    $text = Get-StrictUtf8TextWithoutBom -Path $SkillFile -Label 'SKILL.md'
+    $lines = @([regex]::Split($text, '\r?\n'))
     if ($lines.Count -lt 3 -or $lines[0].Trim() -ne '---') {
         throw "SKILL.md is missing YAML frontmatter: $SkillFile"
     }
@@ -854,6 +1012,10 @@ function Assert-SkillMetadata {
     if ([string]::IsNullOrWhiteSpace($name)) { throw "SKILL.md frontmatter has no name: $SkillFile" }
     if ([string]::IsNullOrWhiteSpace($description)) { throw "SKILL.md frontmatter has no description: $SkillFile" }
     if ($name -ne $ExpectedName) { throw "SKILL.md name '$name' does not match directory '$ExpectedName': $SkillFile" }
+    $openAiYaml = Join-Path $([System.IO.Path]::GetDirectoryName($SkillFile)) 'agents\openai.yaml'
+    if (Test-Path -LiteralPath $openAiYaml -PathType Leaf) {
+        Get-StrictUtf8TextWithoutBom -Path $openAiYaml -Label 'agents/openai.yaml' | Out-Null
+    }
     return [pscustomobject]@{ Name = $name; Description = $description }
 }
 
@@ -869,7 +1031,7 @@ function Get-ConfiguredSkillFiles {
         throw "Source $($Source.id) has no selectedSkills allowlist."
     }
     foreach ($relativeRoot in @($Source.skillRoots)) {
-        $root = Join-Path $Snapshot ([string]$relativeRoot)
+        $root = Resolve-PathUnderRoot -Root $Snapshot -RelativePath ([string]$relativeRoot)
         if (-not (Test-Path -LiteralPath $root)) {
             throw "Configured skill root is missing upstream: $relativeRoot"
         }

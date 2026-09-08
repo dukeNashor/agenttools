@@ -20,10 +20,15 @@ if ($failureMessages.Count -gt 0) {
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
 $config = Get-SkillUpdaterConfig
-if ([int]$config.version -ne 7) { throw 'Unsupported config version.' }
+$repositorySkillsRoot = Split-Path -Parent (Get-SkillUpdaterRoot)
+$repositorySkillFiles = @(Get-ChildItem -LiteralPath $repositorySkillsRoot -Filter 'SKILL.md' -File -Recurse)
+foreach ($skillFile in $repositorySkillFiles) {
+    Assert-SkillMetadata -SkillFile $skillFile.FullName -ExpectedName $skillFile.Directory.Name | Out-Null
+}
+if ([int]$config.version -ne 8) { throw 'Unsupported config version.' }
 if ([string]$config.agentsRoot -ne '~/.agents') { throw 'agentsRoot must remain the canonical ~/.agents user skill root.' }
 if ([string]$config.gitProxyMode -notin @('direct', 'git-config', 'windows-user-proxy')) { throw 'gitProxyMode must be direct, git-config, or windows-user-proxy.' }
-if (@($config.sources).Count -ne 2) { throw 'Expected exactly two tracked sources.' }
+if (@($config.sources).Count -eq 0) { throw 'Expected at least one tracked source.' }
 if ([int]$config.reportRetention -lt 1) { throw 'Report retention must be positive.' }
 
 $package = Get-PackageSpecParts -PackageSpec ([string]$config.tooling.skillsCli)
@@ -51,9 +56,10 @@ foreach ($source in $config.sources) {
         throw "Source IDs must be non-empty and unique: $($source.id)"
     }
     $sourceIds[[string]$source.id] = $true
-    if ([string]$source.repositorySlug -notmatch '^[^/\s]+/[^/\s]+$') { throw "$($source.id) has an invalid repository slug." }
-    if ($repositorySlugs.ContainsKey([string]$source.repositorySlug)) { throw "Repository slugs must be unique: $($source.repositorySlug)" }
-    $repositorySlugs[[string]$source.repositorySlug] = $true
+    if ((Get-SourceType -Source $source) -eq 'github' -and [string]$source.repositorySlug -notmatch '^[^/\s]+/[^/\s]+$') { throw "$($source.id) has an invalid repository slug." }
+    $sourceIdentity = Get-SourceIdentifier -Source $source
+    if ($repositorySlugs.ContainsKey($sourceIdentity)) { throw "Source repositories must be unique: $sourceIdentity" }
+    $repositorySlugs[$sourceIdentity] = $true
     if ([string]$source.sourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "$($source.id) has an invalid sourceCommit." }
     if (@($source.skillRoots).Count -eq 0) { throw "$($source.id) has no skill roots." }
     $roots = @{}
@@ -94,6 +100,7 @@ $tooling = Assert-ToolingEnvironment -Config $config
 $git = Assert-GitEnvironment -Config $config
 
 Write-Host "Parsed $($scriptFiles.Count) PowerShell scripts."
+Write-Host "Validated $($repositorySkillFiles.Count) repository skills as strict UTF-8 without BOM."
 Write-Host "Derived $($derivedInstallSpecs.Count) install specs from configured skill roots."
 Write-Host "Skill runner: $($tooling.Runner.DisplayName) via $($tooling.Runner.Manager) $($tooling.ManagerVersion)"
 Write-Host "Runner policy: $($tooling.RunnerMode)"

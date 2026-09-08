@@ -1,5 +1,8 @@
 {
   "gitProxyMode": "windows-user-proxy",
+  "localRepositories": {
+    "ad-engineering-context": "D:\\dev\\ADJenkinsContext"
+  },
   "tooling": {
     "runner": "user-npx",
     "allowedRegistries": [
