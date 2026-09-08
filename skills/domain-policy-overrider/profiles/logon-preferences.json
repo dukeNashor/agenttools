@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "settings": [
+    { "path": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "DisableCAD", "value": 1 },
+    { "path": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "ConsentPromptBehaviorAdmin", "value": 0 },
+    { "path": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "PromptOnSecureDesktop", "value": 0 },
+    { "path": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "name": "PasswordExpiryWarning", "value": 3 }
+  ]
+}

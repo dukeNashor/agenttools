@@ -1,0 +1,4 @@
+interface:
+  display_name: "Domain Policy Overrider"
+  short_description: "Inspect and maintain selected Windows domain policy overrides"
+  default_prompt: "Use $domain-policy-overrider to inspect my selected local overrides and maintain their event-triggered task."

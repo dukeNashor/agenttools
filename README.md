@@ -1,6 +1,12 @@
 # Agent Tools
 
-Reusable Codex skills and scripts. This repository is packaged as a Codex plugin and contains the explicitly invoked skills `$visualize-codex-tokens` and `$skill-updater`.
+Reusable Codex skills and scripts, packaged as a Codex plugin. Includes `$visualize-codex-tokens`, `$skill-updater`, and `$domain-policy-overrider`.
+
+## Domain Policy Overrider
+
+[`skills/domain-policy-overrider`](skills/domain-policy-overrider/SKILL.md) inspects Windows domain policy settings and maintains selected local HKLM DWORD values after computer Group Policy completes. It includes a configurable profile, event-triggered task installation/update, execution verification, and original-value restoration. Inspection is read-only; deployment requires administrator elevation and an explicitly selected profile. The bundled four-setting logon profile records personal preferences, not a recommended security baseline.
+
+Run isolated checks with `& .\skills\domain-policy-overrider\scripts\Test-Skill.ps1`. Maintaining this source does not redeploy a machine's running task.
 
 ## Visualize Codex Tokens
 
@@ -101,7 +107,13 @@ MIT
 
 # Agent Tools（中文）
 
-可复用的 Codex Skill 与脚本集合。仓库已按 Codex Plugin 格式打包，目前包含一个仅支持显式调用的 Skill：`$visualize-codex-tokens`。
+可复用的 Codex Skill 与脚本集合。仓库已按 Codex Plugin 格式打包，包含 `$visualize-codex-tokens`、`$skill-updater` 和 `$domain-policy-overrider`。
+
+## 域策略 Overrider
+
+[`skills/domain-policy-overrider`](skills/domain-policy-overrider/SKILL.md) 用于检查 Windows 域策略，并在计算机组策略完成应用后维护选定的本地 HKLM DWORD 值。包含可配置预置、事件任务安装与更新、执行验证和原值恢复。检查默认只读；部署需要管理员提权及明确选择配置。附带的四项登录设置记录个人偏好，不是推荐的安全基线。
+
+运行 `& .\skills\domain-policy-overrider\scripts\Test-Skill.ps1` 可执行隔离测试；维护源码不会重新部署本机正在运行的任务。
 
 ## Codex Token 可视化
 
