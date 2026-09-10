@@ -56,34 +56,17 @@
       "sharedFiles": []
     },
     {
-      "id": "critical-thinking-tools",
-      "label": "Critical Thinking Tools",
-      "repositorySlug": "cognitive-bias-lab/cognitive-bias-lab-plugins",
-      "sourceCommit": "9447e4a4fc3d6b31207a8b1b84d4f0ee934e7b48",
+      "id": "warp-common-skills",
+      "label": "Warp Common Skills",
+      "repositorySlug": "warpdotdev/common-skills",
+      "sourceCommit": "b811c24365ae505bfc9646458957b886e29110b5",
       "skillRoots": [
-        "plugins/critical-thinking-tools/skills"
+        ".agents/skills"
       ],
       "selectedSkills": [
-        "base-rate-audit",
-        "calibration-forecasting",
-        "causal-story-dissection",
-        "competing-hypotheses",
-        "consider-the-opposite",
-        "critical-thinking-toolkit",
-        "decision-journal",
-        "devils-advocate",
-        "groupthink-red-team",
-        "outside-view",
-        "pre-mortem",
-        "socratic-ladder",
-        "steelman"
+        "skill-doctor"
       ],
-      "sharedFiles": [
-        {
-          "sourcePath": "plugins/critical-thinking-tools/references/evidence-map.md",
-          "destinationRelativeToAgentsRoot": "references/evidence-map.md"
-        }
-      ]
+      "sharedFiles": []
     },
     {
       "id": "ad-engineering-context",
