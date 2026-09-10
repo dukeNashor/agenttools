@@ -113,13 +113,14 @@ function Get-InstallationFindings {
                 Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Unsafe path' -Summary "Detected $linkKind at the selected user skill path; tell the user and leave it untouched."
                 continue
             }
-            if (-not (Test-CanonicalLockEntry -Entry $entry -Source $plan.Source -SkillPath ([string]$plan.SkillPaths[$name]))) {
+            $comparison = Compare-DirectoryContent -Upstream $skillFile.Directory.FullName -Installed $installedPath
+            $lockStatus = Get-SkillLockStatus -Entry $entry -Source $plan.Source -SkillPath ([string]$plan.SkillPaths[$name])
+            if ($lockStatus -ne 'Current') {
                 $actual = Format-SkillLockIdentity -Entry $entry
-                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Lock mismatch' -Summary "Expected source=$sourceIdentifier ref=$($plan.Source.sourceCommit) path=$($plan.SkillPaths[$name]); actual $actual."
-                continue
+                $repairNote = if ($lockStatus -eq 'Missing lock ref' -and $comparison.Equal) { ' Files match the pinned commit; -Apply can record ref without reinstalling or -Overwrite.' } else { ' -Overwrite is required to replace different content or lock identity/revision.' }
+                Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status $lockStatus -Summary "Expected source=$sourceIdentifier ref=$($plan.Source.sourceCommit) path=$($plan.SkillPaths[$name]); actual $actual.$repairNote"
             }
 
-            $comparison = Compare-DirectoryContent -Upstream $skillFile.Directory.FullName -Installed $installedPath
             if (-not $comparison.Equal) {
                 Add-Finding -Findings $findings -Source $plan.Source.label -Item $name -Status 'Different' -Summary "Installed content differs from pinned sourceCommit $($plan.Source.sourceCommit)."
             }
@@ -272,7 +273,7 @@ try {
         throw 'A divergent legacy skill has the same name as a configured skill. Resolve the conflict before using -PurgeLegacy.'
     }
 
-    $overwriteRequired = @($findings | Where-Object { $_.Status -in @('Different', 'Lock mismatch') })
+    $overwriteRequired = @($findings | Where-Object { $_.Status -in @('Different', 'Missing lock entry', 'Lock identity mismatch', 'Lock revision mismatch') })
     $unsafePaths = @($findings | Where-Object { $_.Status -eq 'Unsafe path' })
     if ($unsafePaths.Count -gt 0) {
         foreach ($finding in $unsafePaths) { Write-Warning "User notice required: $($finding.Source) / $($finding.Item): $($finding.Summary)" }
@@ -284,12 +285,19 @@ try {
 
     foreach ($plan in $sourcePlans) {
         $source = $plan.Source
+        $previousLock = Get-LockObject -LockPath $lockPath
         if ((Get-SourceType -Source $source) -eq 'local') {
             Copy-LocalSourceSkills -SourcePlan $plan -AgentsRoot $agentsRoot -Overwrite:$Overwrite
         }
         foreach ($skillRoot in @($source.skillRoots)) {
             if ((Get-SourceType -Source $source) -eq 'local') { continue }
-            $skillNames = @($plan.SkillNamesByRoot[[string]$skillRoot])
+            $skillNames = @($plan.SkillNamesByRoot[[string]$skillRoot] | Where-Object {
+                $name = $_
+                $installedPath = Join-Path $agentsRoot ('skills/' + $name)
+                $upstreamPath = ($plan.SkillFiles | Where-Object { $_.Directory.Name -eq $name } | Select-Object -First 1).Directory.FullName
+                -not (Test-Path -LiteralPath $installedPath -PathType Container) -or
+                    -not (Compare-DirectoryContent -Upstream $upstreamPath -Installed $installedPath).Equal
+            })
             if ($skillNames.Count -eq 0) { continue }
             # skills@1.5.23 passes a remote ref to git clone as --branch, which
             # cannot resolve an arbitrary commit SHA. Install from the exact
@@ -328,7 +336,7 @@ try {
             Write-Host "Synced shared file: $destination"
         }
 
-        $updatedLock = Set-CanonicalLockEntries -Lock (Get-LockObject -LockPath $lockPath) -SourcePlan $plan -AgentsRoot $agentsRoot -LockPath $lockPath
+        $updatedLock = Set-CanonicalLockEntries -Lock (Get-LockObject -LockPath $lockPath) -PreviousLock $previousLock -SourcePlan $plan -AgentsRoot $agentsRoot -LockPath $lockPath
         $sourceIdentifier = Get-SourceIdentifier -Source $source
         $tracked = @($updatedLock.skills.PSObject.Properties | Where-Object { $_.Value.source -eq $sourceIdentifier })
         if ($Prune) {

@@ -215,9 +215,11 @@ foreach ($source in $config.sources) {
             $entry = if ($lock) { $lock.skills.PSObject.Properties[$name] } else { $null }
             $expectedPath = $skillFile.FullName.Substring($snapshot.Length).TrimStart('\').Replace('\', '/')
             $installedPath = Join-Path $skillsDirectory $name
-            if ((Test-Path -LiteralPath $installedPath) -and (-not $entry -or -not (Test-CanonicalLockEntry -Entry $entry.Value -Source $source -SkillPath $expectedPath))) {
+            $lockStatus = Get-SkillLockStatus -Entry $(if ($entry) { $entry.Value } else { $null }) -Source $source -SkillPath $expectedPath
+            if ((Test-Path -LiteralPath $installedPath) -and $lockStatus -ne 'Current') {
                 $actual = Format-SkillLockIdentity -Entry $(if ($entry) { $entry.Value } else { $null })
-                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = 'Lock mismatch'; Summary = "Expected ref=$($source.sourceCommit) path=$expectedPath; actual $actual"; Files = @() })
+                $repairNote = if ($lockStatus -eq 'Missing lock ref') { ' Missing provenance metadata; -Apply records ref only after all files match the pinned commit. Different content requires -Overwrite.' } else { ' Review the difference before using -Apply -Overwrite.' }
+                $rows.Add([pscustomobject]@{ Source = $source.label; Item = $name; Status = $lockStatus; Summary = "Expected ref=$($source.sourceCommit) path=$expectedPath; actual $actual.$repairNote"; Files = @() })
             }
         }
     }

@@ -758,7 +758,7 @@ function Get-FileManifest {
     $manifest = @{}
     if (-not (Test-Path -LiteralPath $Root)) { return $manifest }
     $rootPath = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\')
-    foreach ($file in Get-ChildItem -LiteralPath $rootPath -File -Recurse | Sort-Object FullName) {
+    foreach ($file in Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force | Sort-Object FullName) {
         $relative = $file.FullName.Substring($rootPath.Length).TrimStart('\').Replace('\', '/')
         $manifest[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
     }
@@ -775,7 +775,7 @@ function Get-SkillFolderHash {
     $rootPath = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\')
     $algorithm = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse | Sort-Object FullName)
+        $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force | Sort-Object FullName)
         foreach ($file in $files) {
             $relativePath = $file.FullName.Substring($rootPath.Length).TrimStart('\').Replace('\', '/')
             $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($relativePath)
@@ -843,7 +843,8 @@ function Set-CanonicalLockEntries {
         [Parameter(Mandatory = $true)][AllowNull()]$Lock,
         [Parameter(Mandatory = $true)]$SourcePlan,
         [Parameter(Mandatory = $true)][string]$AgentsRoot,
-        [Parameter(Mandatory = $true)][string]$LockPath
+        [Parameter(Mandatory = $true)][string]$LockPath,
+        [AllowNull()]$PreviousLock
     )
 
     if (-not $Lock) {
@@ -877,11 +878,20 @@ function Set-CanonicalLockEntries {
 
         $oldProperty = $Lock.skills.PSObject.Properties[$name]
         $oldEntry = if ($oldProperty) { $oldProperty.Value } else { $null }
-        $installedAt = if ($oldEntry -and $oldEntry.PSObject.Properties['installedAt']) {
-            [string]$oldEntry.installedAt
+        $previousProperty = if ($PreviousLock) { $PreviousLock.skills.PSObject.Properties[$name] } else { $null }
+        # The CLI may replace an entry. Retain its new fields and restore any
+        # previous fields before overriding the updater's canonical identity.
+        $fields = [ordered]@{}
+        foreach ($existing in @($oldEntry, $(if ($previousProperty) { $previousProperty.Value }))) {
+            if ($existing) {
+                foreach ($property in $existing.PSObject.Properties) { $fields[$property.Name] = $property.Value }
+            }
+        }
+        $installedAt = if ($fields.Contains('installedAt')) {
+            [string]$fields['installedAt']
         }
         else { $now }
-        $entry = [pscustomobject][ordered]@{
+        $canonical = [ordered]@{
             source = Get-SourceIdentifier -Source $SourcePlan.Source
             sourceType = Get-SourceType -Source $SourcePlan.Source
             sourceUrl = Get-SourceCloneUrl -Source $SourcePlan.Source
@@ -891,6 +901,8 @@ function Set-CanonicalLockEntries {
             installedAt = $installedAt
             updatedAt = $now
         }
+        foreach ($key in $canonical.Keys) { $fields[$key] = $canonical[$key] }
+        $entry = [pscustomobject]$fields
         $Lock.skills.PSObject.Properties.Remove($name)
         $Lock.skills | Add-Member -MemberType NoteProperty -Name $name -Value $entry
     }
@@ -912,6 +924,28 @@ function Format-SkillLockIdentity {
     return ($parts -join ', ')
 }
 
+function Get-SkillLockStatus {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Entry,
+        [Parameter(Mandatory = $true)]$Source,
+        [Parameter(Mandatory = $true)][string]$SkillPath
+    )
+
+    if (-not $Entry) { return 'Missing lock entry' }
+    $expected = @{
+        source = Get-SourceIdentifier -Source $Source
+        sourceType = Get-SourceType -Source $Source
+        sourceUrl = Get-SourceCloneUrl -Source $Source
+        skillPath = $SkillPath
+    }
+    foreach ($key in $expected.Keys) {
+        if (-not $Entry.PSObject.Properties[$key] -or [string]$Entry.$key -cne [string]$expected[$key]) { return 'Lock identity mismatch' }
+    }
+    if (-not $Entry.PSObject.Properties['ref'] -or [string]::IsNullOrWhiteSpace([string]$Entry.ref)) { return 'Missing lock ref' }
+    if ([string]$Entry.ref -cne [string]$Source.sourceCommit) { return 'Lock revision mismatch' }
+    return 'Current'
+}
+
 function Test-CanonicalLockEntry {
     param(
         [Parameter(Mandatory = $true)][AllowNull()]$Entry,
@@ -919,18 +953,7 @@ function Test-CanonicalLockEntry {
         [Parameter(Mandatory = $true)][string]$SkillPath
     )
 
-    if (-not $Entry) { return $false }
-    $expected = @{
-        source = Get-SourceIdentifier -Source $Source
-        sourceType = Get-SourceType -Source $Source
-        sourceUrl = Get-SourceCloneUrl -Source $Source
-        ref = [string]$Source.sourceCommit
-        skillPath = $SkillPath
-    }
-    foreach ($key in $expected.Keys) {
-        if (-not $Entry.PSObject.Properties[$key] -or [string]$Entry.$key -cne [string]$expected[$key]) { return $false }
-    }
-    return $true
+    return (Get-SkillLockStatus -Entry $Entry -Source $Source -SkillPath $SkillPath) -eq 'Current'
 }
 
 function Compare-DirectoryContent {
