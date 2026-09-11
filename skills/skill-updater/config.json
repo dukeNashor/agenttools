@@ -1,4 +1,4 @@
-{
+﻿{
   "version": 8,
   "agentsRoot": "~/.agents",
   "gitProxyMode": "git-config",
@@ -72,7 +72,7 @@
       "id": "ad-engineering-context",
       "label": "AD Engineering Context",
       "sourceType": "local",
-      "sourceCommit": "4b0c5fad1207eb3d335620787e6b8e341779aa60",
+      "sourceCommit": "e5197280ffdb191c5c7dc0528bda9528f9a58983",
       "skillRoots": ["skills"],
       "selectedSkills": ["ad-engineering-context"],
       "sharedFiles": []
